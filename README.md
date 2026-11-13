@@ -6,24 +6,21 @@
 
 ## 安装与配置
 
-```sh
-git clone https://github.com/wowhxj/emacs-reader.git ~/emacs-reader
-```
-
-在 Emacs 配置中加入：
+Emacs 30+ 可用内置 `use-package` 的 `:vc` 从 GitHub 安装：
 
 ```elisp
-(add-to-list 'load-path (expand-file-name "~/emacs-reader"))
-(require 'emacs-reader)
-
-(setq emacs-reader-server-url "https://reader.example.com"
-      emacs-reader-username "your-username"
-      emacs-reader-text-width 80) ; 约 40 个汉字
-
-;; 推荐加密保存密码，不要将密码写进配置。
-(add-to-list 'auth-sources "~/.authinfo.gpg")
-
-(global-set-key (kbd "C-c r") #'emacs-reader-shelf)
+(use-package emacs-reader
+  :vc (:url "https://github.com/wowhxj/emacs-reader"
+       :rev :newest)
+  :commands (emacs-reader-login emacs-reader-shelf)
+  :bind ("C-c r" . emacs-reader-shelf)
+  :custom
+  (emacs-reader-server-url "https://reader.example.com")
+  (emacs-reader-username "your-username")
+  (emacs-reader-text-width 80) ; 约 40 个汉字
+  :config
+  ;; 推荐加密保存密码，不要将密码写进配置。
+  (add-to-list 'auth-sources "~/.authinfo.gpg"))
 ```
 
 首次运行 `M-x emacs-reader-login`，输入服务器地址、用户名和密码；登录成功后可确认保存密码。地址和用户名通过 Customize 保存，密码由 `auth-source` 管理；以后打开书架会自动登录，会话过期会尝试重新登录。GPG 解密可能需要口令。
