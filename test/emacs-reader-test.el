@@ -1028,6 +1028,73 @@
   (let ((emacs-reader-tts-player-command '(42)))
     (should-error (emacs-reader--tts-player) :type 'user-error)))
 
+(ert-deftest emacs-reader-tts-cursor-follows-speech-and-resumes-at-stopped-paragraph ()
+  (with-temp-buffer
+    (emacs-reader-reading-mode)
+    (let ((inhibit-read-only t)) (insert "First.\n\nSecond."))
+    (goto-char (point-min))
+    (setq emacs-reader--tts-active t
+          emacs-reader--current-chapter-index 0 emacs-reader--requested-chapter-index 0)
+    (let ((emacs-reader--session-cookie "fixture") resumed-text)
+      (cl-letf (((symbol-function 'emacs-reader--tts-player) (lambda () '("test-player")))
+                ((symbol-function 'make-process) (lambda (&rest _) 'fake-player))
+                ((symbol-function 'process-live-p) (lambda (_) nil))
+                ((symbol-function 'emacs-reader--tts-prefetch-next) #'ignore)
+                ((symbol-function 'emacs-reader--tts-fetch)
+                 (lambda (text _callback) (setq resumed-text text) nil)))
+        ;; No displayed window: speech must still update the buffer's point.
+        (should-not (get-buffer-window (current-buffer) t))
+        (emacs-reader--tts-play-response (current-buffer) emacs-reader--tts-generation 9 16
+                                         '(:ok ((isSuccess . t) (data . "YXVkaW8="))))
+        (should (= (point) 9))
+        (goto-char (point-min))
+        (emacs-reader-toggle-read-aloud)
+        (should (= (point) 9))
+        (should-not emacs-reader--tts-active)
+        (emacs-reader-toggle-read-aloud)
+        (should (equal resumed-text "Second."))
+        (emacs-reader--tts-stop)))))
+
+(ert-deftest emacs-reader-tts-background-position-survives-callback-point-restoration ()
+  (save-window-excursion
+    (let ((reader (generate-new-buffer " *reader-background-speech*"))
+          (other (generate-new-buffer " *reader-background-other*")))
+      (unwind-protect
+          (cl-letf (((symbol-function 'emacs-reader--tts-player) (lambda () '("test-player")))
+                    ((symbol-function 'make-process) (lambda (&rest _) 'fake-player))
+                    ((symbol-function 'process-live-p) (lambda (_) nil))
+                    ((symbol-function 'emacs-reader--tts-prefetch-next) #'ignore))
+            (switch-to-buffer other)
+            (with-current-buffer reader
+              (emacs-reader-reading-mode)
+              (let ((inhibit-read-only t)) (insert "First.\n\nSecond."))
+              (goto-char (point-min))
+              (setq emacs-reader--tts-active t)
+              ;; Emulate the excursion surrounding an asynchronous background callback.
+              (save-excursion
+                (emacs-reader--tts-play-response reader emacs-reader--tts-generation 9 16
+                                                 '(:ok ((isSuccess . t) (data . "YXVkaW8=")))))
+              (should (= (point) 1))
+              (should (= emacs-reader--tts-position 9))
+              (should emacs-reader--tts-follow-pending))
+            (switch-to-buffer reader)
+            (run-hook-with-args 'window-buffer-change-functions (selected-window))
+            (should (= (point) 9))
+            (should (= (window-point) 9))
+            (should-not emacs-reader--tts-follow-pending)
+            (switch-to-buffer other)
+            (with-current-buffer reader
+              (goto-char (point-min))
+              (save-excursion (emacs-reader--tts-stop))
+              (should-not emacs-reader--tts-active)
+              (should emacs-reader--tts-follow-pending))
+            (switch-to-buffer reader)
+            (run-hook-with-args 'window-selection-change-functions (selected-window))
+            (should (= (point) 9))
+            (should-not emacs-reader--tts-follow-pending))
+        (when (buffer-live-p reader) (kill-buffer reader))
+        (when (buffer-live-p other) (kill-buffer other))))))
+
 (provide 'emacs-reader-test)
 
 ;;; emacs-reader-test.el ends here

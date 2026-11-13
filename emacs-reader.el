@@ -92,6 +92,10 @@ For WSL without Linux audio, use e.g. (\"mpv.exe\" \"--no-video\")."
 (defvar-local emacs-reader--tts-request-buffer nil)
 (defvar-local emacs-reader--tts-prefetch nil)
 (defvar-local emacs-reader--tts-prefetch-buffer nil)
+(defvar-local emacs-reader--tts-position nil
+  "Start of the paragraph actually being spoken, independent of buffer point.")
+(defvar-local emacs-reader--tts-follow-pending nil
+  "Non-nil when returning to this buffer should restore the speech position.")
 
 (defface emacs-reader-shelf-title '((t :inherit bold :height 1.15))
   "Face for book titles on the Reader shelf."
@@ -682,7 +686,9 @@ This command only reads chapter content; it does not write reading progress."
   (setq-local scroll-conservatively 0)
   (add-hook 'window-configuration-change-hook #'emacs-reader--fit-text-width nil t)
   (add-hook 'kill-buffer-hook #'emacs-reader--tts-stop nil t)
-  (add-hook 'change-major-mode-hook #'emacs-reader--tts-stop nil t))
+  (add-hook 'change-major-mode-hook #'emacs-reader--tts-stop nil t)
+  (add-hook 'window-buffer-change-functions #'emacs-reader--tts-follow-window nil t)
+  (add-hook 'window-selection-change-functions #'emacs-reader--tts-follow-window nil t))
 
 (defun emacs-reader--fit-text-width ()
   "Center an `emacs-reader-text-width' column in windows showing this buffer."
@@ -744,8 +750,23 @@ full-width U+3000 indents, are normalized."
 (define-key emacs-reader-reading-mode-map (kbd "C") #'emacs-reader-select-chapter)
 (define-key emacs-reader-reading-mode-map (kbd "r") #'emacs-reader-toggle-read-aloud)
 
+(defun emacs-reader--tts-follow-window (window)
+  "Restore WINDOW to its reading buffer's independently recorded speech position."
+  (when (and (window-live-p window) (eq (window-buffer window) (current-buffer))
+             (or emacs-reader--tts-active emacs-reader--tts-follow-pending)
+             (integerp emacs-reader--tts-position)
+             (<= (point-min) emacs-reader--tts-position (point-max)))
+    (goto-char emacs-reader--tts-position)
+    (set-window-point window emacs-reader--tts-position)
+    (unless (pos-visible-in-window-p emacs-reader--tts-position window)
+      (set-window-start window emacs-reader--tts-position))
+    (setq emacs-reader--tts-follow-pending nil)))
+
 (defun emacs-reader--tts-stop ()
   "Stop playback and discard pending speech in the current reading buffer."
+  (when (and emacs-reader--tts-active emacs-reader--tts-position
+             (not (eq (window-buffer (selected-window)) (current-buffer))))
+    (setq emacs-reader--tts-follow-pending t))
   (setq emacs-reader--tts-active nil
         emacs-reader--tts-generation (1+ emacs-reader--tts-generation))
   (when (process-live-p emacs-reader--tts-process)
@@ -762,7 +783,12 @@ full-width U+3000 indents, are normalized."
   (when (and emacs-reader--tts-file (file-exists-p emacs-reader--tts-file))
     (delete-file emacs-reader--tts-file))
   (setq emacs-reader--tts-file nil)
-  (when (overlayp emacs-reader--tts-overlay) (delete-overlay emacs-reader--tts-overlay))
+  (when (overlayp emacs-reader--tts-overlay)
+    (when (overlay-start emacs-reader--tts-overlay)
+      (goto-char (overlay-start emacs-reader--tts-overlay))
+      (dolist (window (get-buffer-window-list (current-buffer) nil t))
+        (set-window-point window (point))))
+    (delete-overlay emacs-reader--tts-overlay))
   (setq emacs-reader--tts-overlay nil)
   (force-mode-line-update))
 
@@ -821,6 +847,8 @@ full-width U+3000 indents, are normalized."
   (interactive)
   (unless (derived-mode-p 'emacs-reader-reading-mode)
     (user-error "请在阅读页面使用朗读"))
+  (when emacs-reader--tts-follow-pending
+    (emacs-reader--tts-follow-window (selected-window)))
   (if emacs-reader--tts-active
       (progn (emacs-reader--tts-stop) (message "朗读已停止"))
     (unless (and (integerp emacs-reader--current-chapter-index)
@@ -828,7 +856,9 @@ full-width U+3000 indents, are normalized."
       (user-error "请等待章节加载完成"))
     (emacs-reader--tts-player)
     (emacs-reader--tts-stop)
-    (setq emacs-reader--tts-active t)
+    (setq emacs-reader--tts-active t
+          emacs-reader--tts-position nil
+          emacs-reader--tts-follow-pending nil)
     (emacs-reader--tts-read-paragraph (point))))
 
 (defun emacs-reader--tts-paragraph (position)
@@ -931,12 +961,13 @@ full-width U+3000 indents, are normalized."
               (let ((coding-system-for-write 'no-conversion))
                 (write-region audio nil emacs-reader--tts-file nil 'silent)))
             (when (overlayp emacs-reader--tts-overlay) (delete-overlay emacs-reader--tts-overlay))
+            (setq emacs-reader--tts-position start
+                  emacs-reader--tts-follow-pending t)
+            (goto-char start)
             (setq emacs-reader--tts-overlay (make-overlay start end))
             (overlay-put emacs-reader--tts-overlay 'face 'emacs-reader-tts-paragraph)
             (dolist (window (get-buffer-window-list buffer nil t))
-              (set-window-point window start)
-              (unless (pos-visible-in-window-p start window)
-                (set-window-start window start)))
+              (emacs-reader--tts-follow-window window))
             (setq emacs-reader--tts-process
                   (make-process
                    :name "emacs-reader-speech" :buffer nil :connection-type 'pipe :noquery t
@@ -1166,6 +1197,7 @@ With HTML-P, render HTML; otherwise normalize plain text.  Nil means failure."
                          (error nil)))))
         (if (and text (not (string-blank-p text)))
             (let ((inhibit-read-only t))
+              (setq emacs-reader--tts-position nil emacs-reader--tts-follow-pending nil)
               (erase-buffer)
               (insert "\n" text "\n")
               (goto-char (point-min))
