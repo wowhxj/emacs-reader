@@ -519,6 +519,145 @@
     (should (eq (lookup-key emacs-reader-reading-mode-map (kbd (car binding)))
                 (cdr binding)))))
 
+(ert-deftest emacs-reader-epub-chapter-loads-html-instead-of-showing-path ()
+  (let ((emacs-reader-server-url "https://reader.example/reader")
+        (emacs-reader--session-cookie "test-session")
+        request)
+    (with-temp-buffer
+      (emacs-reader-reading-mode)
+      (setq emacs-reader--current-book '((bookUrl . "local.epub") (name . "Test"))
+            emacs-reader--chapter-request-id 1)
+      (cl-letf (((symbol-function 'emacs-reader--url-transport)
+                 (lambda (captured callback)
+                   (setq request captured)
+                   (funcall callback
+                            '(:ok "<html><body><p>第一段。</p><p>第二段。</p></body></html>")))))
+        (emacs-reader--handle-chapter-response
+         (current-buffer) 1 2
+         '(:ok ((isSuccess . t)
+                (data . "/book-assets/user/测试 (书).epub/index/chapter3.html")))))
+      (should (equal (plist-get request :url)
+                     "https://reader.example/book-assets/user/%E6%B5%8B%E8%AF%95%20(%E4%B9%A6).epub/index/chapter3.html"))
+      (should (equal (assoc "Cookie" (plist-get request :headers))
+                     '("Cookie" . "reader.session=test-session")))
+      (should (string-match-p "第一段。" (buffer-string)))
+      (should (string-match-p "第二段。" (buffer-string)))
+      (should-not (string-match-p "/book-assets/\\|<p>" (buffer-string)))
+      (should (= emacs-reader--current-chapter-index 2)))))
+
+(ert-deftest emacs-reader-book-asset-path-stays-on-the-reader-origin ()
+  (let ((emacs-reader-server-url "https://reader.example/reader"))
+    (should (equal (emacs-reader--book-asset-url "/book-assets/a%20b.epub/chapter.xhtml")
+                   "https://reader.example/book-assets/a%20b.epub/chapter.xhtml"))
+    (dolist (path '("https://other.example/book-assets/a.html"
+                    "//other.example/book-assets/a.html"
+                    "/book-assets/../private" "/book-assets/./private"
+                    "/book-assets/%2E%2e/private" "/book-assets/%252e%252e/private"
+                    "/book-assets/a%2fb" "/book-assets/a%5Cb"
+                    "/book-assets/a\\b" "/book-assets/a?query=secret"
+                    "/book-assets/a#fragment" "/book-assets/a%0d%0aInjected"
+                    "/book-assets/a\nb" "/book-assets/a\rb"))
+      (should-error (emacs-reader--book-asset-url path) :type 'user-error))))
+
+(ert-deftest emacs-reader-html-rendering-keeps-paragraphs-without-network ()
+  (cl-letf (((symbol-function 'url-retrieve)
+             (lambda (&rest _) (ert-fail "HTML must not fetch external resources"))))
+    (let ((text (emacs-reader--html-chapter-text
+                 (concat "<html><head><title>Metadata</title>"
+                         "<style>p {color:red}</style></head><body>"
+                         "<h2>Chapter title</h2><p>First &amp; second。</p>"
+                         "<script>untrusted-script</script>"
+                         "<img src='https://other.example/image.png' alt='illustration'/>"
+                         "<p>Last paragraph。</p></body></html>"))))
+      (should (string-match-p "Chapter title\n\n　　First & second。" text))
+      (should (string-match-p "Last paragraph。" text))
+      (should-not (string-match-p "Metadata\\|untrusted-script\\|color:red" text))
+      (should-not (text-properties-at 0 text)))))
+
+(ert-deftest emacs-reader-epub-failure-and-stale-response-preserve-chapter ()
+  (let ((emacs-reader-server-url "https://reader.example") callback)
+    (with-temp-buffer
+      (emacs-reader-reading-mode)
+      (let ((inhibit-read-only t)) (insert "Existing chapter。"))
+      (setq emacs-reader--current-book '((bookUrl . "local.epub"))
+            emacs-reader--current-chapter-index 0
+            emacs-reader--requested-chapter-index 1
+            emacs-reader--chapter-request-id 1)
+      (cl-letf (((symbol-function 'emacs-reader--url-transport)
+                 (lambda (_request cb) (setq callback cb))))
+        (emacs-reader--handle-chapter-response
+         (current-buffer) 1 1
+         '(:ok ((isSuccess . t) (data . "/book-assets/a.epub/chapter.html")))))
+      (should callback)
+      (funcall callback '(:error server :status 500))
+      (should (equal (buffer-string) "Existing chapter。"))
+      (should (= emacs-reader--current-chapter-index 0))
+      (should (= emacs-reader--requested-chapter-index 0))
+      (setq emacs-reader--chapter-request-id 2
+            emacs-reader--requested-chapter-index 2
+            mode-line-process " Loading...")
+      (funcall callback '(:ok "<html><body><p>Stale chapter。</p></body></html>"))
+      (should (equal (buffer-string) "Existing chapter。"))
+      (should (= emacs-reader--requested-chapter-index 2))
+      (should (equal mode-line-process " Loading..."))
+      (cl-letf (((symbol-function 'emacs-reader--url-transport)
+                 (lambda (&rest _) (ert-fail "Invalid asset must not be requested"))))
+        (emacs-reader--handle-chapter-response
+         (current-buffer) 2 2
+         '(:ok ((isSuccess . t) (data . "/book-assets/../private")))))
+      (should (equal (buffer-string) "Existing chapter。")))))
+
+(ert-deftest emacs-reader-html-response-checks-size-type-and-redirects ()
+  (dolist (mime '("text/html;charset=UTF-8" "application/xhtml+xml"))
+    (with-temp-buffer
+      (insert "HTTP/1.1 200 OK\r\n\r\n<p>Test</p>")
+      (let ((url-http-response-status 200) (url-http-content-type mime)
+            (url-http-content-length nil))
+        (should (equal (plist-get (emacs-reader--http-response nil t) :ok)
+                       "<p>Test</p>"))
+        (let ((emacs-reader-max-response-bytes 2))
+          (should (eq (plist-get (emacs-reader--http-response nil t) :error)
+                      'response-too-large)))
+        (let ((url-http-content-type "application/json"))
+          (should (eq (plist-get (emacs-reader--http-response nil t) :error)
+                      'unexpected-content-type)))
+        (let ((url-http-response-status 302))
+          (should (eq (plist-get (emacs-reader--http-response '(:redirect t) t) :error)
+                      'redirect)))))))
+
+(ert-deftest emacs-reader-epub-asset-loads-through-loopback-http ()
+  (let* ((body (encode-coding-string "<html><body><p>本地章节。</p></body></html>" 'utf-8))
+         (emacs-reader-test--http-response
+          (concat (format "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=UTF-8\r\nContent-Length: %d\r\nConnection: close\r\n\r\n" (string-bytes body)) body))
+         (emacs-reader-test--http-request "")
+         (emacs-reader--session-cookie "fixture-cookie")
+         (url-proxy-services nil)
+         (server (make-network-process :name "reader-epub-fixture"
+                                       :family 'ipv4 :host "127.0.0.1" :service t
+                                       :server t :noquery t
+                                       :log #'emacs-reader-test--http-server-log)))
+    (unwind-protect
+        (let ((emacs-reader-server-url
+               (format "http://127.0.0.1:%d" (process-contact server :service))))
+          (with-temp-buffer
+            (emacs-reader-reading-mode)
+            (setq emacs-reader--current-book '((bookUrl . "local.epub"))
+                  emacs-reader--chapter-request-id 1)
+            (emacs-reader--handle-chapter-response
+             (current-buffer) 1 0
+             '(:ok ((isSuccess . t) (data . "/book-assets/a.epub/chapter.html"))))
+            (let ((deadline (time-add (current-time) 3.0)))
+              (while (and (null emacs-reader--current-chapter-index)
+                          (time-less-p (current-time) deadline))
+                (accept-process-output nil 0.05)))
+            (should (equal emacs-reader--current-chapter-index 0))
+            (should (string-match-p "本地章节。" (buffer-string)))
+            (should (string-match-p "GET /book-assets/a.epub/chapter.html"
+                                    emacs-reader-test--http-request))
+            (should (string-match-p "Cookie: reader.session=fixture-cookie"
+                                    emacs-reader-test--http-request))))
+      (delete-process server))))
+
 (provide 'emacs-reader-test)
 
 ;;; emacs-reader-test.el ends here

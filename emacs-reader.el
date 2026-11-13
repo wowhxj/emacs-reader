@@ -18,6 +18,7 @@
 (require 'auth-source)
 (require 'cl-lib)
 (require 'json)
+(require 'shr)
 (require 'subr-x)
 (require 'url)
 (require 'url-http)
@@ -184,7 +185,12 @@ The caller must clear the returned string after use."
     (and (stringp password) (copy-sequence password))))
 
 (defun emacs-reader--json-response (status)
-  "Normalize the current URL response and STATUS without retaining its body."
+  "Normalize a JSON response and STATUS without retaining its body."
+  (emacs-reader--http-response status))
+
+(defun emacs-reader--http-response (status &optional html-p)
+  "Normalize the current URL response and STATUS.
+When HTML-P is non-nil, accept HTML instead of JSON and return decoded text."
   (let ((response-status url-http-response-status)
         (content-type url-http-content-type)
         (content-length url-http-content-length))
@@ -213,7 +219,9 @@ The caller must clear the returned string after use."
       (list :error 'response-too-large :status response-status))
      ((not (and (stringp content-type)
                 (string-match-p
-                 "\\`application/\\(?:[[:alnum:].+-]+\\+\\)?json\\(?:[;[:space:]]\\|\\'\\)"
+                 (if html-p
+                     "\\`\\(?:text/html\\|application/xhtml\\+xml\\)\\(?:[;[:space:]]\\|\\'\\)"
+                   "\\`application/\\(?:[[:alnum:].+-]+\\+\\)?json\\(?:[;[:space:]]\\|\\'\\)")
                  (downcase content-type))))
       (list :error 'unexpected-content-type :status response-status))
      (t
@@ -225,8 +233,12 @@ The caller must clear the returned string after use."
         (if (not separator)
             (list :error 'invalid-response :status response-status)
           (let ((body (buffer-substring-no-properties separator (point-max))))
-            (if (> (string-bytes body) emacs-reader-max-response-bytes)
-                (list :error 'response-too-large :status response-status)
+            (cond
+             ((> (string-bytes body) emacs-reader-max-response-bytes)
+              (list :error 'response-too-large :status response-status))
+             (html-p
+              (list :ok (decode-coding-string body 'utf-8) :status response-status))
+             (t
               (condition-case nil
                   (setq json
                         (json-parse-string
@@ -237,7 +249,7 @@ The caller must clear the returned string after use."
                  (setq json :invalid-json)))
               (if (eq json :invalid-json)
                   (list :error 'invalid-json :status response-status)
-                (list :ok json :status response-status))))))))))
+                (list :ok json :status response-status)))))))))))
 
 (defun emacs-reader--response-session-cookie ()
   "Return the Reader3 session-cookie value from the current response, if any.
@@ -259,8 +271,9 @@ The result is (t . VALUE), allowing an empty VALUE to clear the session."
               value (match-string-no-properties 1)))
       (and found (cons t value)))))
 
-(defun emacs-reader--url-callback (status callback)
-  "Normalize STATUS, capture the session cookie, invoke CALLBACK, and clean up."
+(defun emacs-reader--url-callback (status callback &optional html-p)
+  "Normalize STATUS, capture the session cookie, invoke CALLBACK, and clean up.
+HTML-P selects an HTML response instead of the default JSON response."
   (let ((buffer (current-buffer))
         (cookie (emacs-reader--response-session-cookie)))
     (unwind-protect
@@ -273,13 +286,15 @@ The result is (t . VALUE), allowing an empty VALUE to clear the session."
                     (and (not (string-empty-p value))
                          (string-match-p "\\`[A-Za-z0-9._~%:+/=-]+\\'" value)
                          value))))
-          (funcall callback (emacs-reader--json-response status)))
+          (funcall callback (if html-p
+                                (emacs-reader--http-response status t)
+                              (emacs-reader--json-response status))))
       (when (buffer-live-p buffer)
         (kill-buffer buffer)))))
 
 (defun emacs-reader--url-transport (request callback)
   "Send REQUEST asynchronously with `url-retrieve' and call CALLBACK.
-REQUEST is a plist containing :url, :method, :headers, and optional :data."
+REQUEST contains :url, :method, :headers, optional :data, and :html for HTML."
   (let* ((url-request-method (plist-get request :method))
          (url-request-data (plist-get request :data))
          (url-request-extra-headers (plist-get request :headers))
@@ -290,7 +305,7 @@ REQUEST is a plist containing :url, :method, :headers, and optional :data."
          (url-history-track nil)
          (buffer (url-retrieve (plist-get request :url)
                                #'emacs-reader--url-callback
-                               (list callback) t t)))
+                               (list callback (plist-get request :html)) t t)))
     (when (buffer-live-p buffer)
       (with-current-buffer buffer
         (setq emacs-reader--transport-error nil))
@@ -705,31 +720,92 @@ full-width U+3000 indents, are normalized."
                 (concat ": " title)
               ""))))
 
-(defun emacs-reader--handle-chapter-response (buffer request-id index response)
-  "Display a successful chapter RESPONSE in BUFFER if it is still current."
-  (when (and (buffer-live-p buffer)
-             (= request-id
-                (buffer-local-value 'emacs-reader--chapter-request-id buffer)))
+(defun emacs-reader--book-asset-url (path)
+  "Return a same-origin URL for a server-supplied book asset PATH."
+  (unless (and (stringp path) (string-prefix-p "/book-assets/" path)
+               (not (string-match-p "[?#\\\\[:cntrl:]]" path))
+               (not (string-match-p "\\(?:^\\|/\\)\\.\\.?\\(?:/\\|$\\)" path))
+               (not (string-match-p
+                     "%\\(?:2[eEfF]\\|5[cC]\\|25\\|0[[:xdigit:]]\\|1[[:xdigit:]]\\|7[fF]\\)"
+                     path)))
+    (user-error "Invalid Reader book asset path"))
+  (let ((url (emacs-reader--parsed-server-url)))
+    (setf (url-filename url) (url-encode-url path)
+          (url-target url) nil)
+    (url-recreate-url url)))
+
+(defun emacs-reader--html-chapter-text (html)
+  "Render HTML as paragraphs without loading images or other resources."
+  (unless (libxml-available-p)
+    (user-error "This Emacs needs libxml support to read EPUB chapters"))
+  (with-temp-buffer
+    (insert html)
+    (let ((dom (libxml-parse-html-region (point-min) (point-max)))
+          (shr-inhibit-images t)
+          (shr-use-fonts nil)
+          (shr-use-colors nil)
+          (shr-width most-positive-fixnum)
+          (shr-max-width nil))
+      (erase-buffer)
+      (shr-insert-document (car (dom-by-tag dom 'body)))
+      ;; HTML already defines paragraph boundaries; do not merge headings or verse.
+      (mapconcat
+       (lambda (paragraph)
+         (concat "　　" (string-trim paragraph "[ \t\n　 ]+" "[ \t\n　 ]+")))
+       (split-string (buffer-substring-no-properties (point-min) (point-max))
+                     "\n[ \t]*\n+" t) "\n\n"))))
+
+(defun emacs-reader--chapter-request-current-p (buffer request-id)
+  "Whether BUFFER still expects the chapter response for REQUEST-ID."
+  (and (buffer-live-p buffer)
+       (= request-id
+          (buffer-local-value 'emacs-reader--chapter-request-id buffer))))
+
+(defun emacs-reader--display-chapter (buffer request-id index content &optional html-p)
+  "Display CONTENT for INDEX in BUFFER if REQUEST-ID is current.
+With HTML-P, render HTML; otherwise normalize plain text.  Nil means failure."
+  (when (emacs-reader--chapter-request-current-p buffer request-id)
     (with-current-buffer buffer
       (setq mode-line-process nil)
-      (let* ((json (plist-get response :ok))
-             (content (and (listp json)
-                           (eq (alist-get 'isSuccess json) t)
-                           (alist-get 'data json))))
-        (if (stringp content)
+      (let ((text (and (stringp content)
+                       (condition-case nil
+                           (if html-p (emacs-reader--html-chapter-text content)
+                             (emacs-reader--format-chapter content))
+                         (error nil)))))
+        (if (and text (not (string-blank-p text)))
             (let ((inhibit-read-only t))
               (erase-buffer)
-              (insert "\n" (emacs-reader--format-chapter content) "\n")
+              (insert "\n" text "\n")
               (goto-char (point-min))
               (setq emacs-reader--current-chapter-index index
                     emacs-reader--requested-chapter-index index
                     header-line-format
-                    (emacs-reader--chapter-heading
-                     emacs-reader--current-book index))
+                    (emacs-reader--chapter-heading emacs-reader--current-book index))
               (message "Loaded chapter %d" (1+ index)))
-          (setq emacs-reader--requested-chapter-index
-                emacs-reader--current-chapter-index)
+          (setq emacs-reader--requested-chapter-index emacs-reader--current-chapter-index)
           (message "Reader chapter unavailable; no progress was changed"))))))
+
+(defun emacs-reader--handle-chapter-response (buffer request-id index response)
+  "Display a chapter RESPONSE or fetch its EPUB resource if still current."
+  (when (emacs-reader--chapter-request-current-p buffer request-id)
+    (let* ((json (plist-get response :ok))
+           (content (and (listp json) (eq (alist-get 'isSuccess json) t)
+                         (alist-get 'data json)))
+           (path (and (stringp content) (string-trim content))))
+      (if (and path (string-prefix-p "/book-assets/" path))
+          (condition-case nil
+              (emacs-reader--url-transport
+               (list :url (emacs-reader--book-asset-url path)
+                     :method "GET" :html t
+                     :headers `(("Accept" . "text/html, application/xhtml+xml")
+                                ,@(when emacs-reader--session-cookie
+                                    `(("Cookie" . ,(concat "reader.session="
+                                                           emacs-reader--session-cookie))))))
+               (lambda (asset-response)
+                 (emacs-reader--display-chapter
+                  buffer request-id index (plist-get asset-response :ok) t)))
+            (error (emacs-reader--display-chapter buffer request-id index nil)))
+        (emacs-reader--display-chapter buffer request-id index content)))))
 
 (defun emacs-reader--chapter-navigation-base ()
   "Return the best zero-based chapter index for navigation."

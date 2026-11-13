@@ -2,7 +2,7 @@
 
 [hectorqin/reader](https://github.com/hectorqin/reader) 的轻量 Emacs 客户端：最近阅读优先的卡片书架、中文段落排版、居中阅读与章节切换。
 
-目前支持 Reader3（`/reader3/`）文本章节阅读，**尚未实现进度同步和 EmuReader 集成**。已在 Emacs 32.0.50 验证。
+目前支持 Reader3（`/reader3/`）文本与 EPUB 章节阅读（EPUB 需 Emacs 带 libxml 支持），**尚未实现进度同步和 EmuReader 集成**。已在 Emacs 32.0.50 验证。
 
 ## 安装与配置
 
