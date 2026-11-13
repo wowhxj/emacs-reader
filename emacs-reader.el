@@ -70,6 +70,12 @@ A CJK character occupies two columns."
   "Name of the Reader server's HttpTTS configuration to use."
   :type 'string :group 'emacs-reader)
 
+(defcustom emacs-reader-tts-player-command nil
+  "Audio player executable and arguments, or nil for automatic selection.
+For WSL without Linux audio, use e.g. (\"mpv.exe\" \"--no-video\")."
+  :type '(choice (const :tag "Automatic" nil) (repeat string))
+  :group 'emacs-reader)
+
 (defcustom emacs-reader-tts-rate 1.0
   "Reader speech rate, normally between 0.5 and 2.0."
   :type 'number :group 'emacs-reader)
@@ -84,6 +90,8 @@ A CJK character occupies two columns."
 (defvar-local emacs-reader--tts-file nil)
 (defvar-local emacs-reader--tts-overlay nil)
 (defvar-local emacs-reader--tts-request-buffer nil)
+(defvar-local emacs-reader--tts-prefetch nil)
+(defvar-local emacs-reader--tts-prefetch-buffer nil)
 
 (defface emacs-reader-shelf-title '((t :inherit bold :height 1.15))
   "Face for book titles on the Reader shelf."
@@ -743,12 +751,14 @@ full-width U+3000 indents, are normalized."
   (when (process-live-p emacs-reader--tts-process)
     (delete-process emacs-reader--tts-process))
   (setq emacs-reader--tts-process nil)
-  (when (buffer-live-p emacs-reader--tts-request-buffer)
-    (let ((process (get-buffer-process emacs-reader--tts-request-buffer)))
-      (when (process-live-p process) (delete-process process)))
-    (when (buffer-live-p emacs-reader--tts-request-buffer)
-      (kill-buffer emacs-reader--tts-request-buffer)))
-  (setq emacs-reader--tts-request-buffer nil)
+  (dolist (buffer (list emacs-reader--tts-request-buffer emacs-reader--tts-prefetch-buffer))
+    (when (buffer-live-p buffer)
+      (let ((process (get-buffer-process buffer)))
+        (when (process-live-p process) (delete-process process)))
+      (when (buffer-live-p buffer) (kill-buffer buffer))))
+  (setq emacs-reader--tts-request-buffer nil
+        emacs-reader--tts-prefetch-buffer nil
+        emacs-reader--tts-prefetch nil)
   (when (and emacs-reader--tts-file (file-exists-p emacs-reader--tts-file))
     (delete-file emacs-reader--tts-file))
   (setq emacs-reader--tts-file nil)
@@ -762,13 +772,49 @@ full-width U+3000 indents, are normalized."
        (buffer-local-value 'emacs-reader--tts-active buffer)
        (= generation (buffer-local-value 'emacs-reader--tts-generation buffer))))
 
+(defun emacs-reader--wsl-p ()
+  "Whether Emacs is running in Windows Subsystem for Linux."
+  (and (eq system-type 'gnu/linux)
+       (or (getenv "WSL_DISTRO_NAME") (getenv "WSL_INTEROP")
+           (and (file-readable-p "/proc/sys/kernel/osrelease")
+                (with-temp-buffer
+                  (insert-file-contents "/proc/sys/kernel/osrelease")
+                  (string-match-p "microsoft" (downcase (buffer-string))))))))
+
 (defun emacs-reader--tts-player ()
-  "Return a local audio player's command without shell expansion."
-  (cond ((executable-find "afplay") (list (executable-find "afplay")))
+  "Return a local or WSL-accessible audio player's command without a shell."
+  (cond (emacs-reader-tts-player-command
+         (unless (and (consp emacs-reader-tts-player-command)
+                      (cl-every #'stringp emacs-reader-tts-player-command)
+                      (executable-find (car emacs-reader-tts-player-command)))
+           (user-error "无效或不可用的朗读播放器命令"))
+         (cons (executable-find (car emacs-reader-tts-player-command))
+               (cdr emacs-reader-tts-player-command)))
+        ((executable-find "afplay") (list (executable-find "afplay")))
         ((executable-find "mpv") (list (executable-find "mpv") "--no-video" "--really-quiet"))
         ((executable-find "ffplay")
          (list (executable-find "ffplay") "-nodisp" "-autoexit" "-loglevel" "quiet"))
-        (t (user-error "朗读需要 afplay、mpv 或 ffplay"))))
+        ((and (emacs-reader--wsl-p) (executable-find "mpv.exe"))
+         (list (executable-find "mpv.exe") "--no-video" "--really-quiet"))
+        ((and (emacs-reader--wsl-p) (executable-find "ffplay.exe"))
+         (list (executable-find "ffplay.exe") "-nodisp" "-autoexit" "-loglevel" "quiet"))
+        (t (user-error "朗读需要 afplay、mpv 或 ffplay；WSL 也可使用 PATH 中的 mpv.exe/ffplay.exe"))))
+
+(defun emacs-reader--tts-player-command (file)
+  "Build a playback command for FILE, translating WSL paths for Windows players."
+  (let ((command (emacs-reader--tts-player)))
+    (when (and (emacs-reader--wsl-p) (string-suffix-p ".exe" (car command) t))
+      (unless (executable-find "wslpath")
+        (user-error "WSL 调用 Windows 播放器需要 wslpath"))
+      (setq file
+            (with-temp-buffer
+              (unless (eq 0 (process-file "wslpath" nil t nil "-w" file))
+                (user-error "无法将音频文件路径转换为 Windows 路径"))
+              (let ((path (string-trim (buffer-string))))
+                (when (or (string-empty-p path) (string-match-p "[\r\n]" path))
+                  (user-error "wslpath 返回了无效路径"))
+                path))))
+    (append command (list file))))
 
 (defun emacs-reader-toggle-read-aloud ()
   "Toggle paragraph-by-paragraph speech using the Reader server's HttpTTS."
@@ -785,41 +831,89 @@ full-width U+3000 indents, are normalized."
     (setq emacs-reader--tts-active t)
     (emacs-reader--tts-read-paragraph (point))))
 
-(defun emacs-reader--tts-read-paragraph (position)
-  "Read the paragraph at POSITION, continuing until this chapter ends."
+(defun emacs-reader--tts-paragraph (position)
+  "Return (START END TEXT) for POSITION's paragraph, or nil at chapter end."
   (save-excursion
     (goto-char position)
     (skip-chars-forward " \t\r\n　 ")
-    (if (eobp)
-        (progn (emacs-reader--tts-stop) (message "本章朗读完毕"))
-      (let* ((buffer (current-buffer))
-             (generation emacs-reader--tts-generation)
-             (separator "\n[ \t　 ]*\n")
+    (unless (eobp)
+      (let* ((separator "\n[ \t　 ]*\n")
              (start (save-excursion
                       (if (re-search-backward separator nil t) (match-end 0) (point-min))))
              (end (save-excursion
-                    (if (re-search-forward separator nil t) (match-beginning 0) (point-max))))
-             (text (string-trim (buffer-substring-no-properties start end))))
-        (message "正在获取朗读音频…")
-        (emacs-reader--ensure-session
-         (lambda (ok)
-           (when (emacs-reader--tts-current-p buffer generation)
-             (with-current-buffer buffer
-               (if (not ok)
-                   (progn (emacs-reader--tts-stop) (message "朗读登录失败"))
-                 (condition-case nil
-                     (setq emacs-reader--tts-request-buffer
-                           (emacs-reader--reader3-request
-                            "book/tts" "POST"
-                            `((text . ,text) (type . "httpTTS")
-                              (voice . ,emacs-reader-tts-voice)
-                              (rate . ,(number-to-string emacs-reader-tts-rate))
-                              (pitch . "1") (base64 . "1")
-                              (accessToken . ,emacs-reader--token))
-                            (lambda (response)
-                              (emacs-reader--tts-play-response
-                               buffer generation start end response))))
-                   (error (emacs-reader--tts-stop) (message "朗读请求失败"))))))))))))
+                    (if (re-search-forward separator nil t) (match-beginning 0) (point-max)))))
+        (list start end (string-trim (buffer-substring-no-properties start end)))))))
+
+(defun emacs-reader--tts-fetch (text callback)
+  "Fetch TEXT's audio with the current session; deliver RESPONSE to CALLBACK."
+  (emacs-reader--reader3-request
+   "book/tts" "POST"
+   `((text . ,text) (type . "httpTTS") (voice . ,emacs-reader-tts-voice)
+     (rate . ,(number-to-string emacs-reader-tts-rate))
+     (pitch . "1") (base64 . "1") (accessToken . ,emacs-reader--token))
+   callback))
+
+(defun emacs-reader--tts-read-paragraph (position)
+  "Read POSITION's paragraph, consuming its prefetched audio when available."
+  (let* ((paragraph (emacs-reader--tts-paragraph position))
+         (buffer (current-buffer))
+         (generation emacs-reader--tts-generation)
+         (job emacs-reader--tts-prefetch))
+    (cond
+     ((null paragraph) (emacs-reader--tts-stop) (message "本章朗读完毕"))
+     ((and job (= (car paragraph) (plist-get job :start)))
+      (if (plist-get job :ready)
+          (progn
+            (setq emacs-reader--tts-prefetch nil)
+            (emacs-reader--tts-play-response buffer generation (car paragraph) (cadr paragraph)
+                                             (plist-get job :response)))
+        (setf (plist-get job :waiting) t)
+        (message "下一段音频仍在生成…")))
+     (t
+      (message "正在获取朗读音频…")
+      (emacs-reader--ensure-session
+       (lambda (ok)
+         (when (emacs-reader--tts-current-p buffer generation)
+           (with-current-buffer buffer
+             (if (not ok)
+                 (progn (emacs-reader--tts-stop) (message "朗读登录失败"))
+               (condition-case nil
+                   (setq emacs-reader--tts-request-buffer
+                         (emacs-reader--tts-fetch
+                          (nth 2 paragraph)
+                          (lambda (response)
+                            (emacs-reader--tts-play-response
+                             buffer generation (car paragraph) (cadr paragraph) response))))
+                 (error (emacs-reader--tts-stop) (message "朗读请求失败"))))))))))))
+
+(defun emacs-reader--tts-prefetch-next (position)
+  "Prefetch at most one paragraph after POSITION while current audio plays."
+  (let ((paragraph (emacs-reader--tts-paragraph position))
+        (buffer (current-buffer))
+        (generation emacs-reader--tts-generation))
+    (when (and paragraph (not emacs-reader--tts-prefetch))
+      (let ((job (list :start (car paragraph) :end (cadr paragraph)
+                       :ready nil :waiting nil :response nil)))
+        (setq emacs-reader--tts-prefetch job)
+        (condition-case nil
+            (setq emacs-reader--tts-prefetch-buffer
+                  (emacs-reader--tts-fetch
+                   (nth 2 paragraph)
+                   (lambda (response)
+                     (when (emacs-reader--tts-current-p buffer generation)
+                       (with-current-buffer buffer
+                         (when (eq job emacs-reader--tts-prefetch)
+                           (setq emacs-reader--tts-prefetch-buffer nil)
+                           (setf (plist-get job :ready) t
+                                 (plist-get job :response) response)
+                           (when (plist-get job :waiting)
+                             (setq emacs-reader--tts-prefetch nil)
+                             (emacs-reader--tts-play-response
+                              buffer generation (plist-get job :start)
+                              (plist-get job :end) response))))))))
+          ;; A failed prefetch must not interrupt the paragraph already playing.
+          (error (setf (plist-get job :ready) t
+                       (plist-get job :response) '(:error transport))))))))
 
 (defun emacs-reader--tts-play-response (buffer generation start end response)
   "Play RESPONSE for BUFFER's paragraph START to END if GENERATION is current."
@@ -846,7 +940,7 @@ full-width U+3000 indents, are normalized."
             (setq emacs-reader--tts-process
                   (make-process
                    :name "emacs-reader-speech" :buffer nil :connection-type 'pipe :noquery t
-                   :command (append (emacs-reader--tts-player) (list emacs-reader--tts-file))
+                   :command (emacs-reader--tts-player-command emacs-reader--tts-file)
                    :sentinel
                    (lambda (process _event)
                      (when (and (memq (process-status process) '(exit signal))
@@ -864,6 +958,7 @@ full-width U+3000 indents, are normalized."
                                  (emacs-reader--tts-read-paragraph end))
                              (emacs-reader--tts-stop)
                              (message "朗读播放失败，请检查播放器"))))))))
+            (emacs-reader--tts-prefetch-next end)
             (message "正在朗读；r 停止"))
         (error (emacs-reader--tts-stop) (message "朗读失败，请检查服务器 TTS 配置或重新登录"))))))
 

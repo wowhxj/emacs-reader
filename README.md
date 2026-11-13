@@ -46,6 +46,12 @@ Emacs 30+ 可用内置 `use-package` 的 `:vc` 从 GitHub 安装：
 | 目录 | `n` / `p` | 下一项 / 上一项 |
 | 目录 | `RET` / `q` | 跳转选中章节 / 返回阅读 |
 
-朗读复用服务器 HttpTTS 配置，默认声音为“晓晓”，可通过 `emacs-reader-tts-voice` 修改，`emacs-reader-tts-rate` 调节语速。需本机有 `afplay`（macOS 自带）、`mpv` 或 `ffplay`。从光标所在段落读到本章结束；切章或关闭缓冲区自动停止，不同步服务器进度。
+朗读复用服务器 HttpTTS 配置，默认声音为“晓晓”，可通过 `emacs-reader-tts-voice` 修改，`emacs-reader-tts-rate` 调节语速。需本机有 `afplay`（macOS 自带）、`mpv` 或 `ffplay`。从光标所在段落读到本章结束，播放时预取下一段以减少停顿；切章或关闭缓冲区自动停止并清理预取，不同步服务器进度。
+
+WSL2 + WSLg 可安装 Linux 侧 `mpv` 播放。没有 Linux 音频输出时，可在 Windows 安装 `mpv` 或 `ffplay` 并加入 PATH，WSL 中确认 `command -v mpv.exe` 或 `command -v ffplay.exe` 能找到；客户端会用 `wslpath` 转换音频路径。若需要强制使用 Windows 播放器：
+
+```elisp
+(setq emacs-reader-tts-player-command '("mpv.exe" "--no-video" "--really-quiet"))
+```
 
 `M-x customize-group RET emacs-reader` 可调整阅读宽度、书架字体和颜色。
