@@ -588,7 +588,7 @@ Create the tab if necessary; otherwise reuse it."
   (setq-local truncate-lines t)
   (setq-local line-spacing 0.2)
   (setq header-line-format
-        (propertize "  Bookshelf   RET open   g refresh   n/p move"
+        (propertize "  Bookshelf   RET open   s search   g refresh   n/p move"
                     'face 'emacs-reader-shelf-meta)))
 
 (define-key emacs-reader-shelf-mode-map (kbd "q") #'emacs-reader-quit)
@@ -667,9 +667,206 @@ Create the tab if necessary; otherwise reuse it."
   (or (get-text-property (point) 'emacs-reader-book)
       (user-error "No book on this shelf row")))
 
-(defun emacs-reader-open-book (book)
+(defvar-local emacs-reader--search-config nil
+  "Search parameters: keyword, source, group, page and source cursor.")
+(defvar-local emacs-reader--search-books nil)
+(defvar-local emacs-reader--search-generation 0)
+(defvar-local emacs-reader--search-loading nil)
+(defvar-local emacs-reader--search-ended nil)
+(defvar-local emacs-reader--preview-p nil)
+(defvar-local emacs-reader--preview-start-pending nil)
+
+(define-derived-mode emacs-reader-search-mode tabulated-list-mode "Reader-Search"
+  "Source search results: RET previews, a adds to shelf, m loads more."
+  (setq tabulated-list-format [("书名" 32 t) ("作者" 18 t) ("书源" 24 t)
+                              ("最新章节" 0 nil)])
+  (setq header-line-format "  搜索结果   RET 试读   a 加入书架   m 更多   g 重试   s 新搜索")
+  (tabulated-list-init-header)
+  (hl-line-mode 1))
+
+(define-key emacs-reader-shelf-mode-map (kbd "s") #'emacs-reader-search)
+(define-key emacs-reader-search-mode-map (kbd "s") #'emacs-reader-search)
+(define-key emacs-reader-search-mode-map (kbd "q") #'emacs-reader-quit)
+(define-key emacs-reader-search-mode-map (kbd "n") #'next-line)
+(define-key emacs-reader-search-mode-map (kbd "p") #'previous-line)
+(define-key emacs-reader-search-mode-map (kbd "m") #'emacs-reader-search-more)
+(define-key emacs-reader-search-mode-map (kbd "g") #'emacs-reader-search-more)
+(define-key emacs-reader-search-mode-map (kbd "RET") #'emacs-reader-search-preview)
+(define-key emacs-reader-search-mode-map (kbd "a") #'emacs-reader-add-to-shelf)
+
+(defun emacs-reader--search-choices (sources)
+  "Return completion choices for SOURCES and their groups."
+  (let ((choices '(("多源：全部分组" . (:source "" :group "")))))
+    (dolist (source sources)
+      (let ((url (emacs-reader--book-field source 'bookSourceUrl))
+            (name (emacs-reader--book-field source 'bookSourceName)))
+        (unless (string-empty-p url)
+          (push (cons (format "单源：%s <%s>" name url)
+                      (list :source url :group "")) choices)))
+      (dolist (group (split-string
+                      (emacs-reader--book-field source 'bookSourceGroup) "," t))
+        (let ((label (concat "多源分组：" group)))
+          (unless (assoc label choices)
+            (push (cons label (list :source "" :group group)) choices)))))
+    (nreverse choices)))
+
+;;;###autoload
+(defun emacs-reader-search (keyword)
+  "Search configured server sources for KEYWORD, not the bookshelf."
+  (interactive (list (read-string "搜索书名或作者：")))
+  (setq keyword (string-trim keyword))
+  (when (string-empty-p keyword) (user-error "请输入搜索关键词"))
+  (message "正在读取服务器书源…")
+  (emacs-reader--reader3-request
+   "getBookSources" "GET" nil
+   (lambda (response)
+     (let* ((body (plist-get response :ok))
+            (json (and (listp body) body))
+            (sources (alist-get 'data json)))
+       (if (and (eq (alist-get 'isSuccess json) t) (consp sources)
+                (cl-every #'listp sources))
+           (let* ((choices (emacs-reader--search-choices sources))
+                  (choice (completing-read "搜索范围：" choices nil t nil nil
+                                           "多源：全部分组")))
+             (emacs-reader--start-search keyword (cdr (assoc choice choices))))
+         (message "书源列表不可用或为空；请先在 Web 端配置书源"))))))
+
+(defun emacs-reader--start-search (keyword config)
+  "Start a source search for KEYWORD with CONFIG in the search buffer."
+  (let ((buffer (get-buffer-create "*Reader Search*")))
+    (with-current-buffer buffer
+      (unless (derived-mode-p 'emacs-reader-search-mode)
+        (emacs-reader-search-mode))
+      (cl-incf emacs-reader--search-generation)
+      (setq emacs-reader--search-config
+            (append (list :key keyword :page 1 :last-index -1) config)
+            emacs-reader--search-books nil
+            emacs-reader--search-loading nil
+            emacs-reader--search-ended nil
+            tabulated-list-entries nil)
+      (tabulated-list-print))
+    (emacs-reader--display-buffer buffer)
+    (emacs-reader-search-more)))
+
+(defun emacs-reader-search-more ()
+  "Load the next source search batch, or retry a failed batch."
+  (interactive)
+  (unless (and (derived-mode-p 'emacs-reader-search-mode)
+               emacs-reader--search-config)
+    (user-error "请先运行 emacs-reader-search"))
+  (cond
+   (emacs-reader--search-loading (message "正在搜索，请稍候"))
+   (emacs-reader--search-ended (message "没有更多结果；按 s 开始新搜索"))
+   (t
+    (let* ((buffer (current-buffer))
+           (generation emacs-reader--search-generation)
+           (config emacs-reader--search-config)
+           (multi (string-empty-p (plist-get config :source))))
+      (setq emacs-reader--search-loading t mode-line-process " 搜索中…")
+      (condition-case nil
+          (emacs-reader--reader3-request
+           (if multi "searchBookMulti" "searchBook") "POST"
+           `((key . ,(plist-get config :key))
+             (bookSourceUrl . ,(plist-get config :source))
+             (bookSourceGroup . ,(plist-get config :group))
+             (concurrentCount . 4)
+             (lastIndex . ,(plist-get config :last-index))
+             (page . ,(plist-get config :page)))
+           (lambda (response)
+             (emacs-reader--handle-search-response buffer generation multi response)))
+        (error (emacs-reader--handle-search-response buffer generation multi nil)))))))
+
+(defun emacs-reader--handle-search-response (buffer generation multi response)
+  "Append search RESPONSE in BUFFER for GENERATION; MULTI selects its shape."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (when (and (derived-mode-p 'emacs-reader-search-mode)
+                 (= generation emacs-reader--search-generation))
+        (setq emacs-reader--search-loading nil mode-line-process nil)
+        (let* ((body (plist-get response :ok))
+               (json (and (listp body) body))
+               (data (alist-get 'data json))
+               (books (if multi (and (listp data) (alist-get 'list data)) data))
+               (cursor (and multi (listp data) (alist-get 'lastIndex data))))
+          (if (not (and (eq (alist-get 'isSuccess json) t)
+                        (listp books)
+                        (or (not multi) (integerp cursor))
+                        (cl-every (lambda (book)
+                                    (and (consp book)
+                                         (not (string-empty-p
+                                               (emacs-reader--book-field book 'bookUrl)))
+                                         (not (string-empty-p
+                                               (emacs-reader--book-field book 'origin)))))
+                                  books)))
+              (message "搜索失败；已有结果保留，按 g 重试")
+            (dolist (book books)
+              (unless (cl-find-if
+                       (lambda (old)
+                         (and (equal (alist-get 'bookUrl old) (alist-get 'bookUrl book))
+                              (equal (alist-get 'origin old) (alist-get 'origin book))))
+                       emacs-reader--search-books)
+                (setq emacs-reader--search-books
+                      (append emacs-reader--search-books (list book)))))
+            (setq emacs-reader--search-ended
+                  (if multi
+                      (or (eq (alist-get 'isEnd data) t)
+                          (<= cursor (plist-get emacs-reader--search-config :last-index)))
+                    (null books)))
+            (when multi
+              (setf (plist-get emacs-reader--search-config :last-index) cursor))
+            (cl-incf (plist-get emacs-reader--search-config :page))
+            (setq tabulated-list-entries
+                  (mapcar (lambda (book)
+                            (list book
+                                  (vector (emacs-reader--book-field book 'name)
+                                          (emacs-reader--book-field book 'author)
+                                          (emacs-reader--book-source book)
+                                          (emacs-reader--book-field book 'latestChapterTitle))))
+                          emacs-reader--search-books))
+            (tabulated-list-print t)
+            (message "搜索结果 %d 条%s" (length emacs-reader--search-books)
+                     (if emacs-reader--search-ended "，没有更多结果"
+                       "；按 m 继续搜索"))))))))
+
+(defun emacs-reader--selected-search-book ()
+  "Return the book on the selected search row."
+  (unless (derived-mode-p 'emacs-reader-search-mode)
+    (user-error "请先选择一条搜索结果"))
+  (or (tabulated-list-get-id) (user-error "当前行没有搜索结果")))
+
+(defun emacs-reader-search-preview ()
+  "Preview the selected source result without adding it to the shelf."
+  (interactive)
+  (emacs-reader-open-book (emacs-reader--selected-search-book) t))
+
+(defun emacs-reader-add-to-shelf ()
+  "Add the selected search result or current preview to the server shelf."
+  (interactive)
+  (let ((book (if (derived-mode-p 'emacs-reader-reading-mode)
+                  emacs-reader--current-book
+                (emacs-reader--selected-search-book))))
+    (unless (and (consp book)
+                 (not (string-empty-p (emacs-reader--book-field book 'bookUrl)))
+                 (not (string-empty-p (emacs-reader--book-field book 'origin))))
+      (user-error "书籍缺少链接或书源信息"))
+    (when (yes-or-no-p (format "将《%s》加入服务器书架？ "
+                              (emacs-reader--book-field book 'name)))
+      (emacs-reader--reader3-request
+       "saveBook" "POST" book
+       (lambda (response)
+         (if (and (listp (plist-get response :ok))
+                  (eq (alist-get 'isSuccess (plist-get response :ok)) t))
+             (progn
+               (message "已加入书架；书架按 g 刷新")
+               (let ((shelf (get-buffer "*Reader Shelf*")))
+                 (when (buffer-live-p shelf)
+                   (with-current-buffer shelf (emacs-reader-shelf-refresh)))))
+           (message "加入书架失败；可重试，未确认保存成功")))))))
+
+(defun emacs-reader-open-book (book &optional preview)
   "Open BOOK in a native text-reading buffer.
-This command only reads chapter content; it does not write reading progress."
+With PREVIEW, fetch the catalog with source information before reading.
+This command does not add books to the shelf or write reading progress."
   (interactive (list (emacs-reader--selected-shelf-book)))
   (let ((book-url (alist-get 'bookUrl book))
         (name (emacs-reader--book-field book 'name)))
@@ -683,9 +880,11 @@ This command only reads chapter content; it does not write reading progress."
                               0))))
       (with-current-buffer buffer
         (emacs-reader-reading-mode)
-        (setq-local emacs-reader--current-book book))
+        (setq-local emacs-reader--current-book book
+                    emacs-reader--preview-p preview
+                    emacs-reader--preview-start-pending preview))
       (emacs-reader--display-buffer buffer)
-      (emacs-reader--load-chapter chapter)
+      (unless preview (emacs-reader--load-chapter chapter))
       (emacs-reader--load-catalog))))
 
 (define-derived-mode emacs-reader-reading-mode special-mode "Reader"
@@ -765,6 +964,7 @@ full-width U+3000 indents, are normalized."
 (define-key emacs-reader-reading-mode-map (kbd "c") #'emacs-reader-table-of-contents)
 (define-key emacs-reader-reading-mode-map (kbd "C") #'emacs-reader-select-chapter)
 (define-key emacs-reader-reading-mode-map (kbd "r") #'emacs-reader-toggle-read-aloud)
+(define-key emacs-reader-reading-mode-map (kbd "a") #'emacs-reader-add-to-shelf)
 
 (defun emacs-reader--tts-follow-window (window)
   "Restore WINDOW to its reading buffer's independently recorded speech position."
@@ -1011,6 +1211,8 @@ full-width U+3000 indents, are normalized."
 
 (defun emacs-reader--load-chapter (index)
   "Request zero-based chapter INDEX for the current Reader book."
+  (when emacs-reader--preview-start-pending
+    (user-error "试读目录尚未就绪，请按 c 加载或重试"))
   (unless (and (integerp index) (>= index 0))
     (user-error "Chapter index must be a nonnegative integer"))
   (let* ((book emacs-reader--current-book)
@@ -1080,7 +1282,10 @@ full-width U+3000 indents, are normalized."
           (user-error "No Reader book is open"))
         (setq emacs-reader--catalog-loading t)
         (emacs-reader--reader3-request
-         "getChapterList" "POST" `((url . ,url) (refresh . 0))
+         "getChapterList" "POST"
+         `((url . ,url) (refresh . 0)
+           ,@(when emacs-reader--preview-p
+               `((bookSourceUrl . ,(alist-get 'origin emacs-reader--current-book)))))
          (lambda (response)
            (when (buffer-live-p buffer)
              (with-current-buffer buffer
@@ -1100,6 +1305,9 @@ full-width U+3000 indents, are normalized."
                        (progn
                          (setq emacs-reader--chapters (vconcat chapters))
                          (emacs-reader--update-reading-header)
+                         (when emacs-reader--preview-start-pending
+                           (setq emacs-reader--preview-start-pending nil)
+                           (emacs-reader--load-chapter 0))
                          (when show (emacs-reader--show-catalog buffer)))
                      (message "Reader 目录加载失败，可按 c 重试"))))))))))))
 
