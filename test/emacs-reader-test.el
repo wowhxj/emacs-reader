@@ -1095,6 +1095,57 @@
         (when (buffer-live-p reader) (kill-buffer reader))
         (when (buffer-live-p other) (kill-buffer other))))))
 
+(ert-deftest emacs-reader-buffers-share-a-dedicated-tab ()
+  (save-window-excursion
+    (let ((tabs (copy-tree (frame-parameter nil 'tabs)))
+          (origin (current-buffer))
+          shelf reader toc)
+      (unwind-protect
+          (cl-letf (((symbol-function 'emacs-reader-shelf-refresh) #'ignore)
+                    ((symbol-function 'emacs-reader--load-chapter) #'ignore)
+                    ((symbol-function 'emacs-reader--load-catalog) #'ignore))
+            (tab-bar-rename-tab "Reader test origin")
+            (let ((count (length (tab-bar-tabs))))
+              (emacs-reader-shelf)
+              (setq shelf (current-buffer))
+              (should (equal (alist-get 'name (tab-bar--current-tab)) "emacs-reader"))
+              (should (= (length (tab-bar-tabs)) (1+ count))))
+            (let ((count (length (tab-bar-tabs))))
+              (tab-bar-switch-to-tab "Reader test origin")
+              (should (eq (current-buffer) origin))
+              (emacs-reader-open-book '((bookUrl . "test") (name . "Tab test")))
+              (setq reader (current-buffer))
+              (should (equal (alist-get 'name (tab-bar--current-tab)) "emacs-reader"))
+              (setq emacs-reader--chapters [((index . 0) (title . "Chapter"))])
+              (tab-bar-switch-to-tab "Reader test origin")
+              (emacs-reader--show-catalog reader)
+              (setq toc (current-buffer))
+              (should (equal (alist-get 'name (tab-bar--current-tab)) "emacs-reader"))
+              (should (= (length (tab-bar-tabs)) count))
+              (emacs-reader-shelf)
+              (should (eq (current-buffer) shelf))))
+        (dolist (buffer (list toc reader shelf))
+          (when (buffer-live-p buffer) (kill-buffer buffer)))
+        (set-frame-parameter nil 'tabs tabs)))))
+
+(ert-deftest emacs-reader-q-kills-every-reader-buffer ()
+  (dolist (mode '(emacs-reader-shelf-mode emacs-reader-reading-mode
+                 emacs-reader-toc-mode))
+    (save-window-excursion
+      (let ((buffer (generate-new-buffer " *reader-quit-test*")) stopped)
+        (unwind-protect
+            (cl-letf (((symbol-function 'emacs-reader--tts-stop)
+                       (lambda () (setq stopped t))))
+              (switch-to-buffer buffer)
+              (funcall mode)
+              (let ((command (key-binding (kbd "q"))))
+                (should (eq command #'emacs-reader-quit))
+                (call-interactively command))
+              (should-not (buffer-live-p buffer))
+              (when (eq mode 'emacs-reader-reading-mode)
+                (should stopped)))
+          (when (buffer-live-p buffer) (kill-buffer buffer)))))))
+
 (provide 'emacs-reader-test)
 
 ;;; emacs-reader-test.el ends here

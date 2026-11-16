@@ -20,6 +20,7 @@
 (require 'hl-line)
 (require 'json)
 (require 'shr)
+(require 'tab-bar)
 (require 'tabulated-list)
 (require 'subr-x)
 (require 'url)
@@ -571,6 +572,17 @@ RETRIED is non-nil."
              "\n  " (emacs-reader--book-progress book) "\n")
      'emacs-reader-book book)))
 
+(defun emacs-reader--display-buffer (buffer)
+  "Display BUFFER in the current frame's dedicated Reader tab.
+Create the tab if necessary; otherwise reuse it."
+  (tab-bar-switch-to-tab "emacs-reader")
+  (switch-to-buffer buffer))
+
+(defun emacs-reader-quit ()
+  "Kill the current Reader buffer and leave its window."
+  (interactive)
+  (quit-window t))
+
 (define-derived-mode emacs-reader-shelf-mode special-mode "Reader-Shelf"
   "Major mode for the Reader bookshelf."
   (setq-local truncate-lines t)
@@ -578,6 +590,8 @@ RETRIED is non-nil."
   (setq header-line-format
         (propertize "  Bookshelf   RET open   g refresh   n/p move"
                     'face 'emacs-reader-shelf-meta)))
+
+(define-key emacs-reader-shelf-mode-map (kbd "q") #'emacs-reader-quit)
 
 (define-key emacs-reader-shelf-mode-map (kbd "g") #'emacs-reader-shelf-refresh)
 (define-key emacs-reader-shelf-mode-map (kbd "RET") #'emacs-reader-open-book)
@@ -604,7 +618,7 @@ RETRIED is non-nil."
     (with-current-buffer buffer
       (unless (derived-mode-p 'emacs-reader-shelf-mode)
         (emacs-reader-shelf-mode)))
-    (pop-to-buffer buffer)
+    (emacs-reader--display-buffer buffer)
     (emacs-reader-shelf-refresh)))
 
 (defun emacs-reader-shelf-refresh ()
@@ -670,7 +684,7 @@ This command only reads chapter content; it does not write reading progress."
       (with-current-buffer buffer
         (emacs-reader-reading-mode)
         (setq-local emacs-reader--current-book book))
-      (pop-to-buffer buffer)
+      (emacs-reader--display-buffer buffer)
       (emacs-reader--load-chapter chapter)
       (emacs-reader--load-catalog))))
 
@@ -689,6 +703,8 @@ This command only reads chapter content; it does not write reading progress."
   (add-hook 'change-major-mode-hook #'emacs-reader--tts-stop nil t)
   (add-hook 'window-buffer-change-functions #'emacs-reader--tts-follow-window nil t)
   (add-hook 'window-selection-change-functions #'emacs-reader--tts-follow-window nil t))
+
+(define-key emacs-reader-reading-mode-map (kbd "q") #'emacs-reader-quit)
 
 (defun emacs-reader--fit-text-width ()
   "Center an `emacs-reader-text-width' column in windows showing this buffer."
@@ -1088,12 +1104,13 @@ full-width U+3000 indents, are normalized."
                      (message "Reader 目录加载失败，可按 c 重试"))))))))))))
 
 (define-derived-mode emacs-reader-toc-mode tabulated-list-mode "Reader-TOC"
-  "Table of contents: n/p select, RET reads a chapter, q returns."
+  "Table of contents: n/p select, RET reads a chapter, q kills the buffer."
   (setq tabulated-list-format [("状态" 8 nil) ("序号" 8 nil) ("章节名称" 0 nil)])
   (setq tabulated-list-padding 2)
   (tabulated-list-init-header)
   (hl-line-mode 1))
 
+(define-key emacs-reader-toc-mode-map (kbd "q") #'emacs-reader-quit)
 (define-key emacs-reader-toc-mode-map (kbd "n") #'next-line)
 (define-key emacs-reader-toc-mode-map (kbd "p") #'previous-line)
 (define-key emacs-reader-toc-mode-map (kbd "RET") #'emacs-reader-toc-open-chapter)
@@ -1129,8 +1146,8 @@ full-width U+3000 indents, are normalized."
       (tabulated-list-print)
       (goto-char (point-min))
       (forward-line (or index 0)))
-    (pop-to-buffer buffer)
-    (message "目录：n/p 选择，RET 跳转，q 返回")))
+    (emacs-reader--display-buffer buffer)
+    (message "目录：n/p 选择，RET 跳转，q 关闭")))
 
 (defun emacs-reader-toc-open-chapter ()
   "Read the chapter on the current table-of-contents row."
@@ -1140,7 +1157,7 @@ full-width U+3000 indents, are normalized."
     (unless (integerp index) (user-error "请选择一个章节"))
     (unless (buffer-live-p reader) (user-error "阅读缓冲区已关闭"))
     (quit-window)
-    (pop-to-buffer reader)
+    (emacs-reader--display-buffer reader)
     (with-current-buffer reader (emacs-reader--load-chapter index))))
 
 (defun emacs-reader--book-asset-url (path)
