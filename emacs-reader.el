@@ -540,11 +540,16 @@ RETRIED is non-nil."
         (concat "Local " (upcase (or (file-name-extension name) "file")))
       name)))
 
+(defun emacs-reader--shelf-text (text)
+  "Return TEXT as a single line for bookshelf display only."
+  (string-trim (replace-regexp-in-string "[[:space:]\u2028\u2029]+" " " text)))
+
 (defun emacs-reader--book-progress (book)
   "Return BOOK's shelf progress line: bar, percentage, chapter, title."
   (let* ((chapter (alist-get 'durChapterIndex book))
          (total (alist-get 'totalChapterNum book))
-         (title (emacs-reader--book-field book 'durChapterTitle))
+         (title (emacs-reader--shelf-text
+                 (emacs-reader--book-field book 'durChapterTitle)))
          (known (and (integerp chapter) (integerp total) (> total 0)))
          (ratio (if known (/ (min total (1+ (max 0 chapter))) (float total)) 0))
          (filled (round (* 12 ratio))))
@@ -557,9 +562,11 @@ RETRIED is non-nil."
 
 (defun emacs-reader--shelf-entry (book)
   "Return BOOK rendered as a two-line shelf entry carrying BOOK as a property."
-  (let ((author (emacs-reader--book-field book 'author))
-        (source (emacs-reader--book-source book))
-        (name (emacs-reader--book-field book 'name)))
+  (let ((author (emacs-reader--shelf-text
+                 (emacs-reader--book-field book 'author)))
+        (source (emacs-reader--shelf-text (emacs-reader--book-source book)))
+        (name (emacs-reader--shelf-text
+               (emacs-reader--book-field book 'name))))
     (propertize
      (concat "  " (propertize (if (string-empty-p name) "Untitled" name)
                               'face 'emacs-reader-shelf-title)
@@ -601,10 +608,25 @@ Create the tab if necessary; otherwise reuse it."
 (defun emacs-reader-shelf-next (&optional n)
   "Move to the Nth next book on the shelf."
   (interactive "p")
-  ;; ponytail: entries are fixed at 3 lines (2 text + blank); revisit if layout changes.
-  (let ((pos (save-excursion (forward-line (* 3 (or n 1))) (point))))
-    (when (get-text-property pos 'emacs-reader-book)
-      (goto-char pos))))
+  (let* ((n (or n 1))
+         (direction (if (< n 0) -1 1)))
+    (dotimes (_ (abs n))
+      (let* ((book (get-text-property (point) 'emacs-reader-book))
+             (pos
+              (save-excursion
+                ;; Metadata may contain newlines: skip the entire current book
+                ;; and any separator rows, rather than assuming a line count.
+                (let (candidate)
+                  (while (and (zerop (forward-line direction))
+                              (or (null (setq candidate
+                                              (get-text-property
+                                               (point) 'emacs-reader-book)))
+                                  (eq candidate book))))
+                  (when (and candidate (not (eq candidate book)))
+                    (or (previous-single-property-change
+                         (1+ (point)) 'emacs-reader-book)
+                        (point-min)))))))
+        (when pos (goto-char pos))))))
 
 (defun emacs-reader-shelf-previous (&optional n)
   "Move to the Nth previous book on the shelf."

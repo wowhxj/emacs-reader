@@ -255,6 +255,58 @@
       (emacs-reader-shelf-previous)
       (should (equal (alist-get 'bookUrl (emacs-reader--selected-shelf-book)) "new")))))
 
+(ert-deftest emacs-reader-shelf-entry-normalizes-metadata-whitespace ()
+  (let* ((book '((bookUrl . "audio") (name . "\t盗墓\n笔记  ")
+                 (author . " 南派三叔\r\n周建龙\t ")
+                 (originName . "有声\n悦听吧")
+                 (durChapterTitle . "  第一章\r\n七星\t鲁王宫  ")))
+         (original (copy-tree book))
+         (entry (emacs-reader--shelf-entry book)))
+    (should (= (cl-count ?\n entry) 2))
+    (should (string-prefix-p
+             "  盗墓 笔记    南派三叔 周建龙  ·  有声 悦听吧\n" entry))
+    (should (string-suffix-p "第一章 七星 鲁王宫\n" entry))
+    (should (equal book original))
+    (should (eq (get-text-property 0 'emacs-reader-book entry) book))))
+
+(ert-deftest emacs-reader-shelf-navigation-handles-multiline-entries ()
+  (let ((books '(((bookUrl . "first") (name . "First"))
+                 ((bookUrl . "multiline") (name . "盗墓笔记")
+                  (author . "南派三叔\n周建龙")
+                  (durChapterTitle . "Chapter\ncontinued"))
+                 ((bookUrl . "last") (name . "Last")))))
+    (with-temp-buffer
+      (emacs-reader-shelf-mode)
+      (emacs-reader--handle-bookshelf-response
+       (current-buffer) `(:ok ((isSuccess . t) (data . ,books))))
+      ;; Keep exercising variable-height entries even though metadata is now
+      ;; normalized for display: emulate an extra line inside the first book.
+      (let ((inhibit-read-only t))
+        (end-of-line)
+        (insert (propertize "\nextra metadata" 'emacs-reader-book (car books))))
+      ;; The leading blank line has no book property (e.g. after M-<).
+      (goto-char (point-min))
+      (should-not (get-text-property (point) 'emacs-reader-book))
+      (emacs-reader-shelf-previous)
+      (should (= (point) (point-min)))
+      (emacs-reader-shelf-next)
+      (should (equal (alist-get 'bookUrl (emacs-reader--selected-shelf-book))
+                     "first"))
+      (dolist (expected '("multiline" "last" "last"))
+        (emacs-reader-shelf-next)
+        (should (equal (alist-get 'bookUrl (emacs-reader--selected-shelf-book))
+                       expected)))
+      (dolist (expected '("multiline" "first" "first"))
+        (emacs-reader-shelf-previous)
+        (should (equal (alist-get 'bookUrl (emacs-reader--selected-shelf-book))
+                       expected)))
+      (emacs-reader-shelf-next 2)
+      (should (equal (alist-get 'bookUrl (emacs-reader--selected-shelf-book))
+                     "last"))
+      (emacs-reader-shelf-next -2)
+      (should (equal (alist-get 'bookUrl (emacs-reader--selected-shelf-book))
+                     "first")))))
+
 (ert-deftest emacs-reader-format-chapter-normalizes-paragraphs ()
   (should (equal (emacs-reader--format-chapter
                   "\u3000\u3000第一段。\r\n\n  \n\u3000\u3000第二段——乃是虞国公\n\u3000\u3000府的屈砚。 \n")
