@@ -56,7 +56,31 @@ Emacs 30+ 可用内置 `use-package` 的 `:vc` 从 GitHub 安装：
 | 目录 | `RET` | 跳转选中章节 |
 | 全部 | `q` | 关闭当前 buffer |
 
-朗读复用服务器 HttpTTS 配置，默认声音为“晓晓”，可通过 `emacs-reader-tts-voice` 修改，`emacs-reader-tts-rate` 调节语速。需本机有 `afplay`（macOS 自带）、`mpv` 或 `ffplay`。从光标所在段落读到本章结束，光标跟随正在播放的段落，后台播放也会记录位置，切回时恢复光标；停止后再按 `r` 从该段重新开始；播放时预取下一段以减少停顿；切章或关闭缓冲区自动停止并清理预取，不同步服务器进度。
+### 朗读配置
+
+Emacs 直接向配置的 OpenAI 兼容 TTS 端点发送段落，不再使用 Reader 的 HttpTTS 配置或登录凭据。`emacs-reader-tts-url` 默认不设置，不会自动发送正文。以下配置二选一：
+
+**本地 mac-tts**（按其 README 启动服务）：
+
+```elisp
+(setq emacs-reader-tts-url "http://127.0.0.1:8095/v1/audio/speech"
+      emacs-reader-tts-model "kokoro-multi-lang-v1_1"
+      emacs-reader-tts-voice "zf_001"
+      emacs-reader-tts-format 'wav)
+```
+
+**在线 zb-tts**（晓晓）：
+
+```elisp
+(setq emacs-reader-tts-url "http://remacs.cc:8104/v1/audio/speech"
+      emacs-reader-tts-model "tts-1"
+      emacs-reader-tts-voice "zh-CN-XiaoxiaoNeural"
+      emacs-reader-tts-format 'mp3)
+```
+
+`emacs-reader-tts-rate` 调节语速，默认 `1.0`。如服务需要 Bearer token，设置 `emacs-reader-tts-api-key-env` 为 Emacs 进程可读的环境变量名（不是密钥本身）；仅 HTTPS 或本机回环 HTTP 可以发送 token。在线合成会把正文发送给该服务，上面的 HTTP 地址不加密；敏感内容请使用本地服务。
+
+播放需本机有 `afplay`（macOS 自带）、`mpv` 或 `ffplay`。`r` 从光标所在段落读到本章末尾，播放时高亮并预取下一段；停止后再按 `r` 从当前段重读。切章或关闭缓冲区会停止并清理预取，不同步服务器进度。
 
 WSL2 + WSLg 可安装 Linux 侧 `mpv` 播放。没有 Linux 音频输出时，可在 Windows 安装 `mpv` 或 `ffplay` 并加入 PATH，WSL 中确认 `command -v mpv.exe` 或 `command -v ffplay.exe` 能找到；客户端会用 `wslpath` 转换音频路径。若需要强制使用 Windows 播放器：
 

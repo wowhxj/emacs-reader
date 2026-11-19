@@ -67,9 +67,26 @@ A CJK character occupies two columns."
   :group 'emacs-reader
   :safe #'integerp)
 
-(defcustom emacs-reader-tts-voice "晓晓"
-  "Name of the Reader server's HttpTTS configuration to use."
+(defcustom emacs-reader-tts-url nil
+  "Full HTTP(S) URL of an OpenAI-compatible speech endpoint, or nil.
+Paragraph text is sent directly to this endpoint, not to the Reader API."
+  :type '(choice (const :tag "Not configured" nil) string) :group 'emacs-reader)
+
+(defcustom emacs-reader-tts-model "tts-1"
+  "Speech model ID accepted by the TTS service."
   :type 'string :group 'emacs-reader)
+
+(defcustom emacs-reader-tts-voice "zf_001"
+  "Voice ID accepted by the TTS service."
+  :type 'string :group 'emacs-reader)
+
+(defcustom emacs-reader-tts-format 'wav
+  "Audio format requested from the TTS service."
+  :type '(choice (const wav) (const mp3)) :group 'emacs-reader)
+
+(defcustom emacs-reader-tts-api-key-env nil
+  "Environment variable holding the TTS Bearer token, or nil for no token."
+  :type '(choice (const :tag "No token" nil) string) :group 'emacs-reader)
 
 (defcustom emacs-reader-tts-player-command nil
   "Audio player executable and arguments, or nil for automatic selection.
@@ -78,7 +95,7 @@ For WSL without Linux audio, use e.g. (\"mpv.exe\" \"--no-video\")."
   :group 'emacs-reader)
 
 (defcustom emacs-reader-tts-rate 1.0
-  "Reader speech rate, normally between 0.5 and 2.0."
+  "Speech speed multiplier; supported values depend on the service."
   :type 'number :group 'emacs-reader)
 
 (defface emacs-reader-tts-paragraph '((t :inherit highlight))
@@ -234,12 +251,18 @@ The caller must clear the returned string after use."
   "Normalize a JSON response and STATUS without retaining its body."
   (emacs-reader--http-response status))
 
-(defun emacs-reader--http-response (status &optional html-p)
+(defun emacs-reader--http-response (status &optional html-p audio-format)
   "Normalize the current URL response and STATUS.
-When HTML-P is non-nil, accept HTML instead of JSON and return decoded text."
-  (let ((response-status url-http-response-status)
-        (content-type url-http-content-type)
-        (content-length url-http-content-length))
+HTML-P selects decoded HTML; AUDIO-FORMAT selects binary speech."
+  (let* ((response-status url-http-response-status)
+         (content-type url-http-content-type)
+         (content-length url-http-content-length)
+         (audio-type
+          (when (and audio-format (stringp content-type))
+            (pcase (string-trim (car (split-string (downcase content-type) ";")))
+              ((or "audio/mpeg" "audio/mp3") 'mp3)
+              ((or "audio/wav" "audio/x-wav" "audio/wave") 'wav)
+              ("application/octet-stream" audio-format)))))
     (cond
      (emacs-reader--transport-error
       (list :error 'response-too-large))
@@ -263,12 +286,13 @@ When HTML-P is non-nil, accept HTML instead of JSON and return decoded text."
       (list :ok nil :status response-status))
      ((and content-length (> content-length emacs-reader-max-response-bytes))
       (list :error 'response-too-large :status response-status))
-     ((not (and (stringp content-type)
+     ((not (if audio-format audio-type
+             (and (stringp content-type)
                 (string-match-p
                  (if html-p
                      "\\`\\(?:text/html\\|application/xhtml\\+xml\\)\\(?:[;[:space:]]\\|\\'\\)"
                    "\\`application/\\(?:[[:alnum:].+-]+\\+\\)?json\\(?:[;[:space:]]\\|\\'\\)")
-                 (downcase content-type))))
+                 (downcase content-type)))))
       (list :error 'unexpected-content-type :status response-status))
      (t
       (let ((separator (save-excursion
@@ -282,6 +306,10 @@ When HTML-P is non-nil, accept HTML instead of JSON and return decoded text."
             (cond
              ((> (string-bytes body) emacs-reader-max-response-bytes)
               (list :error 'response-too-large :status response-status))
+             (audio-format
+              (if (and (not (multibyte-string-p body)) (> (length body) 0))
+                  (list :ok body :format audio-type :status response-status)
+                (list :error 'invalid-audio :status response-status)))
              (html-p
               (list :ok (decode-coding-string body 'utf-8) :status response-status))
              (t
@@ -317,11 +345,11 @@ The result is (t . VALUE), allowing an empty VALUE to clear the session."
               value (match-string-no-properties 1)))
       (and found (cons t value)))))
 
-(defun emacs-reader--url-callback (status callback &optional html-p)
-  "Normalize STATUS, capture the session cookie, invoke CALLBACK, and clean up.
-HTML-P selects an HTML response instead of the default JSON response."
+(defun emacs-reader--url-callback (status callback &optional html-p audio-format)
+  "Normalize STATUS, invoke CALLBACK, and clean up the response buffer.
+HTML-P selects HTML; AUDIO-FORMAT selects audio and skips Reader cookies."
   (let ((buffer (current-buffer))
-        (cookie (emacs-reader--response-session-cookie)))
+        (cookie (unless audio-format (emacs-reader--response-session-cookie))))
     (unwind-protect
         (progn
           (when cookie
@@ -332,15 +360,14 @@ HTML-P selects an HTML response instead of the default JSON response."
                     (and (not (string-empty-p value))
                          (string-match-p "\\`[A-Za-z0-9._~%:+/=-]+\\'" value)
                          value))))
-          (funcall callback (if html-p
-                                (emacs-reader--http-response status t)
-                              (emacs-reader--json-response status))))
+          (funcall callback (emacs-reader--http-response status html-p audio-format)))
       (when (buffer-live-p buffer)
         (kill-buffer buffer)))))
 
 (defun emacs-reader--url-transport (request callback)
   "Send REQUEST asynchronously with `url-retrieve' and call CALLBACK.
-REQUEST contains :url, :method, :headers, optional :data, and :html for HTML."
+REQUEST contains :url, :method, :headers, optional :data, and either
+:html for HTML or :audio-format for audio."
   (let* ((url-request-method (plist-get request :method))
          (url-request-data (plist-get request :data))
          (url-request-extra-headers (plist-get request :headers))
@@ -351,7 +378,8 @@ REQUEST contains :url, :method, :headers, optional :data, and :html for HTML."
          (url-history-track nil)
          (buffer (url-retrieve (plist-get request :url)
                                #'emacs-reader--url-callback
-                               (list callback (plist-get request :html)) t t)))
+                               (list callback (plist-get request :html)
+                                     (plist-get request :audio-format)) t t)))
     (when (buffer-live-p buffer)
       (with-current-buffer buffer
         (setq emacs-reader--transport-error nil))
@@ -1092,6 +1120,7 @@ full-width U+3000 indents, are normalized."
     (unless (and (integerp emacs-reader--current-chapter-index)
                  (equal emacs-reader--current-chapter-index emacs-reader--requested-chapter-index))
       (user-error "请等待章节加载完成"))
+    (emacs-reader--tts-endpoint)
     (emacs-reader--tts-player)
     (emacs-reader--tts-stop)
     (setq emacs-reader--tts-active t
@@ -1112,14 +1141,42 @@ full-width U+3000 indents, are normalized."
                     (if (re-search-forward separator nil t) (match-beginning 0) (point-max)))))
         (list start end (string-trim (buffer-substring-no-properties start end)))))))
 
+(defun emacs-reader--tts-endpoint ()
+  "Validate and return the parsed `emacs-reader-tts-url'."
+  (unless (and (stringp emacs-reader-tts-url) (not (string-empty-p emacs-reader-tts-url)))
+    (user-error "请先设置 emacs-reader-tts-url"))
+  (let ((url (url-generic-parse-url emacs-reader-tts-url)))
+    (unless (and (member (url-type url) '("http" "https"))
+                 (not (string-empty-p (or (url-host url) "")))
+                 (not (or (url-user url) (url-password url)))
+                 (not (string-match-p "[?#[:space:][:cntrl:]]" emacs-reader-tts-url)))
+      (user-error "TTS 地址须为不含凭据、查询参数或片段的 HTTP(S) URL"))
+    url))
+
 (defun emacs-reader--tts-fetch (text callback)
-  "Fetch TEXT's audio with the current session; deliver RESPONSE to CALLBACK."
-  (emacs-reader--reader3-request
-   "book/tts" "POST"
-   `((text . ,text) (type . "httpTTS") (voice . ,emacs-reader-tts-voice)
-     (rate . ,(number-to-string emacs-reader-tts-rate))
-     (pitch . "1") (base64 . "1") (accessToken . ,emacs-reader--token))
-   callback))
+  "Fetch TEXT's audio from the standalone TTS endpoint and call CALLBACK."
+  (let* ((url (emacs-reader--tts-endpoint))
+         (key (and emacs-reader-tts-api-key-env (getenv emacs-reader-tts-api-key-env)))
+         (format emacs-reader-tts-format)
+         (headers '(("Content-Type" . "application/json"))))
+    (when emacs-reader-tts-api-key-env
+      (unless (and key (string-match-p "\\`[A-Za-z0-9._~+/-]+=*\\'" key))
+        (user-error "TTS Bearer token 未设置或格式无效"))
+      (unless (or (equal (url-type url) "https")
+                  (member (url-host url) '("localhost" "127.0.0.1" "[::1]")))
+        (user-error "不能通过非本机 HTTP 发送 TTS Bearer token"))
+      (push (cons "Authorization" (encode-coding-string (concat "Bearer " key) 'us-ascii))
+            headers))
+    (emacs-reader--url-transport
+     (list :url emacs-reader-tts-url :method "POST" :headers headers
+           :audio-format format
+           :data (encode-coding-string
+                  (json-serialize `((model . ,emacs-reader-tts-model)
+                                    (voice . ,emacs-reader-tts-voice)
+                                    (input . ,text) (speed . ,emacs-reader-tts-rate)
+                                    (response_format . ,(symbol-name format))))
+                  'utf-8))
+     callback)))
 
 (defun emacs-reader--tts-read-paragraph (position)
   "Read POSITION's paragraph, consuming its prefetched audio when available."
@@ -1139,20 +1196,15 @@ full-width U+3000 indents, are normalized."
         (message "下一段音频仍在生成…")))
      (t
       (message "正在获取朗读音频…")
-      (emacs-reader--ensure-session
-       (lambda (ok)
-         (when (emacs-reader--tts-current-p buffer generation)
-           (with-current-buffer buffer
-             (if (not ok)
-                 (progn (emacs-reader--tts-stop) (message "朗读登录失败"))
-               (condition-case nil
-                   (setq emacs-reader--tts-request-buffer
-                         (emacs-reader--tts-fetch
-                          (nth 2 paragraph)
-                          (lambda (response)
-                            (emacs-reader--tts-play-response
-                             buffer generation (car paragraph) (cadr paragraph) response))))
-                 (error (emacs-reader--tts-stop) (message "朗读请求失败"))))))))))))
+      (condition-case err
+          (setq emacs-reader--tts-request-buffer
+                (emacs-reader--tts-fetch
+                 (nth 2 paragraph)
+                 (lambda (response)
+                   (emacs-reader--tts-play-response
+                    buffer generation (car paragraph) (cadr paragraph) response))))
+        (user-error (emacs-reader--tts-stop) (message "%s" (error-message-string err)))
+        (error (emacs-reader--tts-stop) (message "朗读请求失败，请检查 TTS 服务配置")))))))
 
 (defun emacs-reader--tts-prefetch-next (position)
   "Prefetch at most one paragraph after POSITION while current audio plays."
@@ -1188,16 +1240,16 @@ full-width U+3000 indents, are normalized."
   (when (emacs-reader--tts-current-p buffer generation)
     (with-current-buffer buffer
       (setq emacs-reader--tts-request-buffer nil)
-      (condition-case nil
-          (let* ((json (plist-get response :ok))
-                 (data (and (listp json) (eq (alist-get 'isSuccess json) t)
-                            (alist-get 'data json))))
-            (unless (and (stringp data) (> (length data) 0)) (error "No audio"))
-            (let ((audio (base64-decode-string data)))
-              (unless (> (length audio) 0) (error "Empty audio"))
-              (setq emacs-reader--tts-file (make-temp-file "emacs-reader-speech-" nil ".mp3"))
-              (let ((coding-system-for-write 'no-conversion))
-                (write-region audio nil emacs-reader--tts-file nil 'silent)))
+      (condition-case err
+          (let ((audio (plist-get response :ok))
+                (format (plist-get response :format)))
+            (unless (and (stringp audio) (> (length audio) 0) (memq format '(mp3 wav)))
+              (user-error "朗读合成失败（%s），请检查 TTS 服务配置"
+                          (or (plist-get response :error) "无音频")))
+            (setq emacs-reader--tts-file
+                  (make-temp-file "emacs-reader-speech-" nil (concat "." (symbol-name format))))
+            (let ((coding-system-for-write 'no-conversion))
+              (write-region audio nil emacs-reader--tts-file nil 'silent))
             (when (overlayp emacs-reader--tts-overlay) (delete-overlay emacs-reader--tts-overlay))
             (setq emacs-reader--tts-position start
                   emacs-reader--tts-follow-pending t)
@@ -1229,7 +1281,8 @@ full-width U+3000 indents, are normalized."
                              (message "朗读播放失败，请检查播放器"))))))))
             (emacs-reader--tts-prefetch-next end)
             (message "正在朗读；r 停止"))
-        (error (emacs-reader--tts-stop) (message "朗读失败，请检查服务器 TTS 配置或重新登录"))))))
+        (user-error (emacs-reader--tts-stop) (message "%s" (error-message-string err)))
+        (error (emacs-reader--tts-stop) (message "朗读播放失败，请检查播放器"))))))
 
 (defun emacs-reader--load-chapter (index)
   "Request zero-based chapter INDEX for the current Reader book."
