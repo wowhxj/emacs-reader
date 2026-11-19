@@ -189,7 +189,7 @@
       (should (eq (lookup-key emacs-reader-reading-mode-map (kbd "n"))
                   #'emacs-reader-scroll-forward))
       (should (eq (lookup-key emacs-reader-reading-mode-map (kbd "p"))
-                  #'scroll-down-command)))))
+                  #'emacs-reader-scroll-backward)))))
 
 (ert-deftest emacs-reader-chapter-navigation-uses-zero-based-api-indices ()
   (let ((book '((bookUrl . "source-book-url") (name . "Test Book")
@@ -566,7 +566,7 @@
 
 (ert-deftest emacs-reader-reading-keys ()
   (dolist (binding '(("n" . emacs-reader-scroll-forward) ("SPC" . emacs-reader-scroll-forward)
-                     ("p" . scroll-down-command) ("j" . scroll-up-line)
+                     ("p" . emacs-reader-scroll-backward) ("j" . scroll-up-line)
                      ("k" . scroll-down-line) ("d" . emacs-reader-scroll-half-up)
                      ("u" . emacs-reader-scroll-half-down)))
     (should (eq (lookup-key emacs-reader-reading-mode-map (kbd (car binding)))
@@ -609,7 +609,8 @@
                     "/book-assets/a%2fb" "/book-assets/a%5Cb"
                     "/book-assets/a\\b" "/book-assets/a?query=secret"
                     "/book-assets/a#fragment" "/book-assets/a%0d%0aInjected"
-                    "/book-assets/a\nb" "/book-assets/a\rb"))
+                    "/book-assets/a\nb" "/book-assets/a\rb"
+                    "/epub/../private" "/epub/%2e%2e/private" "/epub/a?query=secret"))
       (should-error (emacs-reader--book-asset-url path) :type 'user-error))))
 
 (ert-deftest emacs-reader-html-rendering-keeps-paragraphs-without-network ()
@@ -698,14 +699,14 @@
                   emacs-reader--chapter-request-id 1)
             (emacs-reader--handle-chapter-response
              (current-buffer) 1 0
-             '(:ok ((isSuccess . t) (data . "/book-assets/a.epub/chapter.html"))))
+             '(:ok ((isSuccess . t) (data . "/epub/user/中文 书.epub/index/chapter.html"))))
             (let ((deadline (time-add (current-time) 3.0)))
               (while (and (null emacs-reader--current-chapter-index)
                           (time-less-p (current-time) deadline))
                 (accept-process-output nil 0.05)))
             (should (equal emacs-reader--current-chapter-index 0))
             (should (string-match-p "本地章节。" (buffer-string)))
-            (should (string-match-p "GET /book-assets/a.epub/chapter.html"
+            (should (string-match-p "GET /epub/user/%E4%B8%AD%E6%96%87%20%E4%B9%A6.epub/index/chapter.html"
                                     emacs-reader-test--http-request))
             (should (string-match-p "Cookie: reader.session=fixture-cookie"
                                     emacs-reader-test--http-request))))
@@ -873,6 +874,36 @@
                 ((symbol-function 'emacs-reader-next-chapter) (lambda () (setq next t))))
         (emacs-reader-scroll-forward)
         (should next)))))
+
+(ert-deftest emacs-reader-screen-backward-loads-previous-chapter-at-end-once ()
+  (save-window-excursion
+    (with-temp-buffer
+      (switch-to-buffer (current-buffer))
+      (emacs-reader-reading-mode)
+      (setq emacs-reader--current-book '((bookUrl . "fixture") (totalChapterNum . 2))
+            emacs-reader--current-chapter-index 1
+            emacs-reader--requested-chapter-index 1)
+      (let (at-start callback indices (screens 0) recentered)
+        (cl-letf (((symbol-function 'pos-visible-in-window-p) (lambda (&rest _) at-start))
+                  ((symbol-function 'scroll-down-command) (lambda () (cl-incf screens)))
+                  ((symbol-function 'recenter) (lambda (line) (setq recentered line)))
+                  ((symbol-function 'emacs-reader--reader3-request)
+                   (lambda (_ _ data cb)
+                     (push (alist-get 'index data) indices)
+                     (setq callback cb))))
+          (emacs-reader-scroll-backward)
+          (should (= screens 1))
+          (should-not indices)
+          (setq at-start t)
+          (emacs-reader-scroll-backward)
+          (emacs-reader-scroll-backward)
+          (should (equal indices '(0)))
+          (funcall callback '(:ok ((isSuccess . t) (data . "Previous chapter."))))
+          (should (= emacs-reader--current-chapter-index 0))
+          (should (= (point) (window-point) (point-max)))
+          (should (eq recentered -1))
+          (should-error (emacs-reader-scroll-backward) :type 'user-error)
+          (should (equal indices '(0))))))))
 
 (ert-deftest emacs-reader-tts-toggle-requests-current-paragraph-and-cancels-stale-audio ()
   (with-temp-buffer

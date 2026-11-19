@@ -986,24 +986,38 @@ full-width U+3000 indents, are normalized."
   (interactive)
   (scroll-down-command (max 1 (/ (window-body-height) 2))))
 
-(defun emacs-reader-scroll-forward ()
-  "Scroll one screen, or open the next chapter when the end is visible."
-  (interactive)
+(defun emacs-reader--scroll-screen (backward)
+  "Scroll one screen or cross a chapter boundary; BACKWARD reverses direction."
   (cond
    ((and emacs-reader--requested-chapter-index
          (not (equal emacs-reader--requested-chapter-index emacs-reader--current-chapter-index)))
     (message "正在加载章节，请稍候"))
    ((not (integerp emacs-reader--current-chapter-index))
     (user-error "正文尚未加载，请从目录选择章节"))
-   ((pos-visible-in-window-p (point-max) nil t)
-    (emacs-reader-next-chapter))
+   (backward
+    (if (pos-visible-in-window-p (point-min))
+        (emacs-reader-previous-chapter t)
+      (condition-case nil
+          (scroll-down-command)
+        (beginning-of-buffer (emacs-reader-previous-chapter t)))))
+   ((pos-visible-in-window-p (point-max)) (emacs-reader-next-chapter))
    (t
     (condition-case nil
         (scroll-up-command)
       (end-of-buffer (emacs-reader-next-chapter))))))
 
+(defun emacs-reader-scroll-forward ()
+  "Scroll one screen forward, or open the next chapter at its beginning."
+  (interactive)
+  (emacs-reader--scroll-screen nil))
+
+(defun emacs-reader-scroll-backward ()
+  "Scroll one screen backward, or open the previous chapter at its end."
+  (interactive)
+  (emacs-reader--scroll-screen t))
+
 (define-key emacs-reader-reading-mode-map (kbd "n") #'emacs-reader-scroll-forward)
-(define-key emacs-reader-reading-mode-map (kbd "p") #'scroll-down-command)
+(define-key emacs-reader-reading-mode-map (kbd "p") #'emacs-reader-scroll-backward)
 (define-key emacs-reader-reading-mode-map (kbd "SPC") #'emacs-reader-scroll-forward)
 (define-key emacs-reader-reading-mode-map (kbd "j") #'scroll-up-line)
 (define-key emacs-reader-reading-mode-map (kbd "k") #'scroll-down-line)
@@ -1293,9 +1307,9 @@ full-width U+3000 indents, are normalized."
         (user-error (emacs-reader--tts-stop) (message "%s" (error-message-string err)))
         (error (emacs-reader--tts-stop) (message "朗读播放失败，请检查播放器"))))))
 
-(defun emacs-reader--load-chapter (index &optional speech-generation)
+(defun emacs-reader--load-chapter (index &optional speech-generation at-end)
   "Request zero-based chapter INDEX for the current Reader book.
-Resume speech after rendering if SPEECH-GENERATION is still active."
+Resume speech if SPEECH-GENERATION is still active.  With AT-END, show the end."
   (when emacs-reader--preview-start-pending
     (user-error "试读目录尚未就绪，请按 c 加载或重试"))
   (unless (and (integerp index) (>= index 0))
@@ -1320,10 +1334,10 @@ Resume speech after rendering if SPEECH-GENERATION is still active."
            `((url . ,book-url) (index . ,index))
            (lambda (response)
              (emacs-reader--handle-chapter-response
-              buffer request-id index response speech-generation)))
+              buffer request-id index response speech-generation at-end)))
         (error
-         (if speech-generation
-             (emacs-reader--display-chapter buffer request-id index nil nil speech-generation)
+         (if (or speech-generation at-end)
+             (emacs-reader--display-chapter buffer request-id index nil nil speech-generation at-end)
            (signal (car err) (cdr err))))))))
 
 (defun emacs-reader--chapter-count (book)
@@ -1458,9 +1472,15 @@ Resume speech after rendering if SPEECH-GENERATION is still active."
     (emacs-reader--display-buffer reader)
     (with-current-buffer reader (emacs-reader--load-chapter index))))
 
+(defun emacs-reader--book-asset-path-p (path)
+  "Whether PATH names a resource under a Reader book asset route."
+  (and (stringp path)
+       (or (string-prefix-p "/book-assets/" path)
+           (string-prefix-p "/epub/" path))))
+
 (defun emacs-reader--book-asset-url (path)
   "Return a same-origin URL for a server-supplied book asset PATH."
-  (unless (and (stringp path) (string-prefix-p "/book-assets/" path)
+  (unless (and (emacs-reader--book-asset-path-p path)
                (not (string-match-p "[?#\\\\[:cntrl:]]" path))
                (not (string-match-p "\\(?:^\\|/\\)\\.\\.?\\(?:/\\|$\\)" path))
                (not (string-match-p
@@ -1499,10 +1519,10 @@ Resume speech after rendering if SPEECH-GENERATION is still active."
        (= request-id
           (buffer-local-value 'emacs-reader--chapter-request-id buffer))))
 
-(defun emacs-reader--display-chapter (buffer request-id index content &optional html-p speech-generation)
+(defun emacs-reader--display-chapter (buffer request-id index content &optional html-p speech-generation at-end)
   "Display CONTENT for INDEX in BUFFER if REQUEST-ID is current.
 With HTML-P, render HTML; otherwise normalize plain text.  Nil means failure.
-Continue SPEECH-GENERATION only if it has not been stopped meanwhile."
+Continue SPEECH-GENERATION only if it is still active.  AT-END shows the end."
   (when (emacs-reader--chapter-request-current-p buffer request-id)
     (with-current-buffer buffer
       (setq mode-line-process nil)
@@ -1516,13 +1536,15 @@ Continue SPEECH-GENERATION only if it has not been stopped meanwhile."
               (setq emacs-reader--tts-position nil emacs-reader--tts-follow-pending nil)
               (erase-buffer)
               (insert "\n" text "\n")
-              (goto-char (point-min))
+              (goto-char (if at-end (point-max) (point-min)))
               (setq emacs-reader--current-chapter-index index
                     emacs-reader--requested-chapter-index index)
               (emacs-reader--update-reading-header)
               (dolist (window (get-buffer-window-list buffer nil t))
-                (set-window-start window (point-min))
-                (set-window-point window (point-min)))
+                (set-window-point window (point))
+                (if at-end
+                    (with-selected-window window (recenter -1))
+                  (set-window-start window (point-min))))
               (if (and speech-generation (emacs-reader--tts-current-p buffer speech-generation))
                   (emacs-reader--tts-read-paragraph (point-min))
                 (message "Loaded chapter %d" (1+ index))))
@@ -1531,15 +1553,15 @@ Continue SPEECH-GENERATION only if it has not been stopped meanwhile."
               (progn (emacs-reader--tts-stop) (message "下一章加载失败，朗读已停止"))
             (message "Reader chapter unavailable; no progress was changed")))))))
 
-(defun emacs-reader--handle-chapter-response (buffer request-id index response &optional speech-generation)
+(defun emacs-reader--handle-chapter-response (buffer request-id index response &optional speech-generation at-end)
   "Display a chapter RESPONSE or fetch its EPUB resource if still current.
-Pass SPEECH-GENERATION through to the final chapter render."
+Pass SPEECH-GENERATION and AT-END through to the final chapter render."
   (when (emacs-reader--chapter-request-current-p buffer request-id)
     (let* ((json (plist-get response :ok))
            (content (and (listp json) (eq (alist-get 'isSuccess json) t)
                          (alist-get 'data json)))
            (path (and (stringp content) (string-trim content))))
-      (if (and path (string-prefix-p "/book-assets/" path))
+      (if (emacs-reader--book-asset-path-p path)
           (condition-case nil
               (emacs-reader--url-transport
                (list :url (emacs-reader--book-asset-url path)
@@ -1550,9 +1572,9 @@ Pass SPEECH-GENERATION through to the final chapter render."
                                                            emacs-reader--session-cookie))))))
                (lambda (asset-response)
                  (emacs-reader--display-chapter
-                  buffer request-id index (plist-get asset-response :ok) t speech-generation)))
-            (error (emacs-reader--display-chapter buffer request-id index nil nil speech-generation)))
-        (emacs-reader--display-chapter buffer request-id index content nil speech-generation)))))
+                  buffer request-id index (plist-get asset-response :ok) t speech-generation at-end)))
+            (error (emacs-reader--display-chapter buffer request-id index nil nil speech-generation at-end)))
+        (emacs-reader--display-chapter buffer request-id index content nil speech-generation at-end)))))
 
 (defun emacs-reader--chapter-navigation-base ()
   "Return the best zero-based chapter index for navigation."
@@ -1570,13 +1592,13 @@ Pass SPEECH-GENERATION through to the final chapter render."
       (user-error "已到最后一章"))
     (emacs-reader--load-chapter index)))
 
-(defun emacs-reader-previous-chapter ()
-  "Load the previous chapter of the current Reader book."
+(defun emacs-reader-previous-chapter (&optional at-end)
+  "Load the previous chapter, landing on its last screen if AT-END is non-nil."
   (interactive)
   (let ((index (1- (emacs-reader--chapter-navigation-base))))
     (when (< index 0)
-      (user-error "This is the first chapter"))
-    (emacs-reader--load-chapter index)))
+      (user-error "已到第一章"))
+    (emacs-reader--load-chapter index nil at-end)))
 
 (defun emacs-reader-select-chapter ()
   "Select a chapter by its one-based number."
