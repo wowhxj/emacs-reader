@@ -80,7 +80,7 @@ Emacs 直接向配置的 OpenAI 兼容 TTS 端点发送段落，不再使用 Rea
 
 `emacs-reader-tts-rate` 调节语速，默认 `1.0`。如服务需要 Bearer token，设置 `emacs-reader-tts-api-key-env` 为 Emacs 进程可读的环境变量名（不是密钥本身）；仅 HTTPS 或本机回环 HTTP 可以发送 token。在线合成会把正文发送给该服务，上面的 HTTP 地址不加密；敏感内容请使用本地服务。
 
-播放需本机有 `afplay`（macOS 自带）、`mpv` 或 `ffplay`。`r` 从光标所在段落读到本章末尾，播放时高亮并预取下一段；停止后再按 `r` 从当前段重读。切章或关闭缓冲区会停止并清理预取，不同步服务器进度。
+播放需本机有 `afplay`（macOS 自带）、`mpv` 或 `ffplay`。`r` 从光标所在段落开始朗读，播放时高亮并预取下一段。本章读完后自动加载下一章，从首段继续，直到全书读完；下一章加载失败时会停止。等待自动翻章时也可按 `r` 停止朗读；手动切章或关闭缓冲区会停止并清理预取。朗读不同步服务器进度。
 
 WSL2 + WSLg 可安装 Linux 侧 `mpv` 播放。没有 Linux 音频输出时，可在 Windows 安装 `mpv` 或 `ffplay` 并加入 PATH，WSL 中确认 `command -v mpv.exe` 或 `command -v ffplay.exe` 能找到；客户端会用 `wslpath` 转换音频路径。若需要强制使用 Windows 播放器：
 

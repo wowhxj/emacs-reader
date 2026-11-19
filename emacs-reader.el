@@ -1178,6 +1178,15 @@ full-width U+3000 indents, are normalized."
                   'utf-8))
      callback)))
 
+(defun emacs-reader--tts-advance-chapter ()
+  "Continue speech in the next chapter, or stop at the end of the book."
+  (let ((index (1+ emacs-reader--current-chapter-index))
+        (total (emacs-reader--chapter-count emacs-reader--current-book)))
+    (if (and (integerp total) (> total 0) (>= index total))
+        (progn (emacs-reader--tts-stop) (message "全书朗读完毕"))
+      (message "正在加载下一章以继续朗读…")
+      (emacs-reader--load-chapter index emacs-reader--tts-generation))))
+
 (defun emacs-reader--tts-read-paragraph (position)
   "Read POSITION's paragraph, consuming its prefetched audio when available."
   (let* ((paragraph (emacs-reader--tts-paragraph position))
@@ -1185,7 +1194,7 @@ full-width U+3000 indents, are normalized."
          (generation emacs-reader--tts-generation)
          (job emacs-reader--tts-prefetch))
     (cond
-     ((null paragraph) (emacs-reader--tts-stop) (message "本章朗读完毕"))
+     ((null paragraph) (emacs-reader--tts-advance-chapter))
      ((and job (= (car paragraph) (plist-get job :start)))
       (if (plist-get job :ready)
           (progn
@@ -1284,8 +1293,9 @@ full-width U+3000 indents, are normalized."
         (user-error (emacs-reader--tts-stop) (message "%s" (error-message-string err)))
         (error (emacs-reader--tts-stop) (message "朗读播放失败，请检查播放器"))))))
 
-(defun emacs-reader--load-chapter (index)
-  "Request zero-based chapter INDEX for the current Reader book."
+(defun emacs-reader--load-chapter (index &optional speech-generation)
+  "Request zero-based chapter INDEX for the current Reader book.
+Resume speech after rendering if SPEECH-GENERATION is still active."
   (when emacs-reader--preview-start-pending
     (user-error "试读目录尚未就绪，请按 c 加载或重试"))
   (unless (and (integerp index) (>= index 0))
@@ -1298,18 +1308,23 @@ full-width U+3000 indents, are normalized."
       (user-error "No Reader book is open"))
     (when (and (integerp total) (> total 0) (>= index total))
       (user-error "Chapter is outside this book's range"))
-    (emacs-reader--tts-stop)
+    (unless speech-generation (emacs-reader--tts-stop))
     (setq emacs-reader--chapter-request-id
           (1+ emacs-reader--chapter-request-id)
           emacs-reader--requested-chapter-index index
           mode-line-process " Loading...")
     (let ((request-id emacs-reader--chapter-request-id))
-      (emacs-reader--reader3-request
-       "getBookContent" "POST"
-       `((url . ,book-url) (index . ,index))
-       (lambda (response)
-         (emacs-reader--handle-chapter-response
-          buffer request-id index response))))))
+      (condition-case err
+          (emacs-reader--reader3-request
+           "getBookContent" "POST"
+           `((url . ,book-url) (index . ,index))
+           (lambda (response)
+             (emacs-reader--handle-chapter-response
+              buffer request-id index response speech-generation)))
+        (error
+         (if speech-generation
+             (emacs-reader--display-chapter buffer request-id index nil nil speech-generation)
+           (signal (car err) (cdr err))))))))
 
 (defun emacs-reader--chapter-count (book)
   "Return BOOK's chapter count, preferring the loaded catalog."
@@ -1484,9 +1499,10 @@ full-width U+3000 indents, are normalized."
        (= request-id
           (buffer-local-value 'emacs-reader--chapter-request-id buffer))))
 
-(defun emacs-reader--display-chapter (buffer request-id index content &optional html-p)
+(defun emacs-reader--display-chapter (buffer request-id index content &optional html-p speech-generation)
   "Display CONTENT for INDEX in BUFFER if REQUEST-ID is current.
-With HTML-P, render HTML; otherwise normalize plain text.  Nil means failure."
+With HTML-P, render HTML; otherwise normalize plain text.  Nil means failure.
+Continue SPEECH-GENERATION only if it has not been stopped meanwhile."
   (when (emacs-reader--chapter-request-current-p buffer request-id)
     (with-current-buffer buffer
       (setq mode-line-process nil)
@@ -1507,12 +1523,17 @@ With HTML-P, render HTML; otherwise normalize plain text.  Nil means failure."
               (dolist (window (get-buffer-window-list buffer nil t))
                 (set-window-start window (point-min))
                 (set-window-point window (point-min)))
-              (message "Loaded chapter %d" (1+ index)))
+              (if (and speech-generation (emacs-reader--tts-current-p buffer speech-generation))
+                  (emacs-reader--tts-read-paragraph (point-min))
+                (message "Loaded chapter %d" (1+ index))))
           (setq emacs-reader--requested-chapter-index emacs-reader--current-chapter-index)
-          (message "Reader chapter unavailable; no progress was changed"))))))
+          (if (and speech-generation (emacs-reader--tts-current-p buffer speech-generation))
+              (progn (emacs-reader--tts-stop) (message "下一章加载失败，朗读已停止"))
+            (message "Reader chapter unavailable; no progress was changed")))))))
 
-(defun emacs-reader--handle-chapter-response (buffer request-id index response)
-  "Display a chapter RESPONSE or fetch its EPUB resource if still current."
+(defun emacs-reader--handle-chapter-response (buffer request-id index response &optional speech-generation)
+  "Display a chapter RESPONSE or fetch its EPUB resource if still current.
+Pass SPEECH-GENERATION through to the final chapter render."
   (when (emacs-reader--chapter-request-current-p buffer request-id)
     (let* ((json (plist-get response :ok))
            (content (and (listp json) (eq (alist-get 'isSuccess json) t)
@@ -1529,9 +1550,9 @@ With HTML-P, render HTML; otherwise normalize plain text.  Nil means failure."
                                                            emacs-reader--session-cookie))))))
                (lambda (asset-response)
                  (emacs-reader--display-chapter
-                  buffer request-id index (plist-get asset-response :ok) t)))
-            (error (emacs-reader--display-chapter buffer request-id index nil)))
-        (emacs-reader--display-chapter buffer request-id index content)))))
+                  buffer request-id index (plist-get asset-response :ok) t speech-generation)))
+            (error (emacs-reader--display-chapter buffer request-id index nil nil speech-generation)))
+        (emacs-reader--display-chapter buffer request-id index content nil speech-generation)))))
 
 (defun emacs-reader--chapter-navigation-base ()
   "Return the best zero-based chapter index for navigation."
