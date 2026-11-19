@@ -30,6 +30,7 @@
 (defvar url-http-response-status nil)
 (defvar url-http-content-type nil)
 (defvar url-http-content-length nil)
+(defvar shr-fill-text) ; Available in Emacs 30 and later.
 
 (defgroup emacs-reader nil
   "Read books from a Reader server."
@@ -1492,6 +1493,10 @@ Resume speech if SPEECH-GENERATION is still active.  With AT-END, show the end."
           (url-target url) nil)
     (url-recreate-url url)))
 
+(defun emacs-reader--html-horizontal-rule (_dom)
+  "Render an EPUB rule as a paragraph break rather than a line of text."
+  (shr-ensure-paragraph))
+
 (defun emacs-reader--html-chapter-text (html)
   "Render HTML as paragraphs without loading images or other resources."
   (unless (libxml-available-p)
@@ -1502,8 +1507,12 @@ Resume speech if SPEECH-GENERATION is still active.  With AT-END, show the end."
           (shr-inhibit-images t)
           (shr-use-fonts nil)
           (shr-use-colors nil)
-          (shr-width most-positive-fixnum)
-          (shr-max-width nil))
+          ;; Keep width bounded: SHR uses it to allocate rules and table cells.
+          ;; Let the reading buffer wrap prose on Emacs versions with this option.
+          (shr-fill-text nil)
+          (shr-width (if (boundp 'shr-fill-text) 80 2048))
+          (shr-external-rendering-functions
+           '((hr . emacs-reader--html-horizontal-rule))))
       (erase-buffer)
       (shr-insert-document (car (dom-by-tag dom 'body)))
       ;; HTML already defines paragraph boundaries; do not merge headings or verse.

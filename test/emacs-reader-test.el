@@ -619,12 +619,13 @@
     (let ((text (emacs-reader--html-chapter-text
                  (concat "<html><head><title>Metadata</title>"
                          "<style>p {color:red}</style></head><body>"
-                         "<h2>Chapter title</h2><p>First &amp; second。</p>"
+                         "<h2>Chapter title</h2><p>First &amp; second。</p><hr>"
                          "<script>untrusted-script</script>"
                          "<img src='https://other.example/image.png' alt='illustration'/>"
                          "<p>Last paragraph。</p></body></html>"))))
       (should (string-match-p "Chapter title\n\n　　First & second。" text))
       (should (string-match-p "Last paragraph。" text))
+      (should (< (length text) 200))
       (should-not (string-match-p "Metadata\\|untrusted-script\\|color:red" text))
       (should-not (text-properties-at 0 text)))))
 
