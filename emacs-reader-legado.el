@@ -355,8 +355,8 @@
                       (string-replace "{{page}}" page (string-replace "{{baseUrl}}" base text))))))
 
 (defun emacs-reader-legado--fetch (source target base callback &optional search)
-  "Fetch TARGET relative to BASE for SOURCE; call CALLBACK with DOC URL ERROR.
-SEARCH, when supplied, holds the query and page for template expansion."
+  "Fetch TARGET relative to BASE for SOURCE using optional SEARCH substitutions.
+Call CALLBACK with DOC, final URL, ERROR and the originally requested URL."
   (let (delivered)
     (condition-case err
         (let* ((parts (emacs-reader-legado--request-parts target))
@@ -409,20 +409,20 @@ SEARCH, when supplied, holds the query and page for template expansion."
                            (error (setq message (error-message-string problem))))
                        (kill-buffer buffer))
                      (setq delivered t)
-                     (funcall callback doc final message)))
+                     (funcall callback doc final message url)))
              nil t t)))
       (error (if delivered (signal (car err) (cdr err))
-               (funcall callback nil nil (error-message-string err)))))))
+               (funcall callback nil nil (error-message-string err) nil))))))
 
 (defun emacs-reader-legado--map-page (source target base callback parser &optional search)
   "Fetch TARGET relative to BASE using SOURCE and run PARSER before CALLBACK.
 Pass SEARCH to `emacs-reader-legado--fetch' for search substitutions."
   (emacs-reader-legado--fetch
    source target base
-   (lambda (doc url message)
+   (lambda (doc url message requested)
      (let (value)
        (unless message
-         (condition-case err (setq value (funcall parser doc url))
+         (condition-case err (setq value (funcall parser doc url requested))
            (error (setq message (error-message-string err)))))
        (funcall callback value message)))
    search))
@@ -437,6 +437,20 @@ Pass SEARCH to `emacs-reader-legado--fetch' for search substitutions."
     (mapcar (lambda (node) (funcall build (cons (car doc) node)))
             (if reverse-order (reverse nodes) nodes))))
 
+(defun emacs-reader-legado--direct-result (source doc url query)
+  "Read a redirected detail page at URL when SOURCE identifies QUERY in DOC."
+  (let ((rules (plist-get source :ruleBookInfo)))
+    (when-let* ((name-rule (plist-get rules :name))
+                (detail (if-let* ((init (plist-get rules :init)) ((not (equal init ""))))
+                            (when-let* ((node (car (emacs-reader-legado--values doc init t))))
+                              (cons (car doc) node))
+                          doc))
+                (name (car (emacs-reader-legado--values detail name-rule)))
+                ((equal name (string-trim query))))
+      (list (list :bookUrl url :name name :author (emacs-reader-legado--field detail rules :author)
+                  :origin (plist-get source :bookSourceUrl)
+                  :originName (plist-get source :bookSourceName))))))
+
 (defun emacs-reader-legado-search (source query callback &optional page)
   "Search SOURCE for QUERY on one-based PAGE and call CALLBACK with books/error."
   (let ((template (plist-get source :searchUrl)) (page (or page 1))
@@ -448,15 +462,18 @@ Pass SEARCH to `emacs-reader-legado--fetch' for search substitutions."
           (t
            (emacs-reader-legado--map-page
             source template origin callback
-            (lambda (doc url)
-              (emacs-reader-legado--rows
-               doc rules :bookList
-               (lambda (row)
-                 (list :bookUrl (emacs-reader-legado--url
-                                 (emacs-reader-legado--field row rules :bookUrl) url)
-                       :name (or (emacs-reader-legado--field row rules :name) (error "搜索结果缺少书名"))
-                       :author (emacs-reader-legado--field row rules :author)
-                       :origin origin :originName (plist-get source :bookSourceName)))))
+            (lambda (doc url requested)
+              (or (emacs-reader-legado--rows
+                   doc rules :bookList
+                   (lambda (row)
+                     (list :bookUrl (emacs-reader-legado--url
+                                     (emacs-reader-legado--field row rules :bookUrl) url)
+                           :name (or (emacs-reader-legado--field row rules :name)
+                                     (error "搜索结果缺少书名"))
+                           :author (emacs-reader-legado--field row rules :author)
+                           :origin origin :originName (plist-get source :bookSourceName))))
+                  (when (and (= page 1) (not (equal url requested)))
+                    (emacs-reader-legado--direct-result source doc url query))))
             (list query page))))))
 
 (defun emacs-reader-legado--info (doc url book rules)
@@ -476,7 +493,8 @@ Pass SEARCH to `emacs-reader-legado--fetch' for search substitutions."
   "Read details of BOOK from SOURCE; call CALLBACK with updated book/error."
   (emacs-reader-legado--map-page
    source (plist-get book :bookUrl) (plist-get source :bookSourceUrl) callback
-   (lambda (doc url) (emacs-reader-legado--info doc url book (plist-get source :ruleBookInfo)))))
+   (lambda (doc url _requested)
+     (emacs-reader-legado--info doc url book (plist-get source :ruleBookInfo)))))
 
 (defun emacs-reader-legado--catalog (source doc url)
   "Read the catalog from DOC at URL according to SOURCE."
@@ -493,7 +511,7 @@ Pass SEARCH to `emacs-reader-legado--fetch' for search substitutions."
 Start at TARGET with optional FIRST-DOC and call CALLBACK with the complete list."
   (let ((seen (make-hash-table :test #'equal)) pieces pending)
     (cl-labels
-        ((consume (doc url message)
+        ((consume (doc url message &optional _requested)
            (let (next)
              (unless message
                (condition-case err
@@ -527,7 +545,7 @@ Start at TARGET with optional FIRST-DOC and call CALLBACK with the complete list
        (lambda (value message)
          (if message (funcall callback nil message)
            (emacs-reader-legado--pages source (car value) (cdr value) next read-page callback)))
-       (lambda (doc url)
+       (lambda (doc url _requested)
          (let* ((info (emacs-reader-legado--info doc url book (plist-get source :ruleBookInfo)))
                 (target (plist-get info :tocUrl)))
            (cons target (and (equal target url) doc))))))))
