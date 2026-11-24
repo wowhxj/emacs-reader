@@ -103,6 +103,8 @@
 (cl-defstruct (emacs-reader-sources--check (:constructor emacs-reader-sources--make-check))
   source keyword timer handle)
 
+(defvar-local emacs-reader-sources--marked nil)
+(defvar-local emacs-reader-sources--flagged nil)
 (defvar-local emacs-reader-sources--states nil)
 (defvar-local emacs-reader-sources--queue nil)
 (defvar-local emacs-reader-sources--running nil)
@@ -113,6 +115,8 @@
   "Invalidate the last result for a deleted or edited SOURCE."
   (when-let* ((buffer (get-buffer emacs-reader-sources--buffer)))
     (with-current-buffer buffer
+      (setq emacs-reader-sources--marked (delete source emacs-reader-sources--marked)
+            emacs-reader-sources--flagged (delete source emacs-reader-sources--flagged))
       (when emacs-reader-sources--states (remhash source emacs-reader-sources--states)))))
 
 (defun emacs-reader-sources--redraw ()
@@ -249,11 +253,11 @@
     emacs-reader-sources-check-keyword))
 
 (defun emacs-reader-sources-check (keyword)
-  "Check the selected source using KEYWORD.  With a prefix, prompt for it."
+  "Check marked sources or the source at point using KEYWORD.  With a prefix, prompt for it."
   (interactive (list (emacs-reader-sources--keyword)))
-  (let ((source (emacs-reader-sources--selected)))
-    (emacs-reader-sources--check-current source)
-    (emacs-reader-sources--begin (list source) keyword)))
+  (let ((sources (or emacs-reader-sources--marked (list (emacs-reader-sources--selected)))))
+    (mapc #'emacs-reader-sources--check-current sources)
+    (emacs-reader-sources--begin sources keyword)))
 
 (defun emacs-reader-sources-check-all (keyword)
   "Check every registered source using KEYWORD.  With a prefix, prompt for it."
@@ -378,27 +382,86 @@
 (define-key emacs-reader-sources-edit-mode-map (kbd "C-c C-c") #'emacs-reader-sources-edit-save)
 (define-key emacs-reader-sources-edit-mode-map (kbd "C-c C-k") #'emacs-reader-sources-edit-cancel)
 
-(defun emacs-reader-sources-delete ()
-  "Confirm and delete the selected source record."
+(defun emacs-reader-sources--print-entry (id cols)
+  "Print ID and COLS with the selection or deletion flag in the margin."
+  (let ((start (point)))
+    (tabulated-list-print-entry id cols)
+    (save-excursion
+      (goto-char start)
+      (cond ((member id emacs-reader-sources--flagged) (tabulated-list-put-tag "D"))
+            ((member id emacs-reader-sources--marked) (tabulated-list-put-tag "*"))))))
+
+(defun emacs-reader-sources-mark ()
+  "Toggle selection of this source and advance to the next row."
   (interactive)
   (let ((src (emacs-reader-sources--selected)))
-    (when (yes-or-no-p (format "删除书源「%s」并保留本地书籍副本? " (alist-get 'name src)))
-      (emacs-reader-sources--check-current src)
-      (delete-file (emacs-reader-sources--path src))
-      (emacs-reader-sources--forget src)
+    (setq emacs-reader-sources--flagged (delete src emacs-reader-sources--flagged))
+    (if (member src emacs-reader-sources--marked)
+        (progn (setq emacs-reader-sources--marked (delete src emacs-reader-sources--marked))
+               (tabulated-list-put-tag "" t))
+      (push src emacs-reader-sources--marked)
+      (tabulated-list-put-tag "*" t))))
+
+(defun emacs-reader-sources-unmark ()
+  "Clear either mark on the current row and advance."
+  (interactive)
+  (let ((src (emacs-reader-sources--selected)))
+    (setq emacs-reader-sources--flagged (delete src emacs-reader-sources--flagged)
+          emacs-reader-sources--marked (delete src emacs-reader-sources--marked))
+    (tabulated-list-put-tag "" t)))
+
+(defun emacs-reader-sources-flag ()
+  "Flag selected sources or the current row for later deletion."
+  (interactive)
+  (if emacs-reader-sources--marked
+      (progn
+        (setq emacs-reader-sources--flagged (append emacs-reader-sources--marked
+                                                    emacs-reader-sources--flagged)
+              emacs-reader-sources--marked nil)
+        (tabulated-list-print t))
+    (cl-pushnew (emacs-reader-sources--selected) emacs-reader-sources--flagged :test #'equal)
+    (tabulated-list-put-tag "D" t)))
+
+(defun emacs-reader-sources--delete-records (sources)
+  "Confirm deletion of SOURCES, checking each record before removing it."
+  (when (yes-or-no-p (format "删除这 %d 个书源（保留本地书籍）：%s? " (length sources)
+                             (mapconcat (lambda (s) (alist-get 'name s)) sources "、")))
+    (unwind-protect
+        (progn
+          (mapc #'emacs-reader-sources--check-current sources)
+          (dolist (src sources)
+            (emacs-reader-sources--check-current src)
+            (delete-file (emacs-reader-sources--path src))
+            (emacs-reader-sources--forget src)))
       (emacs-reader-sources--refresh))))
+
+(defun emacs-reader-sources-execute ()
+  "Confirm and delete only sources flagged D."
+  (interactive)
+  (unless emacs-reader-sources--flagged (user-error "请先按 d 标记待删除的书源"))
+  (emacs-reader-sources--delete-records (reverse emacs-reader-sources--flagged)))
+
+(defun emacs-reader-sources-delete ()
+  "Confirm deletion of selected sources or the source at point."
+  (interactive)
+  (emacs-reader-sources--delete-records (or emacs-reader-sources--marked
+                                            (list (emacs-reader-sources--selected)))))
 
 (transient-define-prefix emacs-reader-sources-menu ()
   "Show source management commands."
   [["书源管理"
     ("a" "添加" emacs-reader-sources-add)
     ("e" "编辑" emacs-reader-sources-edit)
-    ("d" "删除" emacs-reader-sources-delete)
     ("g" "刷新" revert-buffer)]
+   ["标记与删除"
+    ("m" "勾选 / 取消勾选" emacs-reader-sources-mark :transient t)
+    ("u" "清除当前标记" emacs-reader-sources-unmark :transient t)
+    ("d" "标记待删除" emacs-reader-sources-flag :transient t)
+    ("x" "执行待删除项" emacs-reader-sources-execute)]
    ["有效性检测（C-u 指定关键词）"
-    ("t" "检测当前书源" emacs-reader-sources-check)
+    ("t" "检测所选或当前书源" emacs-reader-sources-check)
     ("T" "检测全部书源" emacs-reader-sources-check-all)
-    ("x" "取消检测" emacs-reader-sources-check-cancel)]
+    ("c" "取消检测" emacs-reader-sources-check-cancel)]
    ["浏览"
     ("n" "下一项" next-line :transient t)
     ("p" "上一项" previous-line :transient t)
@@ -409,18 +472,23 @@
   (setq emacs-reader-sources--states (make-hash-table :test #'equal))
   (add-hook 'kill-buffer-hook #'emacs-reader-sources--stop nil t)
   (setq tabulated-list-format [("名称" 24 t) ("类型" 8 t) ("状态" 12 t) ("原因" 44 t) ("URL" 0 t)]
+        tabulated-list-padding 2
+        tabulated-list-printer #'emacs-reader-sources--print-entry
         tabulated-list-sort-key '("名称" . nil)
         tabulated-list-entries #'emacs-reader-sources--entries)
-  (setq-local mode-line-process "  t 检测  T 全检  x 取消  d 删除  ? 帮助")
+  (setq-local mode-line-process "  m 多选  u 清标  d 待删  x 执行  t 检测  T 全检  c 取消  ? 帮助")
   (tabulated-list-init-header))
 
 (define-key emacs-reader-sources-mode-map (kbd "RET") #'emacs-reader-sources-edit)
 (define-key emacs-reader-sources-mode-map (kbd "a") #'emacs-reader-sources-add)
 (define-key emacs-reader-sources-mode-map (kbd "e") #'emacs-reader-sources-edit)
-(define-key emacs-reader-sources-mode-map (kbd "d") #'emacs-reader-sources-delete)
+(define-key emacs-reader-sources-mode-map (kbd "d") #'emacs-reader-sources-flag)
+(define-key emacs-reader-sources-mode-map (kbd "m") #'emacs-reader-sources-mark)
+(define-key emacs-reader-sources-mode-map (kbd "u") #'emacs-reader-sources-unmark)
+(define-key emacs-reader-sources-mode-map (kbd "x") #'emacs-reader-sources-execute)
 (define-key emacs-reader-sources-mode-map (kbd "t") #'emacs-reader-sources-check)
 (define-key emacs-reader-sources-mode-map (kbd "T") #'emacs-reader-sources-check-all)
-(define-key emacs-reader-sources-mode-map (kbd "x") #'emacs-reader-sources-check-cancel)
+(define-key emacs-reader-sources-mode-map (kbd "c") #'emacs-reader-sources-check-cancel)
 (define-key emacs-reader-sources-mode-map (kbd "?") #'emacs-reader-sources-menu)
 
 ;;;###autoload
