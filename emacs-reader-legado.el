@@ -224,9 +224,17 @@
            (when (= (cl-incf i) (length pattern)) (emacs-reader-legado--unsupported pattern))
            (let ((escaped (aref pattern i)))
              (pcase escaped
+               (?u (let ((hex (substring pattern (1+ i) (min (+ i 5) (length pattern)))))
+                     (unless (string-match-p (rx string-start (= 4 xdigit) string-end) hex)
+                       (emacs-reader-legado--unsupported pattern))
+                     (let ((code (string-to-number hex 16)))
+                       (unless (and (> code 127) (not (<= #xd800 code #xdfff)))
+                         (emacs-reader-legado--unsupported pattern))
+                       (cl-incf i 4)
+                       (char-to-string code))))
                (?s (if in-class "[:space:]" "[[:space:]]"))
                (?d (if in-class "0-9" "[0-9]"))
-               ((or ?\( ?\) ?\{ ?\} ?| ?- ?/ ?_) (char-to-string escaped))
+               ((or ?\( ?\) ?\{ ?\} ?| ?- ?/ ?_ ?: ?\;) (char-to-string escaped))
                ((or ?. ?* ?+ ?? ?^ ?$ ?\[ ?\] ?\\) (concat "\\" (char-to-string escaped)))
                (_ (if (> escaped 127) (regexp-quote (char-to-string escaped))
                     (emacs-reader-legado--unsupported pattern))))))
@@ -263,12 +271,13 @@
           (list (substring rule 0 start) pattern index)))
        (t (emacs-reader-legado--unsupported rule))))))
 
-(defun emacs-reader-legado--json-url-values (root rule)
-  "Expand scalar JSON fields in path segments or query values of RULE below ROOT."
+(defun emacs-reader-legado--json-url-values (root rule &optional bindings)
+  "Expand scalar fields of ROOT and book BINDINGS in URL template RULE."
   (when (string-match-p (rx "," (* space) "{") rule)
     (error "书籍链接使用暂不支持的请求配置"))
   (rx-let ((field (seq "$" (+ (seq "." (+ (any alnum "_-"))))))
-           (slot (or (seq "{{" field "}}") (seq "{" field "}")))
+           (slot (or (seq "{{" field "}}") (seq "{" field "}")
+                     (seq "@get:{" (+ (any alnum "_")) "}")))
            (url-token (+ (any alnum "._~%-")))
            (segment (or url-token (seq slot (? "." (+ alnum)))))
            (param (seq url-token "=" (or slot (* (any alnum "._~%-"))))))
@@ -281,10 +290,12 @@
       (list (replace-regexp-in-string
              (rx slot)
              (lambda (field)
-               (let* ((width (if (string-prefix-p "{{" field) 2 1))
+               (let* ((var (string-prefix-p "@get:{" field))
+                      (width (if (string-prefix-p "{{" field) 2 1))
                       (path (substring field width (- width)))
-                      (value (save-match-data
-                               (car (emacs-reader-legado--json-values root path t)))))
+                      (value (if var (cdr (assoc (substring field 6 -1) bindings))
+                               (save-match-data
+                                 (car (emacs-reader-legado--json-values root path t))))))
                  (unless (and (or (numberp value) (stringp value))
                               (not (member value '("" "." ".."))))
                    (throw 'missing nil))
@@ -726,8 +737,19 @@ Pass SEARCH to `emacs-reader-legado--fetch' for search substitutions."
                                "&gst=0&cu=&autoBuy=0&cName=%s")
                        gid nid sort (url-hexify-string name)))))
 
-(defun emacs-reader-legado--catalog (source doc url)
-  "Read the catalog from DOC at URL according to SOURCE."
+(defun emacs-reader-legado--book-bindings (doc rules)
+  "Collect scalar JSON field assignments declared by book details RULES in DOC."
+  (when (and (eq (car doc) 'json) (string-empty-p (or (plist-get rules :init) "")))
+    (cl-loop for (_ field-rule) on rules by #'cddr
+             when (and (stringp field-rule)
+                       (string-match (rx "@put:{" (group (+ (any alnum "_"))) ":"
+                                         (group "$" (+ (seq "." (+ (any alnum "_-"))))) "}"
+                                         string-end) field-rule))
+             collect (let ((name (match-string 1 field-rule)) (path (match-string 2 field-rule)))
+                       (cons name (car (emacs-reader-legado--json-values (cdr doc) path t)))))))
+
+(defun emacs-reader-legado--catalog (source doc url &optional bindings)
+  "Read the catalog from DOC at URL using SOURCE and book BINDINGS."
   (let* ((rules (plist-get source :ruleToc))
          (gid (emacs-reader-legado--easou-gid source url (plist-get rules :chapterUrl))))
     (emacs-reader-legado--rows
@@ -735,7 +757,12 @@ Pass SEARCH to `emacs-reader-legado--fetch' for search substitutions."
      (lambda (row)
        (when-let* ((name (emacs-reader-legado--chapter-title row rules)))
          (if gid (emacs-reader-legado--easou-chapter row name gid)
-           (when-let* ((link (emacs-reader-legado--field row rules :chapterUrl)))
+           (when-let* ((rule (plist-get rules :chapterUrl))
+                       (link (if (and (eq (car row) 'json) (string-search "@get:{" rule))
+                                 (or (car (emacs-reader-legado--json-url-values
+                                           (cdr row) rule bindings))
+                                     (error "章节链接缺少书籍或章节字段"))
+                               (emacs-reader-legado--field row rules :chapterUrl))))
              (list :title name :url (emacs-reader-legado--url link url)))))))))
 
 (defun emacs-reader-legado--pages (source target first-doc next-rule read-page callback)
@@ -776,20 +803,25 @@ Start at TARGET with optional FIRST-DOC and call CALLBACK with the complete list
   "Read BOOK's catalog from SOURCE; call CALLBACK with chapters/error."
   (let ((toc (plist-get book :tocUrl))
         (next (plist-get (plist-get source :ruleToc) :nextTocUrl))
-        (read-page (apply-partially #'emacs-reader-legado--catalog source)))
-    (if toc (emacs-reader-legado--pages source toc nil next read-page callback)
-      (emacs-reader-legado--map-page
-       source (plist-get book :bookUrl) (plist-get source :bookSourceUrl)
-       (lambda (value message)
-         (if message (funcall callback nil message)
-           (emacs-reader-legado--pages source (car value) (cdr value) next read-page callback)))
-       (lambda (doc url _requested)
-         (let* ((rules (plist-get source :ruleBookInfo))
-                (toc-rule (plist-get rules :tocUrl))
-                (target (if (and toc-rule (not (equal toc-rule "")))
-                            (plist-get (emacs-reader-legado--info doc url book rules) :tocUrl)
-                          url)))
-           (cons target (and (equal target url) doc))))))))
+        (needs-vars (string-search "@get:{"
+                                   (or (plist-get (plist-get source :ruleToc) :chapterUrl) "")))
+        bindings)
+    (let ((read-page (lambda (doc url) (emacs-reader-legado--catalog source doc url bindings))))
+      (if (and toc (not needs-vars))
+          (emacs-reader-legado--pages source toc nil next read-page callback)
+        (emacs-reader-legado--map-page
+         source (plist-get book :bookUrl) (plist-get source :bookSourceUrl)
+         (lambda (value message)
+           (if message (funcall callback nil message)
+             (emacs-reader-legado--pages source (car value) (cdr value) next read-page callback)))
+         (lambda (doc url _requested)
+           (let* ((rules (plist-get source :ruleBookInfo))
+                  (toc-rule (plist-get rules :tocUrl))
+                  (target (if (and toc-rule (not (equal toc-rule "")))
+                              (plist-get (emacs-reader-legado--info doc url book rules) :tocUrl)
+                            url)))
+             (when needs-vars (setq bindings (emacs-reader-legado--book-bindings doc rules)))
+             (cons (or toc target) (and (equal (or toc target) url) doc)))))))))
 
 (defun emacs-reader-legado-content (source chapter callback)
   "Read CHAPTER from SOURCE; call CALLBACK with its text/error."
@@ -811,7 +843,15 @@ Start at TARGET with optional FIRST-DOC and call CALLBACK with the complete list
   (let ((rules (plist-get source :ruleContent)))
     (emacs-reader-legado--pages
      source (plist-get chapter :url) nil (plist-get rules :nextContentUrl)
-     (lambda (doc _url)
+     (lambda (doc url)
+       (when (and (equal (plist-get source :bookSourceUrl) "https://ts.txs12.com/")
+                  (string-prefix-p "https://res.txs12.com/" url)
+                  (eq (car doc) 'json)
+                  (when-let* ((body (car (emacs-reader-legado--json-values
+                                          (cdr doc) "$.chapter.body"))))
+                    (and (stringp body) (< (length body) 500)
+                         (string-match-p "当前版本过低，已停止使用" body))))
+         (error "听小说正文接口提示「当前版本过低，已停止使用」，未返回本章正文"))
        (or (emacs-reader-legado--values doc (plist-get rules :content))
            (error "正文规则未提取到文本")))
      (lambda (parts message)

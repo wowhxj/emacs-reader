@@ -62,6 +62,28 @@
       (funcall body)
       (should-not pending))))
 
+(ert-deftest emacs-reader-legado-book-variable-in-chapter-url ()
+  (let* ((source
+          '(:bookSourceUrl "https://ts.txs12.com/"
+                           :ruleBookInfo (:author "$.data.author@put:{bid:$.data.id}"
+                                                  :tocUrl "/list/{{$.data.key}}?view=chapters")
+                           :ruleToc (:chapterList "$..chapters[*]" :chapterName "$.tit"
+                                                  :chapterUrl "https://res.txs12.com/@get:{bid}/{{$.num}}")
+                           :ruleContent (:content "$..body##\\:|\\;|\\s\\u3002")))
+         (book '(:bookUrl "https://ts.txs12.com/info/1")) chapter)
+    (emacs-reader-legado-test--with-pages
+     '(("https://ts.txs12.com/info/1" "{\"data\":{\"key\":123,\"id\":\"A&B\"}}")
+       ("https://ts.txs12.com/list/123?view=chapters" "{\"chapters\":[{\"tit\":\"前言\",\"num\":1}]}")
+       ("https://res.txs12.com/A%26B/1" "{\"chapter\":{\"body\":\"序:章; 。\"}}")
+       ("https://res.txs12.com/A%26B/1" "{\"chapter\":{\"body\":\"当前版本过低，已停止使用\"}}"))
+     (lambda ()
+       (emacs-reader-legado-chapters
+        source book (lambda (v e) (should-not e) (setq chapter (car v))))
+       (emacs-reader-legado-content
+        source chapter (lambda (v e) (should-not e) (should (equal v "序章"))))
+       (emacs-reader-legado-content source chapter (lambda (v e) (should-not v)
+                                                     (should (string-search "已停止使用" e))))))))
+
 (ert-deftest emacs-reader-legado-html-reading ()
   (let ((source '(:bookSourceUrl "https://fixture.test" :bookSourceName "书源"
                                  :searchUrl "/search?q={{key}}&p={{page}}"
