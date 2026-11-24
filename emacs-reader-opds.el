@@ -249,9 +249,9 @@ preserves raw response bytes for acquisition."
   (emacs-reader-opds--get url #'emacs-reader-opds--parse
                           (lambda (items) (emacs-reader-opds--show heading items))))
 
-(defun emacs-reader-opds--search (url)
-  "Search a catalog using URL, a template or OpenSearch description."
-  (let ((query (read-string "Search catalog: ")))
+(defun emacs-reader-opds--search (url &optional keyword)
+  "Search a catalog using URL with KEYWORD, prompting when omitted."
+  (let ((query (or keyword (read-string "Search catalog: "))))
     (if (string-match-p "{" url)
         (emacs-reader-opds--feed (emacs-reader-opds--expand-search url query) query)
       (emacs-reader-opds--get
@@ -373,6 +373,17 @@ preserves raw response bytes for acquisition."
   (interactive (list (read-string "Catalog name: ") (read-string "Catalog URL: ")))
   (emacs-reader-opds--start name)
   (emacs-reader-opds--feed url name))
+
+(defun emacs-reader-opds-search (name url keyword)
+  "Search catalog NAME at URL for KEYWORD using its advertised search link."
+  (emacs-reader-opds--start name)
+  (emacs-reader-opds--get
+   url #'emacs-reader-opds--parse
+   (lambda (items)
+     (emacs-reader-opds--show name items)
+     (if-let* ((search (cl-find 'search items :key #'emacs-reader-opds--item-kind)))
+         (emacs-reader-opds--search (emacs-reader-opds--item-url search) keyword)
+       (message "目录「%s」未声明搜索入口，可按 TAB 和 RET 浏览" name)))))
 
 ;;;###autoload
 (defun emacs-reader-openlibrary-search (query)

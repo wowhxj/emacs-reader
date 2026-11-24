@@ -17,7 +17,7 @@ Emacs 原生阅读客户端。书架、已导入的文件和章节进度保存�
 | 来源 | 添加与阅读 |
 |---|---|
 | Legado | `M-x emacs-reader-import-legado` 导入 JSON 文件，支持单个书源或书源数组。用 `C-u M-x emacs-reader-import-legado` 输入订阅 URL。相同书源地址再次导入会更新规则。书架按 `s` 输入关键词并选择书源，结果按 `RET` 试读、按 `a` 加入本地书架。 |
-| OPDS | `M-x emacs-reader-add-opds` 保存目录名称和 URL。书架按 `o` 打开目录，支持 OPDS 1.x Atom 和 2.0 JSON。用 `TAB` 选择分类、搜索、下一页或下载链接，`RET` 打开，`b` 返回。直接获取的 EPUB、TXT 下载到本地书架。 |
+| OPDS | `M-x emacs-reader-add-opds` 保存目录名称和 URL。书架按 `s` 选择该源搜索，按 `o` 浏览目录。支持 OPDS 1.x Atom 和 2.0 JSON。用 `TAB` 选择分类、搜索、下一页或下载链接，`RET` 打开，`b` 返回。直接获取的 EPUB、TXT 下载到本地书架。 |
 | Open Library | 书架按 `s` 选择内置的 Open Library，也可运行 `M-x emacs-reader-openlibrary-search`。在结果中选择公开版本和 EPUB / TXT 文件。需要借阅、登录或 DRM 的版本不提供本地下载。 |
 
 Legado 支持声明式 HTML/CSS 选择器、原生 tag/class/id 规则、基础 JSONPath、GET/POST、静态请求头，以及目录和正文分页。导入时标记为 `enabled: false` 的书源不会出现在搜索列表中。依赖 JavaScript、WebView、XPath 或复杂脚本的书源需要额外引擎。在线搜索与抓取 Legado 章节需要联网；已导入的 EPUB、TXT 可断网阅读。
@@ -32,7 +32,7 @@ Legado 支持声明式 HTML/CSS 选择器、原生 tag/class/id 规则、基础 
 |---|---|---|
 | 书架 | `n` / `p` | 下一本 / 上一本 |
 | 书架 | `g` | 刷新 |
-| 书架 | `s` | 搜索 Legado 书源或 Open Library |
+| 书架 | `s` | 搜索 Legado、OPDS 书源或 Open Library |
 | 搜索 | `n` / `p` | 下一条 / 上一条结果 |
 | 搜索 | `RET` | 试读，不加入书架 |
 | 搜索 | `a` | 确认后加入书架 |

@@ -28,6 +28,7 @@
 (autoload 'emacs-reader-legado-search "emacs-reader-legado")
 (autoload 'emacs-reader-legado-chapters "emacs-reader-legado")
 (autoload 'emacs-reader-legado-content "emacs-reader-legado")
+(autoload 'emacs-reader-opds-search "emacs-reader-opds")
 (autoload 'emacs-reader-opds-browse "emacs-reader-opds" nil t)
 (autoload 'emacs-reader-openlibrary-search "emacs-reader-opds" nil t)
 (declare-function emacs-reader-shelf-refresh "emacs-reader")
@@ -201,12 +202,13 @@
 
 (defun emacs-reader-local--search (keyword)
   "Select a local source and start searching for KEYWORD."
-  (let ((src (emacs-reader-local--select '("legado" "openlibrary"))))
-    (if (equal (alist-get 'type src) "openlibrary")
-        (emacs-reader-openlibrary-search keyword)
-      (emacs-reader--start-search keyword (list :source (alist-get 'url src)
-                                                :native (emacs-reader-local--plist
-                                                         (alist-get 'definition src)))))))
+  (let ((src (emacs-reader-local--select '("legado" "opds" "openlibrary"))))
+    (pcase (alist-get 'type src)
+      ("openlibrary" (emacs-reader-openlibrary-search keyword))
+      ("opds" (emacs-reader-opds-search (alist-get 'name src) (alist-get 'url src) keyword))
+      ("legado" (emacs-reader--start-search keyword (list :source (alist-get 'url src)
+                                                          :native (emacs-reader-local--plist
+                                                                   (alist-get 'definition src))))))))
 
 (defun emacs-reader-local--book (result)
   "Convert Legado search RESULT into a shelf book."

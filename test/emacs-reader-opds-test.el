@@ -6,6 +6,7 @@
 ;;; Code:
 
 (require 'ert)
+(require 'emacs-reader)
 (require 'emacs-reader-opds)
 
 (defun emacs-reader-opds-test--parse (body)
@@ -119,6 +120,29 @@
               (should-not (file-exists-p path))
               (should-not (buffer-live-p response)))
           (kill-buffer (current-buffer)))))))
+
+(ert-deftest emacs-reader-opds-shelf-search-selects-registered-catalog ()
+  (let ((emacs-reader-backend 'local)
+        (url "https://catalog.invalid/opds/") result)
+    (with-temp-buffer
+      (cl-letf (((symbol-function 'emacs-reader-local--records)
+                 (lambda (_) `(((type . "opds") (name . "文渊阁") (url . ,url)))))
+                ((symbol-function 'completing-read)
+                 (lambda (_ choices &rest _args)
+                   (or (car (assoc-string (concat "文渊阁 [opds] <" url ">") choices))
+                       (ert-fail "Registered OPDS catalog missing from shelf search"))))
+                ((symbol-function 'emacs-reader-opds--start) #'ignore)
+                ((symbol-function 'emacs-reader-opds--get)
+                 (lambda (target parser done)
+                   (should (equal target url))
+                   (funcall done (with-temp-buffer
+                                   (insert "<feed><link rel='search' "
+                                           "href='?q={searchTerms}'/></feed>")
+                                   (goto-char (point-min)) (funcall parser target)))))
+                ((symbol-function 'emacs-reader-opds--feed)
+                 (lambda (target query) (setq result (list target query)))))
+        (emacs-reader-search "红 A")
+        (should (equal result (list (concat url "?q=%E7%BA%A2%20A") "红 A")))))))
 
 (provide 'emacs-reader-opds-test)
 ;;; emacs-reader-opds-test.el ends here
