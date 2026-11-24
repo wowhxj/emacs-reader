@@ -110,7 +110,7 @@
             (emacs-reader-local--write (emacs-reader-local--source-path "json" url) src)
             (cl-letf (((symbol-function 'completing-read)
                        (lambda (_ choices &rest _args)
-                         (should (= (length choices) 1)) (caar choices)))
+                         (should (= (length choices) 2)) (car (cadr choices))))
                       ((symbol-function 'emacs-reader-json-catalog-search)
                        (lambda (record query) (setq selected (list record query)))))
               (emacs-reader-local--search "小说")

@@ -941,12 +941,12 @@ Create the tab if necessary; otherwise reuse it."
   (interactive)
   (emacs-reader-open-book (emacs-reader--selected-search-book) t))
 
-(defun emacs-reader-add-to-shelf ()
-  "Add the selected search result or current preview to its bookshelf."
+(defun emacs-reader-add-to-shelf (&optional selected)
+  "Add SELECTED, the search result at point, or the current preview to its shelf."
   (interactive)
-  (let ((book (if (derived-mode-p 'emacs-reader-reading-mode)
-                  emacs-reader--current-book
-                (emacs-reader--selected-search-book))))
+  (let ((book (or selected (if (derived-mode-p 'emacs-reader-reading-mode)
+                               emacs-reader--current-book
+                             (emacs-reader--selected-search-book)))))
     (unless (and (consp book)
                  (not (string-empty-p (emacs-reader--book-field book 'bookUrl)))
                  (not (string-empty-p (emacs-reader--book-field book 'origin))))

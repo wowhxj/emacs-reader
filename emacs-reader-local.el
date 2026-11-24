@@ -31,6 +31,7 @@
 (autoload 'emacs-reader-opds-search "emacs-reader-opds")
 (autoload 'emacs-reader-opds-browse "emacs-reader-opds" nil t)
 (autoload 'emacs-reader-json-catalog-search "emacs-reader-opds")
+(autoload 'emacs-reader-search-all "emacs-reader-search-all")
 (declare-function emacs-reader-shelf-refresh "emacs-reader")
 (declare-function emacs-reader--start-search "emacs-reader")
 
@@ -242,8 +243,40 @@
   (json-parse-string (json-serialize record :false-object :false :null-object :null)
                      :object-type 'plist :array-type 'list :false-object nil :null-object nil))
 
-(defun emacs-reader-local--select (types)
-  "Prompt for one of the registered sources matching TYPES."
+(defun emacs-reader-local--picker-map (scope)
+  "Install the source picker's keys for SCOPE in this minibuffer."
+  (let ((map (make-sparse-keymap)))
+    (dolist (binding (if scope '(("DEL" . nil) ("<backspace>" . nil))
+                       '(("l" . "legado") ("o" . "opds"))))
+      (let ((next (cdr binding)))
+        (define-key map (kbd (car binding))
+                    `(menu-item "" ,(lambda () (interactive) (throw 'reader-picker-scope next))
+                                :filter ,(lambda (command)
+                                           (when (= (minibuffer-prompt-end) (point-max))
+                                             command))))))
+    (use-local-map (make-composed-keymap map (current-local-map)))))
+
+(defun emacs-reader-local--pick-scope (choices scope)
+  "Read from CHOICES within SCOPE, returning a source or the next scope."
+  (let* ((visible (if scope
+                      (cl-remove-if-not (lambda (pair) (equal (alist-get 'type (cdr pair)) scope))
+                                        choices)
+                    choices))
+         (default (and visible "【全部】"))
+         (table (when visible
+                  (cons (list default '(type . "all") (cons 'sources (mapcar #'cdr visible)))
+                        visible)))
+         (prompt (if scope (format "选择书源 [%s，DEL 返回]：" scope)
+                   "选择书源 [l Legado，o OPDS]：")))
+    (catch 'reader-picker-scope
+      (let ((choice (minibuffer-with-setup-hook (lambda () (emacs-reader-local--picker-map scope))
+                      (completing-read prompt table nil t nil nil default))))
+        (or (cdr (assoc choice table)) (user-error "当前范围没有可选书源"))))))
+
+(defun emacs-reader-local--select (types &optional allow-all)
+  "Read an enabled source matching TYPES.
+With ALLOW-ALL, offer all sources in the current scope as the default.
+From empty input, l and o limit the scope to Legado or OPDS.  DEL widens it."
   (let* ((sources (emacs-reader-local--records "sources"))
          (choices (cl-loop for src in sources
                            for definition = (alist-get 'definition src)
@@ -253,7 +286,12 @@
                            collect (cons (format "%s [%s] <%s>" (alist-get 'name src)
                                                  (alist-get 'type src) (alist-get 'url src)) src))))
     (unless choices (user-error "没有可用的匹配书源；请在书架按 S 管理书源"))
-    (cdr (assoc (completing-read "选择书源：" choices nil t) choices))))
+    (if (not allow-all)
+        (cdr (assoc (completing-read "选择书源：" choices nil t) choices))
+      (let (selection)
+        (while (not (consp selection))
+          (setq selection (emacs-reader-local--pick-scope choices selection)))
+        selection))))
 
 ;;;###autoload
 (defun emacs-reader-browse-catalog ()
@@ -264,8 +302,9 @@
 
 (defun emacs-reader-local--search (keyword)
   "Select a local source and start searching for KEYWORD."
-  (let ((src (emacs-reader-local--select '("legado" "opds" "json"))))
+  (let ((src (emacs-reader-local--select '("legado" "opds" "json") t)))
     (pcase (alist-get 'type src)
+      ("all" (emacs-reader-search-all keyword (alist-get 'sources src)))
       ("json" (emacs-reader-json-catalog-search src keyword))
       ("opds" (emacs-reader-opds-search (alist-get 'name src) (alist-get 'url src) keyword))
       ("legado"

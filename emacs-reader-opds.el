@@ -107,8 +107,9 @@ PUBLICATION means NODE describes a book or navigation entry."
   (emacs-reader-opds--link (alist-get 'href link) (alist-get 'rel link)
                            (alist-get 'type link) (alist-get 'title link) base title author nav))
 
-(defun emacs-reader-opds--json-feed (feed base)
-  "Return catalog items from JSON FEED at BASE."
+(defun emacs-reader-opds--json-feed (feed base &optional results)
+  "Return catalog items from JSON FEED at BASE.
+For a RESULTS page, keep pagination and acquisitions among the feed's own links."
   (let* ((metadata (alist-get 'metadata feed))
          (authors (alist-get 'author metadata))
          (names (cl-loop for a in (cond ((stringp authors) (list authors))
@@ -121,11 +122,17 @@ PUBLICATION means NODE describes a book or navigation entry."
      (cl-loop for link in (alist-get 'links feed)
               for item = (emacs-reader-opds--json-link link base (alist-get 'title metadata)
                                                        (and names (string-join names ", ")))
-              when item collect item)
+              for rel = (alist-get 'rel link)
+              when (and item (or (not results) (eq (emacs-reader-opds--item-kind item) 'download)
+                                 (cl-intersection (if (stringp rel) (split-string rel) rel)
+                                                  '("next" "previous" "prev" "first" "last")
+                                                  :test #'equal))) collect item)
      (cl-loop for link in (alist-get 'navigation feed)
               for item = (emacs-reader-opds--json-link link base nil nil t) when item collect item)
-     (cl-loop for nested in (append (alist-get 'publications feed) (alist-get 'groups feed))
-              append (emacs-reader-opds--json-feed nested base)))))
+     (cl-loop for nested in (alist-get 'publications feed)
+              append (emacs-reader-opds--json-feed nested base))
+     (cl-loop for group in (alist-get 'groups feed)
+              append (emacs-reader-opds--json-feed group base results)))))
 
 (defun emacs-reader-opds--xml ()
   "Parse XML at point in the response buffer."
@@ -135,11 +142,12 @@ PUBLICATION means NODE describes a book or navigation entry."
   "Read JSON in the response buffer."
   (json-parse-buffer :object-type 'alist :array-type 'list :null-object nil :false-object nil))
 
-(defun emacs-reader-opds--parse (base)
-  "Parse an OPDS feed at point given the response URL BASE."
+(defun emacs-reader-opds--parse (base &optional results)
+  "Parse an OPDS feed at point given the response URL BASE.
+RESULTS limits feed-level actions on a search results page."
   (skip-chars-forward " \t\r\n")
   (if (eq (char-after) ?{)
-      (emacs-reader-opds--json-feed (emacs-reader-opds--json) base)
+      (emacs-reader-opds--json-feed (emacs-reader-opds--json) base results)
     (let* ((root (emacs-reader-opds--xml))
            (tag (car (last (split-string (symbol-name (dom-tag root)) ":")))))
       (unless (member tag '("feed" "entry")) (error "Expected an OPDS feed, received %s" tag))
@@ -148,7 +156,8 @@ PUBLICATION means NODE describes a book or navigation entry."
 (defun emacs-reader-opds--expand-search (template query)
   "Expand the search terms in TEMPLATE with QUERY."
   (let* ((value (url-hexify-string query))
-         (url (replace-regexp-in-string "{\\(?:searchTerms\\|query\\)\\??}" value template t t)))
+         (url (replace-regexp-in-string "{\\(?:searchTerms\\|query\\)\\??}" value template t t))
+         (used (not (equal url template))))
     (setq url (replace-regexp-in-string
                "{\\([?&]\\)\\([^}]+\\)}"
                (lambda (match)
@@ -157,15 +166,17 @@ PUBLICATION means NODE describes a book or navigation entry."
                           (vars (split-string (substring match 2 -1) ","))
                           (var (cl-find-if
                                 (lambda (v) (member v '("query" "searchTerms" "q"))) vars)))
-                     (if var (concat sep var "=" value) "")))) url t t))
+                     (if var (progn (setq used t) (concat sep var "=" value)) "")))) url t t))
     (setq url (replace-regexp-in-string "{[^{}]+\\?}" "" url))
-    (when (or (equal url template) (string-match-p "[{}]" url))
+    (when (or (not used) (string-match-p "[{}]" url))
       (user-error "Unsupported catalog search template"))
     url))
 
 (defvar-local emacs-reader-opds--name nil)
 (defvar-local emacs-reader-opds--generation 0)
 (defvar-local emacs-reader-opds--history nil)
+(defvar-local emacs-reader-opds--on-error nil
+  "Error callback for a background catalog request.")
 
 (defvar emacs-reader-opds-mode-map
   (let ((map (make-sparse-keymap)))
@@ -207,6 +218,20 @@ PUBLICATION means NODE describes a book or navigation entry."
   (pop emacs-reader-opds--history)
   (emacs-reader-opds--draw))
 
+(defun emacs-reader-opds--request-error (url read-body done binary reason)
+  "Report REASON for a request with URL, READ-BODY, DONE and BINARY."
+  (if emacs-reader-opds--on-error
+      (funcall emacs-reader-opds--on-error reason)
+    (let ((inhibit-read-only t))
+      (if emacs-reader-opds--history (emacs-reader-opds--draw) (erase-buffer))
+      (goto-char (point-min))
+      (insert (format "%s · %s\n" emacs-reader-opds--name reason))
+      (insert-text-button "重试" 'follow-link t
+                          'action (lambda (_) (emacs-reader-opds--get url read-body done binary)))
+      (insert "\n\n")
+      (goto-char (point-min))
+      (message "%s · %s" emacs-reader-opds--name reason))))
+
 (defun emacs-reader-opds--get (url read-body done &optional binary)
   "Fetch URL and call READ-BODY at its body, passing the final URL.
 Call DONE with the result in the originating catalog buffer.  BINARY
@@ -216,7 +241,8 @@ preserves raw response bytes for acquisition."
         (generation (cl-incf emacs-reader-opds--generation))
         (url-request-extra-headers nil)
         (url-request-method "GET") (url-request-data nil))
-    (message "Fetching %s…" (truncate-string-to-width url 90 nil nil "…"))
+    (unless emacs-reader-opds--on-error
+      (message "Fetching %s…" (truncate-string-to-width url 90 nil nil "…")))
     (url-retrieve
      url (lambda (status)
            (let ((response (current-buffer)))
@@ -246,18 +272,8 @@ preserves raw response bytes for acquisition."
                              (with-current-buffer target (funcall done result)))))
                      (error
                       (with-current-buffer target
-                        (let ((inhibit-read-only t)
-                              (reason (error-message-string err)))
-                          (if emacs-reader-opds--history (emacs-reader-opds--draw) (erase-buffer))
-                          (goto-char (point-min))
-                          (insert (format "%s · %s\n" emacs-reader-opds--name reason))
-                          (insert-text-button "重试" 'follow-link t
-                                              'action (lambda (_)
-                                                        (emacs-reader-opds--get
-                                                         url read-body done binary)))
-                          (insert "\n\n")
-                          (goto-char (point-min))
-                          (message "%s · %s" emacs-reader-opds--name reason))))))
+                        (emacs-reader-opds--request-error url read-body done binary
+                                                          (error-message-string err))))))
                (when (buffer-live-p response) (kill-buffer response))))) nil t t)))
 
 (defun emacs-reader-opds--feed (url heading)
@@ -265,18 +281,21 @@ preserves raw response bytes for acquisition."
   (emacs-reader-opds--get url #'emacs-reader-opds--parse
                           (lambda (items) (emacs-reader-opds--show heading items))))
 
+(defun emacs-reader-opds--description (base)
+  "Return the OPDS search template in an OpenSearch description at BASE."
+  (or (cl-loop for node in (emacs-reader-opds--children (emacs-reader-opds--xml) "Url")
+               thereis (and (string-match-p emacs-reader-opds--feed-type
+                                            (or (dom-attr node 'type) ""))
+                            (emacs-reader-opds--http (dom-attr node 'template) base)))
+      (error "No OPDS search template in description")))
+
 (defun emacs-reader-opds--search (url &optional keyword)
   "Search a catalog using URL with KEYWORD, prompting when omitted."
   (let ((query (or keyword (read-string "Search catalog: "))))
     (if (string-match-p "{" url)
         (emacs-reader-opds--feed (emacs-reader-opds--expand-search url query) query)
       (emacs-reader-opds--get
-       url (lambda (base)
-             (or (cl-loop for node in (emacs-reader-opds--children (emacs-reader-opds--xml) "Url")
-                          when (string-match-p emacs-reader-opds--feed-type
-                                               (or (dom-attr node 'type) ""))
-                          return (emacs-reader-opds--http (dom-attr node 'template) base))
-                 (error "No OPDS search template in description")))
+       url #'emacs-reader-opds--description
        (lambda (tpl)
          (emacs-reader-opds--feed (emacs-reader-opds--expand-search tpl query) query))))))
 
@@ -371,8 +390,9 @@ Each batch exposes its joined values as {batch}."
                                     (emacs-reader-json--page next href heading
                                                              book-title book-author 1))))))))
 
-(defun emacs-reader-json--page (rule template heading title author page)
-  "Fetch PAGE of TEMPLATE with RULE, inheriting HEADING, TITLE and AUTHOR."
+(defun emacs-reader-json--page (rule template heading title author page &optional done)
+  "Fetch PAGE of TEMPLATE with RULE, HEADING, TITLE and AUTHOR.
+Pass items to DONE when supplied."
   (let ((url (string-replace "{page}" (number-to-string page) template)))
     (emacs-reader-opds--get
      url (lambda (base)
@@ -388,7 +408,7 @@ Each batch exposes its joined values as {batch}."
                                                           rule template heading title author
                                                           (1+ page))))))
                items)))
-     (lambda (items) (emacs-reader-opds--show heading items)))))
+     (or done (lambda (items) (emacs-reader-opds--show heading items))))))
 
 (defun emacs-reader-opds--activate (item)
   "Follow catalog ITEM."
@@ -438,6 +458,74 @@ Set next to a nested definition to navigate, or omit it for downloads."
       (user-error "Expected a JSON catalog URL with {query}"))
     (emacs-reader-opds--start name)
     (emacs-reader-json--page (alist-get 'definition source) url query nil nil 1)))
+
+(defun emacs-reader-catalog--search-link (base)
+  "Return the search link advertised by the OPDS catalog at BASE."
+  (skip-chars-forward " \t\r\n")
+  (let ((links (if (eq (char-after) ?{)
+                   (alist-get 'links (emacs-reader-opds--json))
+                 (let ((root (emacs-reader-opds--xml)))
+                   (setq base (or (emacs-reader-opds--http (dom-attr root 'xml:base) base) base))
+                   (mapcar #'dom-attributes (emacs-reader-opds--children root "link"))))))
+    (or (cl-loop for link in links
+                 for rel = (alist-get 'rel link)
+                 for mime = (alist-get 'type link)
+                 thereis (and (member "search" (if (stringp rel) (split-string rel) rel))
+                              (or (null mime) (string-match-p emacs-reader-opds--feed-type mime)
+                                  (string-prefix-p "application/opensearchdescription+xml" mime))
+                              (emacs-reader-opds--http
+                               (alist-get 'href link)
+                               (or (emacs-reader-opds--http (alist-get 'xml:base link) base)
+                                   base))))
+        (error "目录未声明可用的搜索入口"))))
+
+;;;###autoload
+(defun emacs-reader-catalog-results (source keyword callback)
+  "Search catalog SOURCE for KEYWORD without opening a window.
+Call CALLBACK once with (ITEMS ERROR-STRING).  On success ITEMS contains
+catalog actions and ERROR-STRING is nil, including for an empty page."
+  (let ((worker (generate-new-buffer " *book catalog request*")) timer)
+    (cl-labels ((finish (items reason)
+                  (when (buffer-live-p worker)
+                    (cancel-timer timer)
+                    (kill-buffer worker)
+                    (funcall callback items reason)))
+                (success (items) (finish items nil))
+                (fetch-results (template)
+                  (emacs-reader-opds--get
+                   (emacs-reader-opds--expand-search template keyword)
+                   (lambda (base) (emacs-reader-opds--parse base t))
+                   (lambda (items)
+                     (success (cl-remove 'search items :key #'emacs-reader-opds--item-kind))))))
+      (setq timer (run-at-time 30 nil #'finish nil "目录搜索超时"))
+      (with-current-buffer worker
+        (setq emacs-reader-opds--on-error (lambda (reason) (finish nil reason)))
+        (condition-case err
+            (let ((url (alist-get 'url source)))
+              (when (string-empty-p (string-trim keyword)) (user-error "Enter a search term"))
+              (pcase (alist-get 'type source)
+                ("opds"
+                 (emacs-reader-opds--get
+                  url #'emacs-reader-catalog--search-link
+                  (lambda (link)
+                    (if (string-match-p "{" link) (fetch-results link)
+                      (emacs-reader-opds--get link #'emacs-reader-opds--description
+                                              #'fetch-results)))))
+                ("json"
+                 (unless (string-search "{query}" url) (error "JSON catalog URL lacks {query}"))
+                 (emacs-reader-json--page (alist-get 'definition source)
+                                          (string-replace "{query}" (url-hexify-string keyword) url)
+                                          keyword nil nil 1 #'success))
+                (_ (error "Unsupported catalog type"))))
+          (error (finish nil (error-message-string err))))))))
+
+;;;###autoload
+(defun emacs-reader-catalog-open-item (source item)
+  "Open ITEM from SOURCE in a dedicated catalog buffer."
+  (let ((name (alist-get 'name source)))
+    (emacs-reader-opds--start name)
+    (emacs-reader-opds--show name (list item))
+    (emacs-reader-opds--activate item)))
 
 (provide 'emacs-reader-opds)
 ;;; emacs-reader-opds.el ends here
