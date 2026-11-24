@@ -16,6 +16,20 @@
     (goto-char (point-min))
     (emacs-reader-opds--parse "https://a.invalid/catalog/root")))
 
+(ert-deftest emacs-reader-opds-manybooks-gutenberg-edition ()
+  (dolist (case '(("https://library.manybooks.net/live/get-book/121576/epub?gid=1342" . 2)
+                  ("https://library.manybooks.net/live/get-book/121576/epub?gid=oops" . 1)
+                  ("https://example.org/live/get-book/121576/epub?gid=1342" . 1)))
+    (let ((items (emacs-reader-opds-test--parse
+                  (format (concat "<entry><title>Pride and Prejudice</title>"
+                                  "<link rel='http://opds-spec.org/acquisition'"
+                                  " type='application/epub+zip' href='%s'/></entry>") (car case)))))
+      (should (= (cdr case) (length items)))
+      (should (equal (car case) (emacs-reader-opds--item-url (car (last items)))))
+      (when (cdr items)
+        (should (equal (emacs-reader-opds--item-url (car items))
+                       "https://gutenberg.pglaf.org/cache/epub/1342/pg1342-images-3.epub"))))))
+
 (ert-deftest emacs-reader-opds-alternate-html-or-atom-detail ()
   (let* ((item (car (emacs-reader-opds-test--parse
                      "<entry><title>Book</title><link href='detail' type='text/html'/></entry>")))

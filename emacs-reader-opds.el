@@ -99,6 +99,22 @@ ROOT marks links on the top-level feed."
                             :kind 'record :title title :label title :author author :url url
                             :action (lambda () (emacs-reader-opds--detail url title)))))))
 
+(defun emacs-reader-opds--editions (item)
+  "Offer a Gutenberg edition when a ManyBooks acquisition ITEM identifies one."
+  (let ((url (emacs-reader-opds--item-url item)))
+    (if (and (eq 'download (emacs-reader-opds--item-kind item))
+             (string-match-p (rx string-start "https://library.manybooks.net/live/get-book/"
+                                 (+ digit) "/epub?") url)
+             (string-match (rx (any "?&") "gid=" (group (any "1-9") (* digit))
+                               (or "&" string-end)) url))
+        (let ((id (match-string 1 url)) (mirror (copy-emacs-reader-opds--item item)))
+          (setf (emacs-reader-opds--item-url mirror)
+                (format "https://gutenberg.pglaf.org/cache/epub/%s/pg%s-images-3.epub" id id)
+                (emacs-reader-opds--item-label mirror)
+                (format "%s — Project Gutenberg #%s [EPUB]" (emacs-reader-opds--item-title item) id))
+          (list mirror item))
+      (list item))))
+
 (defun emacs-reader-opds--atom (node base &optional publication)
   "Return catalog items from Atom NODE relative to BASE.
 PUBLICATION means NODE describes a book or navigation entry."
@@ -117,7 +133,7 @@ PUBLICATION means NODE describes a book or navigation entry."
                               (dom-attr link 'title)
                               (or (emacs-reader-opds--http (dom-attr link 'xml:base) base) base)
                               title author nil (not publication))
-                  when item collect item)
+                  when item append (emacs-reader-opds--editions item))
          (when (and publication (not (string-empty-p title)))
            (emacs-reader-opds--alternate links base title author)))
      (cl-loop for entry in (emacs-reader-opds--children node "entry")
@@ -420,10 +436,15 @@ preserves raw response bytes for acquisition."
   (let ((ext (emacs-reader-opds--item-extension item))
         (title (emacs-reader-opds--item-title item))
         (author (emacs-reader-opds--item-author item))
-        (origin emacs-reader-opds--name))
+        (origin (if (string-prefix-p "https://gutenberg.pglaf.org/cache/epub/"
+                                     (emacs-reader-opds--item-url item))
+                    "Project Gutenberg" emacs-reader-opds--name)))
     (emacs-reader-opds--get
      (emacs-reader-opds--item-url item)
-     (lambda (_base)
+     (lambda (base)
+       (when (and (equal ext "epub") (looking-at-p "[[:space:]]*<"))
+         (error "下载链接返回了 %s 的网页，请返回目录选择其他版本"
+                (url-host (url-generic-parse-url base))))
        (when (or (eobp) (and (equal ext "epub") (not (looking-at-p "PK\003\004")))
                  (and (equal ext "txt") (looking-at-p "[[:space:]]*<\\(?:!doctype html\\|html\\)")))
          (error "Server did not return a %s book" ext))
