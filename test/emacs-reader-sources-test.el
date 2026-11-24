@@ -121,6 +121,13 @@
         (emacs-reader-sources-add-preset))
       (should (equal (alist-get 'type (emacs-reader-sources--selected)) "opds")))))
 
+(ert-deftest emacs-reader-sources-register-bibliographic-catalog ()
+  (emacs-reader-sources-test--with-registry
+    (let ((src '((type . "json") (name . "书目") (url . "https://example.test/?q={query}")
+                 (definition . ((rows . "docs") (label . "title") (recordHref . "{key}"))))))
+      (emacs-reader-sources--save src)
+      (should (equal (emacs-reader-local--records "sources") (list src))))))
+
 (provide 'emacs-reader-sources-test)
 
 ;; Local Variables:

@@ -53,6 +53,7 @@
                                        (list home results))))
       (should (equal (mapcar #'emacs-reader-opds--item-kind items) '(feed download)))
       (should (equal (emacs-reader-opds--item-url (cadr items)) (concat home "book.txt")))
+      (should (equal (mapcar #'emacs-reader-opds--item-pagination items) '(t nil)))
       (should (eq window (selected-window)))
       (should (eq buffer (window-buffer window))))))
 
@@ -91,31 +92,50 @@
 (ert-deftest emacs-reader-catalog-search-open-library-actions ()
   (let ((source (with-temp-buffer (insert-file-contents emacs-reader-catalog-test--open-library)
                                   (emacs-reader-opds--json)))
-        (bodies '("{\"numFound\":21,\"docs\":[{\"title\":\"Book\",
-\"author_name\":[\"A\"],\"ia\":[\"id\"]}]}"
-                  "{\"numFound\":21,\"docs\":[]}"
+        (bodies '("{\"numFound\":25,\"docs\":[{\"title\":\"Book\",\"key\":\"/works/A\",
+\"ebook_access\":\"public\",\"author_name\":[\"A\"],\"ia\":[\"id\"]},
+{\"title\":\"Print\",\"key\":\"/works/B\"}, {\"title\":\"Loan\",\"key\":\"/works/C\",
+\"ebook_access\":\"borrowable\",\"ia\":[\"restricted\"]}]}"
+                  "{\"numFound\":25,\"docs\":[{\"title\":\"Final\",\"key\":\"/works/D\"}]}"
                   "{\"response\":{\"numFound\":1,\"docs\":[{\"identifier\":\"id\"}]}}"
                   "{\"metadata\":{\"identifier\":\"id\"},\"files\":[{\"name\":\"b.txt\"}]}"
                   "Book body"))
-        calls items reason imported)
+        calls items reason imported visited)
     (cl-letf (((symbol-function 'url-retrieve)
                (lambda (url callback &rest _)
                  (push url calls)
                  (emacs-reader-catalog-test--respond (pop bodies) callback)))
+              ((symbol-function 'browse-url) (lambda (url &rest _) (push url visited)))
               ((symbol-function 'emacs-reader-import-file)
                (lambda (_ title author origin) (setq imported (list title author origin)))))
       (emacs-reader-catalog-results source "needle" (lambda (i e) (setq items i reason e)))
       (should-not reason)
       (should (= (length calls) 1))
       (should (string-match-p "q=needle.*page=1" (car calls)))
-      (should (equal (mapcar #'emacs-reader-opds--item-label items) '("Book — A" "Next page")))
+      (should-not (string-search "ebook_access%3Apublic" (car calls)))
+      (should (equal (mapcar #'emacs-reader-opds--item-label items)
+                     '("Book — A" "Print" "Loan" "Next page")))
+      (should (equal (mapcar #'emacs-reader-opds--item-kind items)
+                     '(record record record json-page)))
+      (should (equal (mapcar #'emacs-reader-opds--item-pagination items) '(nil nil nil t)))
+      (dolist (i '(1 2)) (emacs-reader-catalog-open-item source (nth i items)))
+      (should (equal visited
+                     '("https://openlibrary.org/works/C" "https://openlibrary.org/works/B")))
+      (should (= (length calls) 1))
       (save-window-excursion
-        (emacs-reader-catalog-open-item source (cadr items))
-        (unwind-protect (should (string-match-p "q=needle.*page=2" (car calls)))
+        (emacs-reader-catalog-open-item source (nth 3 items))
+        (unwind-protect
+            (progn
+              (should (string-match-p "q=needle.*page=2" (car calls)))
+              (should (string-search "第 2 页 · 本页 1 条，共 25 条" (buffer-string))))
           (kill-buffer (current-buffer)))
         (emacs-reader-catalog-open-item source (car items))
         (unwind-protect
             (progn
+              (let ((choices (cdar emacs-reader-opds--history)))
+                (emacs-reader-opds--activate (car choices))
+                (should (equal (car visited) "https://openlibrary.org/works/A"))
+                (emacs-reader-opds--activate (cadr choices)))
               (should (string-match-p "archive.org/advancedsearch" (car calls)))
               (emacs-reader-opds--activate (car (cdar emacs-reader-opds--history)))
               (should (equal (car calls) "https://archive.org/metadata/id"))

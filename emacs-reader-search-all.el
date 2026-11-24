@@ -38,7 +38,13 @@
           header-line-format
           (format "  %s · %d 个书源 · %d 条结果 · 待返回 %d · 失败 %d    RET 打开   a 入架   m 更多   g 重试"
                   emacs-reader-all--keyword (length emacs-reader-all--tasks)
-                  (length emacs-reader-all--rows) pending (length errors)))
+                  (cl-count-if-not
+                   (lambda (row)
+                     (let ((item (cdar row)))
+                       (and (emacs-reader-opds--item-p item)
+                            (emacs-reader-opds--item-pagination item))))
+                   emacs-reader-all--rows)
+                  pending (length errors)))
     (tabulated-list-print t)))
 
 (defun emacs-reader-all--append (source items)
@@ -57,8 +63,10 @@
         (push (list (cons source item)
                     (vector (or (emacs-reader-opds--item-label item) "")
                             (or (emacs-reader-opds--item-author item) "") (alist-get 'name source)
-                            (if (eq (emacs-reader-opds--item-kind item) 'download)
-                                "下载入架" "打开目录"))) entries)))
+                            (pcase (emacs-reader-opds--item-kind item)
+                              ('download "下载入架")
+                              ('record "查看书目")
+                              (_ "打开目录")))) entries)))
     (let ((count (length entries)))
       (setq emacs-reader-all--rows (nconc emacs-reader-all--rows (nreverse entries)))
       count)))
@@ -138,6 +146,8 @@
              (emacs-reader-open-book (cdr row) t)))
           ((or (not add) (eq (emacs-reader-opds--item-kind (cdr row)) 'download))
            (emacs-reader-catalog-open-item (car row) (cdr row)))
+          ((eq (emacs-reader-opds--item-kind (cdr row)) 'record)
+           (user-error "此行是书目，按 RET 查看详情和可用版本"))
           (t (user-error "请按 RET 打开目录，选择可下载的版本")))))
 
 (defun emacs-reader-all-add ()

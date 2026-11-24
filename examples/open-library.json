@@ -1,13 +1,15 @@
 {
   "type": "json",
   "name": "Open Library",
-  "url": "https://openlibrary.org/search.json?q={query}%20ebook_access%3Apublic&fields=ia,title,author_name&limit=20&page={page}",
+  "url": "https://openlibrary.org/search.json?q={query}&fields=key,title,author_name,ebook_access,ia&limit=24&page={page}",
   "definition": {
     "rows": "docs",
     "label": "title",
     "author": "author_name",
+    "recordHref": "{key}",
+    "lookupLabel": "查找公开版本",
     "total": "numFound",
-    "pageSize": 20,
+    "pageSize": 24,
     "href": "https://archive.org/advancedsearch.php?q=mediatype%3Atexts%20AND%20NOT%20access-restricted-item%3Atrue%20AND%20identifier%3A%28%22{batch}%22%29&fl%5B%5D=identifier&rows=40&page={page}&output=json",
     "next": {
       "rows": "response.docs",
@@ -25,6 +27,8 @@
     },
     "batch": {
       "field": "ia",
+      "whenField": "ebook_access",
+      "whenEquals": "public",
       "size": 40,
       "pattern": "\\`[[:alnum:]_.-]+\\'",
       "join": "\" OR \""

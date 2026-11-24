@@ -21,7 +21,7 @@
 (autoload 'emacs-reader-import-file "emacs-reader-local")
 
 (cl-defstruct (emacs-reader-opds--item (:constructor emacs-reader-opds--item))
-  label kind url title author extension action)
+  label kind url title author extension action pagination)
 
 (defun emacs-reader-opds--http (href base)
   "Resolve HREF against BASE and accept only HTTP(S) book catalog URLs."
@@ -62,7 +62,7 @@ TITLE and AUTHOR describe the publication.  NAV indicates a navigation entry."
                         'feed))))
       (when kind
         (emacs-reader-opds--item
-         :kind kind :url url :title title :author author :extension ext
+         :kind kind :pagination (and page t) :url url :title title :author author :extension ext
          :label (pcase kind
                   ('download (format "%s%s [%s]" title
                                      (if author (concat " — " author) "") (upcase ext)))
@@ -345,70 +345,90 @@ A single {field} holds a link.  Embedded fields are URL-encoded.
               (if (equal match template) value (url-hexify-string value))))))
       template t t) base)))
 
-(defun emacs-reader-json--rows (rule data)
-  "Return RULE's rows from DATA, optionally batching a field for a lookup.
-Each batch exposes its joined values as {batch}."
-  (let ((rows (emacs-reader-json--field (alist-get 'rows rule) data))
-        (batch (alist-get 'batch rule)))
-    (if (not batch) rows
-      (unless (and (integerp (alist-get 'size batch)) (> (alist-get 'size batch) 0))
-        (user-error "JSON catalog batch size must be positive"))
-      (cl-loop for row in rows append
-               (let* ((values (emacs-reader-json--field (alist-get 'field batch) row))
-                      (pattern (alist-get 'pattern batch))
-                      (ids (seq-filter (lambda (id) (and (stringp id)
-                                                         (string-match-p pattern id))) values))
-                      (groups (seq-partition (delete-dups ids) (alist-get 'size batch))))
-                 (cl-loop for group in groups for n from 1
-                          collect (append `((batch . ,(string-join group (alist-get 'join batch)))
-                                            (batchNumber . ,(and (cdr groups) n))) row)))))))
+(defun emacs-reader-json--batch-rows (batch row)
+  "Expand ROW into lookup groups for BATCH, or return ROW alone."
+  (if (not batch) (list row)
+    (unless (and (integerp (alist-get 'size batch)) (> (alist-get 'size batch) 0))
+      (user-error "JSON catalog batch size must be positive"))
+    (when (or (not (alist-get 'whenField batch))
+              (equal (emacs-reader-json--field (alist-get 'whenField batch) row)
+                     (alist-get 'whenEquals batch)))
+      (let* ((values (emacs-reader-json--field (alist-get 'field batch) row))
+             (pattern (alist-get 'pattern batch))
+             (ids (seq-filter (lambda (id) (and (stringp id) (string-match-p pattern id))) values))
+             (groups (seq-partition (delete-dups ids) (alist-get 'size batch))))
+        (cl-loop for group in groups for n from 1
+                 collect (append `((batch . ,(string-join group (alist-get 'join batch)))
+                                   (batchNumber . ,(and (cdr groups) n))) row))))))
+
+(defun emacs-reader-json--lookup (rule row data base label heading book writer)
+  "Build a lookup or download for ROW in DATA at BASE with RULE, LABEL, HEADING, BOOK and WRITER."
+  (when-let* ((template (alist-get 'href rule))
+              (href (emacs-reader-json--href template row data base)))
+    (let* ((next (alist-get 'next rule))
+           (ext (and (not next) (emacs-reader-opds--format href nil))))
+      (when (or next ext)
+        (emacs-reader-opds--item
+         :kind (if next 'json-page 'download) :url href :title book :author writer :extension ext
+         :label (concat label (when-let* ((n (alist-get 'batchNumber row))) (format " [%d]" n)))
+         :action (when next
+                   (lambda () (emacs-reader-json--page next href heading book writer 1))))))))
+
+(defun emacs-reader-json--row-items (rule row data base title author)
+  "Create catalog actions for ROW in DATA at BASE using RULE, TITLE and AUTHOR."
+  (let* ((name (emacs-reader-json--field (alist-get 'label rule) row))
+         (book (or (emacs-reader-json--field (alist-get 'title rule) row) title name))
+         (by (emacs-reader-json--field (alist-get 'author rule) row))
+         (writer (cond ((stringp by) by) (by (string-join by ", ")) (t author)))
+         (exclude (alist-get 'excludeLabel rule)))
+    (when (and (stringp name) (not (and exclude (string-match-p exclude name)))
+               (not (emacs-reader-json--field (alist-get 'skipIf rule) row)))
+      (let* ((label (concat name (when (and writer (equal name book)) (concat " — " writer))))
+             (record (when-let* ((href (alist-get 'recordHref rule)))
+                       (emacs-reader-json--href href row data base)))
+             (lookup-label (if record (or (alist-get 'lookupLabel rule) "查看版本") label))
+             (groups (emacs-reader-json--batch-rows (alist-get 'batch rule) row))
+             (links (cl-loop for group in groups
+                             for link = (emacs-reader-json--lookup
+                                         rule group data base lookup-label name book writer)
+                             when link collect link)))
+        (if (not record) links
+          (list (emacs-reader-opds--item
+                 :kind 'record :url record :label label :title book :author writer
+                 :action (when links
+                           (lambda ()
+                             (emacs-reader-opds--show
+                              label (cons (emacs-reader-opds--item :kind 'record :url record
+                                                                   :label "打开原站书目") links)))))))))))
 
 (defun emacs-reader-json--items (rule data base title author)
   "Map DATA at BASE using RULE, inheriting book TITLE and AUTHOR."
-  (let ((next (alist-get 'next rule)))
-    (cl-loop for row in (emacs-reader-json--rows rule data)
-             for name = (emacs-reader-json--field (alist-get 'label rule) row)
-             for book = (or (emacs-reader-json--field (alist-get 'title rule) row) title name)
-             for by = (emacs-reader-json--field (alist-get 'author rule) row)
-             for writer = (cond ((stringp by) by) (by (string-join by ", ")) (t author))
-             for url = (emacs-reader-json--href (alist-get 'href rule) row data base)
-             for ext = (and url (not next) (emacs-reader-opds--format url nil))
-             when (and (stringp name) url (or ext next)
-                       (not (emacs-reader-json--field (alist-get 'skipIf rule) row))
-                       (not (when-let* ((rx (alist-get 'excludeLabel rule)))
-                              (string-match-p rx name))))
-             collect (let ((heading name) (href url) (book-title book) (book-author writer))
-                       (emacs-reader-opds--item
-                        :label (concat name
-                                       (when (and writer (equal name book)) (concat " — " writer))
-                                       (when-let* ((n (alist-get 'batchNumber row)))
-                                         (format " [%d]" n)))
-                        :kind (if next 'json-page 'download) :url url
-                        :title book :author writer :extension ext
-                        :action (when next
-                                  (lambda ()
-                                    (emacs-reader-json--page next href heading
-                                                             book-title book-author 1))))))))
+  (cl-loop for row in (emacs-reader-json--field (alist-get 'rows rule) data)
+           append (emacs-reader-json--row-items rule row data base title author)))
 
 (defun emacs-reader-json--page (rule template heading title author page &optional done)
   "Fetch PAGE of TEMPLATE with RULE, HEADING, TITLE and AUTHOR.
 Pass items to DONE when supplied."
-  (let ((url (string-replace "{page}" (number-to-string page) template)))
+  (let ((url (string-replace "{page}" (number-to-string page) template))
+        (page-heading heading))
     (emacs-reader-opds--get
      url (lambda (base)
            (let* ((data (emacs-reader-opds--json))
                   (items (emacs-reader-json--items rule data base title author))
                   (size (alist-get 'pageSize rule))
                   (total (emacs-reader-json--field (alist-get 'total rule) data)))
+             (when (numberp total)
+               (setq page-heading (format "%s · 第 %d 页 · 本页 %d 条，共 %d 条"
+                                          heading page (length items) total)))
              (if (and (integerp size) (> size 0) (numberp total) (< (* size page) total)
                       (not (equal url template)))
                  (append items (list (emacs-reader-opds--item
-                                      :kind 'json-page :label "Next page"
+                                      :kind 'json-page :pagination t :label "Next page"
                                       :action (lambda () (emacs-reader-json--page
                                                           rule template heading title author
                                                           (1+ page))))))
                items)))
-     (or done (lambda (items) (emacs-reader-opds--show heading items))))))
+     (or done (lambda (items) (emacs-reader-opds--show page-heading items))))))
 
 (defun emacs-reader-opds--activate (item)
   "Follow catalog ITEM."
@@ -416,6 +436,8 @@ Pass items to DONE when supplied."
     (pcase (emacs-reader-opds--item-kind item)
       ('feed (emacs-reader-opds--feed url (emacs-reader-opds--item-label item)))
       ('search (emacs-reader-opds--search url))
+      ('record (if-let* ((action (emacs-reader-opds--item-action item)))
+                   (funcall action) (browse-url url)))
       ('download (emacs-reader-opds--download item))
       ('json-page (funcall (emacs-reader-opds--item-action item))))))
 
@@ -449,7 +471,10 @@ Pass items to DONE when supplied."
 SOURCE is an alist with type, name, url and definition fields.  The url
 substitutes {query} and optionally {page}.  Each definition selects a
 rows array by dotted field path and maps each row's label and href.
-Set next to a nested definition to navigate, or omit it for downloads."
+Set next to a nested definition to navigate, or omit it for downloads.
+An optional recordHref gives each row a bibliographic page and groups
+its lookup actions under lookupLabel.  A batch may require whenField to
+match whenEquals."
   (when (string-empty-p (string-trim query)) (user-error "Enter a search term"))
   (let* ((template (alist-get 'url source))
          (name (alist-get 'name source))
@@ -521,11 +546,13 @@ catalog actions and ERROR-STRING is nil, including for an empty page."
 
 ;;;###autoload
 (defun emacs-reader-catalog-open-item (source item)
-  "Open ITEM from SOURCE in a dedicated catalog buffer."
-  (let ((name (alist-get 'name source)))
-    (emacs-reader-opds--start name)
-    (emacs-reader-opds--show name (list item))
-    (emacs-reader-opds--activate item)))
+  "Open ITEM from SOURCE, using a catalog buffer when it has further actions."
+  (unless (and (eq (emacs-reader-opds--item-kind item) 'record)
+               (not (emacs-reader-opds--item-action item)))
+    (let ((name (alist-get 'name source)))
+      (emacs-reader-opds--start name)
+      (emacs-reader-opds--show name (list item))))
+  (emacs-reader-opds--activate item))
 
 (provide 'emacs-reader-opds)
 ;;; emacs-reader-opds.el ends here
