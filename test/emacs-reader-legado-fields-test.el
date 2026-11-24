@@ -44,5 +44,17 @@
     (should-not (emacs-reader-legado--values (emacs-reader-legado--parse "{}") rule))
     (should-error (emacs-reader-legado--values (emacs-reader-legado--parse "{}") "/x/{{f()}}"))))
 
+(ert-deftest emacs-reader-legado-fields-hide-executable-rules ()
+  (dolist (rule '("<js>private-value\nsecond line</js>"
+                  "https://api.test/?token={{private-value}}"))
+    (let ((message (error-message-string (should-error (emacs-reader-legado--unsupported rule)))))
+      (should (string-search "不支持" message))
+      (should-not (string-search "private-value" message))
+      (should-not (string-search "\n" message)))))
+
+(ert-deftest emacs-reader-legado-fields-escaped-wide-parenthesis ()
+  (should (equal (emacs-reader-legado--values (emacs-reader-legado--parse "<h1>书名（连载）</h1>")
+                                              "h1@text##\\（.*|\\(.*|免费阅读") '("书名"))))
+
 (provide 'emacs-reader-legado-fields-test)
 ;;; emacs-reader-legado-fields-test.el ends here

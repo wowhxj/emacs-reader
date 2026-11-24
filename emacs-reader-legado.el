@@ -21,7 +21,16 @@
 
 (defun emacs-reader-legado--unsupported (rule)
   "Report an unsupported RULE."
-  (error "不支持的 Legado 规则 %S" rule))
+  (error "不支持的 Legado 规则%s"
+         (cond ((keywordp rule) (format " %s" rule))
+               ((not (stringp rule)) "")
+               ((string-search "JavaImporter" rule) "：需要 Java/Android 脚本环境")
+               ((string-match-p "<js>\\|@js:" rule) "：此字段需要脚本处理")
+               ((string-search "{{" rule) "：此模板含未支持的动态表达式")
+               ((string-match-p "\\`https?://" rule) "：书源 URL 表达式")
+               (t (format " %s" (truncate-string-to-width
+                                 (replace-regexp-in-string "[\n\r\t]+" " " rule)
+                                 64 nil nil "…"))))))
 
 (defun emacs-reader-legado--url (value base)
   "Resolve HTTP URL VALUE relative to BASE."
@@ -45,13 +54,29 @@
                     (insert body)
                     (libxml-parse-html-region (point-min) (point-max)))))))
 
-(defun emacs-reader-legado--json-values (root rule)
-  "Select a list of values below ROOT with JSON path RULE."
+(defun emacs-reader-legado--json-descendants (root key)
+  "Collect values of KEY anywhere below ROOT in depth-first order."
+  (let (values)
+    (cl-labels ((visit (node)
+                  (cond ((hash-table-p node)
+                         (when-let* ((value (gethash key node))) (push value values))
+                         (maphash (lambda (_ child) (visit child)) node))
+                        ((vectorp node) (mapc #'visit node)))))
+      (visit root))
+    (nreverse values)))
+
+(defun emacs-reader-legado--json-values (root rule &optional keep-arrays)
+  "Select values below ROOT with JSON path RULE.  KEEP-ARRAYS preserves leaf arrays."
   (let* ((path (string-remove-prefix "$" (string-remove-prefix "@json:" rule)))
          (values (list root))
          (first t))
     (while (not (string-empty-p path))
       (cond
+       ((string-match (rx string-start ".." (group (+ (any alnum "_-")))) path)
+        (let ((key (match-string 1 path)))
+          (setq path (substring path (match-end 0))
+                values (cl-loop for value in values append
+                                (emacs-reader-legado--json-descendants value key)))))
        ((or (string-match "\\`\\.\\([[:alnum:]_-]+\\)" path)
             (and first (string-match "\\`\\([[:alnum:]_-]+\\)" path)))
         (let ((key (match-string 1 path)))
@@ -59,7 +84,7 @@
                 values (delq nil (mapcar (lambda (v) (and (hash-table-p v)
                                                           (gethash key v)))
                                          values)))))
-       ((string-match "\\`\\[\\(\\*\\|[0-9]+\\)\\]" path)
+       ((string-match "\\`\\.?\\[\\(\\*\\|[0-9]+\\)\\]" path)
         (let ((index (match-string 1 path)))
           (setq path (substring path (match-end 0))
                 values (cl-loop for v in values when (vectorp v) append
@@ -68,10 +93,23 @@
                                     (and (< i (length v)) (list (aref v i)))))))))
        (t (emacs-reader-legado--unsupported rule)))
       (setq first nil))
-    (cl-loop for v in values append (if (vectorp v) (append v nil) (list v)))))
+    (if keep-arrays values
+      (cl-loop for v in values append (if (vectorp v) (append v nil) (list v))))))
 
 (defun emacs-reader-legado--selector (step)
   "Compile a simple CSS or Legado selector STEP."
+  (if (string-prefix-p "text." step)
+      (let ((text (substring step 5)))
+        (when (string-empty-p text) (emacs-reader-legado--unsupported step))
+        (list (lambda (node)
+                (string-search text (mapconcat #'identity
+                                               (cl-remove-if-not #'stringp (dom-children node))
+                                               "")))
+              nil nil))
+    (emacs-reader-legado--css-selector step)))
+
+(defun emacs-reader-legado--css-selector (step)
+  "Compile a CSS or indexed tag, class or id selector STEP."
   (let (index exclude tag tests)
     (when (string-match "\\([.!]\\)\\(-?[0-9]+\\)\\'" step)
       (setq index (string-to-number (match-string 2 step))
@@ -131,6 +169,9 @@
 
 (defun emacs-reader-legado--html-values (root rule rows)
   "Select HTML elements or field values from ROOT using RULE and ROWS."
+  (when (or (string-prefix-p "$." rule) (string-prefix-p "$[" rule)
+            (string-prefix-p "@json:" rule))
+    (error "书源返回 HTML，但规则需要 JSON 响应"))
   (let* ((rule (string-remove-prefix "@css:" rule))
          (parts (split-string rule "@"))
          (field (unless rows
@@ -176,7 +217,8 @@
                (?d (if in-class "0-9" "[0-9]"))
                ((or ?\( ?\) ?\{ ?\} ?| ?- ?/ ?_) (char-to-string escaped))
                ((or ?. ?* ?+ ?? ?^ ?$ ?\[ ?\] ?\\) (concat "\\" (char-to-string escaped)))
-               (_ (emacs-reader-legado--unsupported pattern)))))
+               (_ (if (> escaped 127) (regexp-quote (char-to-string escaped))
+                    (emacs-reader-legado--unsupported pattern))))))
           ((and (not in-class) (eq ch ?\() (< (1+ i) (length pattern))
                 (eq (aref pattern (1+ i)) ??))
            (emacs-reader-legado--unsupported pattern))
@@ -190,32 +232,53 @@
     (apply #'concat (nreverse chunks))))
 
 (defun emacs-reader-legado--match-rule (rule)
-  "Parse RULE ending in a literal result.match(/regexp/)[index] expression."
+  "Return a selector and optional regexp capture for a supported literal RULE."
   (when-let* ((start (string-search "@js:" rule)))
     (let ((expression (substring rule start)))
-      (unless (string-match
-               (rx string-start "@js:result.match(/"
-                   (group (+ (or (not (any "/\\\r\n")) (seq "\\" (not (any "\r\n"))))))
-                   "/)[" (group (+ digit)) "]" string-end)
-               expression)
-        (emacs-reader-legado--unsupported rule))
-      (let* ((index (string-to-number (match-string 2 expression)))
-             (pattern (emacs-reader-legado--regexp (match-string 1 expression))))
-        (unless (<= index (regexp-opt-depth pattern)) (emacs-reader-legado--unsupported rule))
-        (list (substring rule 0 start) pattern index)))))
+      (cond
+       ((string-match (rx string-start (group "$" (+ (seq "." (+ (any alnum "_-")))))
+                          "@js:'" (group "http" (? "s") "://" (+ (any alnum ".-"))
+                                         (+ (seq "/" (* (any alnum "._~-")))) "/")
+                          "'+result" string-end) rule)
+        (list (concat (match-string 2 rule) "{{" (match-string 1 rule) "}}")))
+       ((string-match
+         (rx string-start "@js:result.match(/"
+             (group (+ (or (not (any "/\\\r\n")) (seq "\\" (not (any "\r\n"))))))
+             "/)[" (group (+ digit)) "]" string-end)
+         expression)
+        (let* ((index (string-to-number (match-string 2 expression)))
+               (pattern (emacs-reader-legado--regexp (match-string 1 expression))))
+          (unless (<= index (regexp-opt-depth pattern)) (emacs-reader-legado--unsupported rule))
+          (list (substring rule 0 start) pattern index)))
+       (t (emacs-reader-legado--unsupported rule))))))
 
 (defun emacs-reader-legado--json-url-values (root rule)
-  "Expand a single JSON scalar as the final path component of RULE below ROOT."
-  (unless (string-match (rx string-start (group "/" (+ (any alnum "-_/")) "/")
-                            "{{" (group "$" (+ (seq "." (+ (any alnum "_-"))))) "}}" string-end)
-                        rule)
-    (emacs-reader-legado--unsupported rule))
-  (let* ((prefix (match-string 1 rule))
-         (values (emacs-reader-legado--json-values root (match-string 2 rule)))
-         (value (car values)))
-    (when (and (not (string-prefix-p "//" prefix)) (= (length values) 1)
-               (or (numberp value) (stringp value)) (not (member value '("" "." ".."))))
-      (list (concat prefix (url-hexify-string (format "%s" value)))))))
+  "Expand scalar JSON fields in path segments or query values of RULE below ROOT."
+  (when (string-match-p (rx "," (* space) "{") rule)
+    (error "书籍链接使用暂不支持的请求配置"))
+  (rx-let ((field (seq "$" (+ (seq "." (+ (any alnum "_-"))))))
+           (slot (or (seq "{{" field "}}") (seq "{" field "}")))
+           (url-token (+ (any alnum "._~%-")))
+           (segment (or url-token (seq slot (? "." (+ alnum)))))
+           (param (seq url-token "=" (or slot (* (any alnum "._~%-"))))))
+    (unless (string-match-p
+             (rx string-start (? "http" (? "s") "://" (+ (any alnum ".-")) (? ":" (+ digit)))
+                 "/" segment (* "/" segment)
+                 (? "?" param (* "&" param)) string-end) rule)
+      (emacs-reader-legado--unsupported rule))
+    (catch 'missing
+      (list (replace-regexp-in-string
+             (rx slot)
+             (lambda (field)
+               (let* ((width (if (string-prefix-p "{{" field) 2 1))
+                      (path (substring field width (- width)))
+                      (value (save-match-data
+                               (car (emacs-reader-legado--json-values root path t)))))
+                 (unless (and (or (numberp value) (stringp value))
+                              (not (member value '("" "." ".."))))
+                   (throw 'missing nil))
+                 (url-hexify-string (format "%s" value))))
+             rule t t)))))
 
 (defun emacs-reader-legado--values (doc rule &optional rows)
   "Evaluate RULE in DOC, returning elements for ROWS or strings otherwise."
@@ -226,13 +289,16 @@
          (path (car parts))
          (capture (and (not rows) (emacs-reader-legado--match-rule path)))
          (path (or (car capture) path)))
-    (when (or (string-match-p "@js:\\|<js>\\|&&\\|%%\\|@put:\\|@get:" path)
+    (when (or (string-match-p "@js:\\|<js>\\|%%\\|@put:\\|@get:" path)
               (and (cdr parts) (or rows (string-empty-p (cadr parts)) (> (length parts) 3))))
       (emacs-reader-legado--unsupported rule))
     (let* ((values (cond ((string-search "||" path)
                           (cl-loop for option in (split-string path (regexp-quote "||"))
                                    thereis (emacs-reader-legado--values doc option rows)))
-                         ((and (eq (car doc) 'json) (not rows) (string-search "{{" path))
+                         ((string-search "&&" path)
+                          (cl-loop for option in (split-string path "&&" nil "[[:space:]]+")
+                                   append (emacs-reader-legado--values doc option rows)))
+                         ((and (eq (car doc) 'json) (not rows) (string-search "{" path))
                           (emacs-reader-legado--json-url-values (cdr doc) path))
                          ((eq (car doc) 'json) (emacs-reader-legado--json-values (cdr doc) path))
                          (t (emacs-reader-legado--html-values (cdr doc) path rows))))
@@ -242,7 +308,7 @@
       (if rows values
         (cl-loop for value in values when (or (numberp value) (stringp value))
                  for text = (format "%s" value)
-                 for extracted = (if capture
+                 for extracted = (if (cdr capture)
                                      (and (string-match (nth 1 capture) text)
                                           (match-string (nth 2 capture) text))
                                    text)
@@ -254,15 +320,31 @@
                  unless (string-empty-p cleaned) collect cleaned)))))
 
 (defun emacs-reader-legado--field (doc rules key)
-  "Read the first value for KEY in RULES from DOC."
+  "Read KEY in RULES from DOC, joining combined text fields with newlines."
   (when-let* ((rule (plist-get rules key)))
-    (unless (equal rule "") (car (emacs-reader-legado--values doc rule)))))
+    (unless (equal rule "")
+      (when-let* ((values (emacs-reader-legado--values doc rule)))
+        (if (and (not (memq key '(:bookUrl :tocUrl :chapterUrl :coverUrl)))
+                 (string-search "&&" (car (split-string rule "##")))) (string-join values "\n")
+          (car values))))))
 
-(defun emacs-reader-legado--request-object (text)
-  "Read a JSON object from TEXT, also accepting single-quoted strings."
+(defun emacs-reader-legado--search-field (row rules key)
+  "Read KEY in ROW using RULES, projecting the value of a static JSON put annotation.
+Search result metadata only consumes the value associated with KEY."
+  (let ((rule (plist-get rules key)))
+    (if (and (eq (car row) 'json) (stringp rule)
+             (string-match (rx string-start (group "$" (+ (seq "." (+ (any alnum "_-")))))
+                               "@put:{" (+ (any alnum "_")) ":" (+ (any alnum "_")) "}" string-end)
+                           rule))
+        (car (emacs-reader-legado--values row (match-string 1 rule)))
+      (emacs-reader-legado--field row rules key))))
+
+(defun emacs-reader-legado--request-object (text &optional search header)
+  "Read a static object from TEXT with optional SEARCH placeholders.
+HEADER also permits an equals sign between a quoted header name and its value."
   (unless (string-match-p "\\`[[:space:]]*{" text)
     (error "书源请求配置需要对象"))
-  (when (string-search "'" text)
+  (when (or search header (string-search "'" text))
     (let (chars delimiter (i 0))
       (while (< i (length text))
         (let ((ch (aref text i)))
@@ -271,6 +353,17 @@
             (setq i (1+ i) ch (aref text i))
             (unless (and (= delimiter ?') (= ch ?')) (push ?\\ chars))
             (push ch chars))
+           ((and (eq delimiter ?') (memq ch '(?\n ?\r ?\t)))
+            (push ?\\ chars) (push (pcase ch (?\n ?n) (?\r ?r) (_ ?t)) chars))
+           ((and (null delimiter) header (= ch ?=)) (push ?: chars))
+           ((and (null delimiter) search (= ch ?{)
+                 (equal (substring text i (min (length text) (+ i 7))) "{{key}}"))
+            (dolist (c (string-to-list "\"{{key}}\"")) (push c chars))
+            (setq i (+ i 6)))
+           ((and (null delimiter) search (= ch ?{)
+                 (equal (substring text i (min (length text) (+ i 8))) "{{page}}"))
+            (dolist (c (string-to-list (number-to-string (cadr search)))) (push c chars))
+            (setq i (+ i 7)))
            ((and delimiter (= delimiter ch)) (push ?\" chars) (setq delimiter nil))
            ((and (null delimiter) (memq ch '(?' ?\"))) (push ?\" chars) (setq delimiter ch))
            ((and (eq delimiter ?') (= ch ?\")) (push ?\\ chars) (push ch chars))
@@ -283,13 +376,13 @@
 (defconst emacs-reader-legado--url-script-prefix "\\`[[:space:]]*\\(?:@js:\\|<js>\\)"
   "Prefix used by Legado URL scripts.")
 
-(defun emacs-reader-legado--request-parts (target)
-  "Split TARGET into its URL template and parsed request options."
+(defun emacs-reader-legado--request-parts (target &optional search)
+  "Split TARGET into its URL template and options for SEARCH."
   (when (and (stringp target) (string-match-p emacs-reader-legado--url-script-prefix target))
     (error "不支持 JavaScript/WebView 书源 URL"))
   (if (and (stringp target) (string-match ",[[:space:]]*\\({\\)" target))
       (cons (substring target 0 (match-beginning 0))
-            (emacs-reader-legado--request-object (substring target (match-beginning 1))))
+            (emacs-reader-legado--request-object (substring target (match-beginning 1)) search))
     (list target)))
 
 (defun emacs-reader-legado--request-charset (options)
@@ -300,20 +393,35 @@
 
 (defun emacs-reader-legado--headers (headers &optional expand)
   "Convert static HEADERS to an HTTP header alist, using EXPAND on values."
-  (let (result)
+  (let ((case-fold-search nil) result)
+    ;; Recognize the complete literal UA wrapper.  Any additional statement fails.
+    (when (and (stringp headers)
+               (string-match
+                (rx-let ((ws (* (any " \t\r\n"))))
+                  (rx string-start ws "<js>" ws "(()=>{" ws
+                      "var" (+ space) "ua" ws "=" ws
+                      (group ?\" (* (not (any ?\" ?\\ ?\r ?\n))) ?\") ";" ws
+                      "var" (+ space) (group (+ (any "a-zA-Z_"))) ws "=" ws
+                      "{" ws "\"User-Agent\"" ws ":" ws "ua" ws "};" ws
+                      "return" (+ space) "JSON.stringify(" (backref 2) ");" ws
+                      "})()" ws "</js>" ws string-end))
+                headers))
+      (setq headers (list :User-Agent (json-parse-string (match-string 1 headers)))))
     (when (stringp headers)
       (setq headers (unless (string-blank-p headers)
-                      (condition-case nil (emacs-reader-legado--request-object headers)
+                      (condition-case nil (emacs-reader-legado--request-object headers nil t)
                         (error (error "不支持的书源请求头格式"))))))
     (unless (proper-list-p headers) (error "不支持的书源请求头格式"))
     (while headers
       (unless (and (keywordp (car headers)) (cdr headers)) (error "不支持的书源请求头字段"))
       (let ((name (substring (symbol-name (pop headers)) 1)) (value (pop headers)))
         (when (and expand (stringp value)) (setq value (funcall expand value)))
-        (unless (and (string-match-p "\\`[[:alnum:]_-]+\\'" name) (stringp value)
-                     (not (string-match-p "[\r\n]\\|{{\\|@js:\\|<js>" value)))
+        (unless (and (string-match-p "\\`[A-Za-z0-9_-]+\\'" name) (stringp value)
+                     (let ((case-fold-search t))
+                       (not (string-match-p "[\0-\10\12-\37\177]\\|{{\\|@js:\\|<js>" value))))
           (error "不支持的书源请求头字段"))
-        (push (cons name value) result)))
+        (push (cons (encode-coding-string name 'us-ascii)
+                    (encode-coding-string value 'utf-8)) result)))
     result))
 
 (defun emacs-reader-legado--response (status &optional fallback)
@@ -346,48 +454,68 @@
       (when (and (member (url-type url) '("http" "https")) (url-host url))
         (list (url-type url) (downcase (url-host url)) (url-port url))))))
 
-(defun emacs-reader-legado--search-expander (search base charset)
-  "Build a template expander for SEARCH (query page), BASE and CHARSET."
-  (let ((key (url-hexify-string (encode-coding-string (car search) (or charset 'utf-8))))
-        (page (number-to-string (cadr search))))
+(defun emacs-reader-legado--search-expander (search base charset &optional json)
+  "Build a template expander for SEARCH, BASE and CHARSET.
+For a JSON body, escape string values for insertion in serialized JSON."
+  (let ((key (if json (substring (json-serialize (car search)) 1 -1)
+               (url-hexify-string (encode-coding-string (car search) (or charset 'utf-8)))))
+        (base-value (if json (substring (json-serialize base) 1 -1) base))
+        (page (number-to-string (cadr search)))
+        (index (number-to-string (1- (cadr search)))))
     (lambda (text)
-      (string-replace "{{key}}" key
-                      (string-replace "{{page}}" page (string-replace "{{baseUrl}}" base text))))))
+      (let ((case-fold-search nil))
+        (replace-regexp-in-string
+         (rx "{{" (or "key" "page" "page-1" "baseUrl") "}}")
+         (lambda (token)
+           (pcase token ("{{key}}" key) ("{{page}}" page) ("{{page-1}}" index) (_ base-value)))
+         text t t)))))
 
 (defun emacs-reader-legado--fetch (source target base callback &optional search)
   "Fetch TARGET relative to BASE for SOURCE using optional SEARCH substitutions.
 Call CALLBACK with DOC, final URL, ERROR and the originally requested URL."
   (let (delivered)
     (condition-case err
-        (let* ((parts (emacs-reader-legado--request-parts target))
+        (let* ((parts (emacs-reader-legado--request-parts target search))
                (options (cdr parts))
                (charset (emacs-reader-legado--request-charset options))
                (expand (if search (emacs-reader-legado--search-expander search (or base "") charset)
                          #'identity))
                (url (emacs-reader-legado--url (funcall expand (car parts)) base))
-               (url-request-method (upcase (or (plist-get options :method) "GET")))
+               (url-request-method (encode-coding-string
+                                    (upcase (or (plist-get options :method) "GET")) 'utf-8))
                (body (plist-get options :body))
+               (json-body (and body (or (not (stringp body))
+                                        (string-match-p "\\`[[:space:]]*{" body))))
                (url-request-extra-headers (emacs-reader-legado--headers (plist-get source :header)))
                (url-request-data
-                (and body (encode-coding-string
-                           (funcall expand (if (stringp body) body (json-serialize body)))
-                           (if (stringp body) (or charset 'utf-8) 'utf-8)))))
-          (cl-loop for (key _) on options by #'cddr
-                   unless (memq key '(:method :body :header :headers :charset))
+                (and body
+                     (if json-body
+                         (let ((json (json-serialize
+                                      (if (stringp body)
+                                          (emacs-reader-legado--request-object body search) body))))
+                           (when search
+                             (setq json (funcall (emacs-reader-legado--search-expander
+                                                  search (or base "") charset t) json)))
+                           (encode-coding-string json 'utf-8))
+                       (encode-coding-string (funcall expand body) (or charset 'utf-8))))))
+          (cl-loop for (key value) on options by #'cddr
+                   unless (or (memq key '(:method :body :header :headers :charset))
+                              (and (eq key :webView) (member value '(:false "false"))))
                    do (emacs-reader-legado--unsupported key))
           (unless (member url-request-method '("GET" "POST"))
             (emacs-reader-legado--unsupported url-request-method))
           (when (and body (or (equal url-request-method "GET")
                               (string-match-p "{{\\|@js:\\|<js>" url-request-data)))
-            (emacs-reader-legado--unsupported body))
+            (error "书源请求体含未支持的模板或请求方法"))
           (dolist (entry (emacs-reader-legado--headers
                           (or (plist-get options :headers) (plist-get options :header)) expand))
             (let ((old (assoc-string (car entry) url-request-extra-headers t)))
               (if old (setcdr old (cdr entry)) (push entry url-request-extra-headers))))
           (when (and url-request-data
                      (not (assoc-string "Content-Type" url-request-extra-headers t)))
-            (push (cons "Content-Type" (if (stringp body) "application/x-www-form-urlencoded"
-                                         "application/json")) url-request-extra-headers))
+            (push (cons "Content-Type" (if json-body "application/json"
+                                         "application/x-www-form-urlencoded"))
+                  url-request-extra-headers))
           (let* ((home (emacs-reader-legado--origin (plist-get source :bookSourceUrl)))
                  (credentials (cl-some (lambda (key) (assoc-string key url-request-extra-headers t))
                                        '("Cookie" "Authorization"
@@ -434,8 +562,10 @@ Pass SEARCH to `emacs-reader-legado--fetch' for search substitutions."
          (path (if (and (stringp rule) (or reverse-order (string-prefix-p "+" rule)))
                    (substring rule 1) rule))
          (nodes (emacs-reader-legado--values doc path t)))
-    (mapcar (lambda (node) (funcall build (cons (car doc) node)))
-            (if reverse-order (reverse nodes) nodes))))
+    (when nodes
+      (or (delq nil (mapcar (lambda (node) (funcall build (cons (car doc) node)))
+                            (if reverse-order (reverse nodes) nodes)))
+          (error "书源 %s 已匹配列表，但未提取到有效名称及链接" key)))))
 
 (defun emacs-reader-legado--direct-result (source doc url query)
   "Read a redirected detail page at URL when SOURCE identifies QUERY in DOC."
@@ -447,7 +577,8 @@ Pass SEARCH to `emacs-reader-legado--fetch' for search substitutions."
                           doc))
                 (name (car (emacs-reader-legado--values detail name-rule)))
                 ((equal name (string-trim query))))
-      (list (list :bookUrl url :name name :author (emacs-reader-legado--field detail rules :author)
+      (list (list :bookUrl url :name name
+                  :author (ignore-errors (emacs-reader-legado--field detail rules :author))
                   :origin (plist-get source :bookSourceUrl)
                   :originName (plist-get source :bookSourceName))))))
 
@@ -474,7 +605,7 @@ Pass SEARCH to `emacs-reader-legado--fetch' for search substitutions."
   (let ((template (plist-get source :searchUrl)) (page (or page 1))
         (origin (plist-get source :bookSourceUrl)) (rules (plist-get source :ruleSearch)))
     (cond ((not (stringp template)) (funcall callback nil "书源缺少 searchUrl"))
-          ((and (> page 1) (not (string-search "{{page}}" template))
+          ((and (> page 1) (not (string-match-p "{{page\\(?:-1\\)?}}" template))
                 (not (string-match-p emacs-reader-legado--url-script-prefix template)))
            (funcall callback nil nil))
           (t
@@ -484,12 +615,12 @@ Pass SEARCH to `emacs-reader-legado--fetch' for search substitutions."
               (or (emacs-reader-legado--rows
                    doc rules :bookList
                    (lambda (row)
-                     (list :bookUrl (emacs-reader-legado--url
-                                     (emacs-reader-legado--field row rules :bookUrl) url)
-                           :name (or (emacs-reader-legado--field row rules :name)
-                                     (error "搜索结果缺少书名"))
-                           :author (emacs-reader-legado--field row rules :author)
-                           :origin origin :originName (plist-get source :bookSourceName))))
+                     (when-let* ((name (emacs-reader-legado--search-field row rules :name))
+                                 (link (emacs-reader-legado--field row rules :bookUrl)))
+                       (list :bookUrl (emacs-reader-legado--url link url) :name name
+                             :author (ignore-errors
+                                       (emacs-reader-legado--search-field row rules :author))
+                             :origin origin :originName (plist-get source :bookSourceName)))))
                   (when (and (= page 1) (not (equal url requested)))
                     (emacs-reader-legado--direct-result source doc url query))))
             (list query page))))))
@@ -500,9 +631,10 @@ Pass SEARCH to `emacs-reader-legado--fetch' for search substitutions."
     (when (and init (not (equal init "")))
       (setq doc (cons (car doc) (car (emacs-reader-legado--values doc init t)))))
     (dolist (key '(:name :author :intro :kind :lastChapter :wordCount :coverUrl))
-      (when-let* ((value (emacs-reader-legado--field doc rules key)))
-        (setq info (plist-put info key
-                              (if (eq key :coverUrl) (emacs-reader-legado--url value url) value)))))
+      (ignore-errors
+        (when-let* ((value (emacs-reader-legado--field doc rules key)))
+          (setq info (plist-put info key (if (eq key :coverUrl)
+                                             (emacs-reader-legado--url value url) value))))))
     (plist-put info :tocUrl
                (if-let* ((toc (emacs-reader-legado--field doc rules :tocUrl)))
                    (emacs-reader-legado--url toc url) url))))
@@ -526,9 +658,9 @@ Pass SEARCH to `emacs-reader-legado--fetch' for search substitutions."
     (emacs-reader-legado--rows
      doc rules :chapterList
      (lambda (row)
-       (list :title (or (emacs-reader-legado--field row rules :chapterName) (error "目录缺少章节名"))
-             :url (emacs-reader-legado--url
-                   (emacs-reader-legado--field row rules :chapterUrl) url))))))
+       (when-let* ((name (emacs-reader-legado--field row rules :chapterName))
+                   (link (emacs-reader-legado--field row rules :chapterUrl)))
+         (list :title name :url (emacs-reader-legado--url link url)))))))
 
 (defun emacs-reader-legado--pages (source target first-doc next-rule read-page callback)
   "Collect lists from READ-PAGE, following NEXT-RULE in SOURCE.
@@ -576,8 +708,11 @@ Start at TARGET with optional FIRST-DOC and call CALLBACK with the complete list
          (if message (funcall callback nil message)
            (emacs-reader-legado--pages source (car value) (cdr value) next read-page callback)))
        (lambda (doc url _requested)
-         (let* ((info (emacs-reader-legado--info doc url book (plist-get source :ruleBookInfo)))
-                (target (plist-get info :tocUrl)))
+         (let* ((rules (plist-get source :ruleBookInfo))
+                (toc-rule (plist-get rules :tocUrl))
+                (target (if (and toc-rule (not (equal toc-rule "")))
+                            (plist-get (emacs-reader-legado--info doc url book rules) :tocUrl)
+                          url)))
            (cons target (and (equal target url) doc))))))))
 
 (defun emacs-reader-legado-content (source chapter callback)
@@ -586,17 +721,35 @@ Start at TARGET with optional FIRST-DOC and call CALLBACK with the complete list
       (emacs-reader-wendian-content source chapter callback)
     (emacs-reader-legado--content-rules source chapter callback)))
 
+(defun emacs-reader-legado--clean-content (text)
+  "Normalize web page line endings and paragraph margins in TEXT."
+  (let* ((lines (replace-regexp-in-string "\r\n?" "\n" text))
+         (trimmed (mapconcat (lambda (line) (string-trim line "[ \t ]+" "[ \t ]+"))
+                             (split-string lines "\n") "\n")))
+    (string-trim (replace-regexp-in-string "\n\n\n+" "\n\n" trimmed))))
+
 (defun emacs-reader-legado--content-rules (source chapter callback)
   "Read CHAPTER from SOURCE; call CALLBACK with its text/error."
   (let ((rules (plist-get source :ruleContent)))
     (emacs-reader-legado--pages
      source (plist-get chapter :url) nil (plist-get rules :nextContentUrl)
      (lambda (doc _url)
-       (when-let* ((regex (plist-get rules :replaceRegex)))
-         (unless (equal regex "") (emacs-reader-legado--unsupported regex)))
        (or (emacs-reader-legado--values doc (plist-get rules :content))
            (error "正文规则未提取到文本")))
-     (lambda (text message) (funcall callback (and text (string-join text "\n")) message)))))
+     (lambda (parts message)
+       (let (text)
+         (unless message
+           (condition-case err
+               (let ((joined (string-join parts "\n")) (regex (plist-get rules :replaceRegex)))
+                 (when (and regex (not (equal regex "")))
+                   (unless (and (stringp regex) (string-prefix-p "##" regex))
+                     (emacs-reader-legado--unsupported regex))
+                   (setq joined (car (emacs-reader-legado--values (cons 'json joined)
+                                                                  (concat "$" regex)))))
+                 (setq text (emacs-reader-legado--clean-content (or joined "")))
+                 (when (string-empty-p text) (error "正文规则未提取到文本")))
+             (error (setq text nil message (error-message-string err)))))
+         (funcall callback text message))))))
 
 (provide 'emacs-reader-legado)
 ;;; emacs-reader-legado.el ends here

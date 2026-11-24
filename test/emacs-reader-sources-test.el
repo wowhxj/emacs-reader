@@ -144,6 +144,12 @@
         (should (equal expected (car result)))
         (when reason (should (equal reason (cdr result))))))))
 
+(ert-deftest emacs-reader-sources-test-check-search-relevance ()
+  (let ((state (emacs-reader-sources--result '((type . "legado")) "三体"
+                                             '((:name "三体") (:author "三体") (:name "三位一体")) nil)))
+    (should (string-search "首页 3 条结果" (cdr state)))
+    (should (string-search "含关键词 2 条" (cdr state)))))
+
 (ert-deftest emacs-reader-sources-test-check-queue ()
   (emacs-reader-sources-test--with-registry
     (let ((emacs-reader-sources-check-concurrency 2) calls canceled)

@@ -99,7 +99,7 @@
 
 (ert-deftest emacs-reader-legado-unsupported-rules ()
   (dolist (case '(("<p>x</p>" "@js:result") ("<p>x</p>" "p:first@text")
-                  ("{}" "$..x") ("[]" "$[?(@.a)]")))
+                  ("{}" "$..*") ("[]" "$[?(@.a)]")))
     (emacs-reader-legado-test--with-pages
      (list (list "https://fixture.test/ch" (car case)))
      (lambda ()
@@ -196,6 +196,41 @@
         (insert body)
         (let ((failure (should-error (emacs-reader-legado--response status))))
           (should (string-search message (error-message-string failure))))))))
+
+(ert-deftest emacs-reader-legado-chapter-reading-path ()
+  (let ((source '(:bookSourceUrl "https://books.test/" :searchUrl "/s"
+                                 :ruleSearch (:bookList "li" :name "a@text" :bookUrl "a@href")
+                                 :ruleBookInfo (:kind "b@text&&\ni@text##类型："
+                                                      :intro "@js:unsupported()")
+                                 :ruleToc (:chapterList "dd" :chapterName "a@text"
+                                                        :chapterUrl "a@href")
+                                 :ruleContent (:content "#content@html" :nextContentUrl
+                                                        "text.下一页@href" :replaceRegex "##广告")))
+        book info chapters lines)
+    (emacs-reader-legado-test--with-pages
+     '(("https://books.test/s" "<li>书名</li><li><a href='/b'>书</a></li>")
+       ("https://books.test/b" "<b>类型：连载</b><i>仙侠</i>")
+       ("https://books.test/b" "<dd>卷首</dd><dd><a href='/c'>第一章</a></dd>")
+       ("https://books.test/c" "<div id='content'>广告<br>　甲</div><a href='d'>下一页</a>")
+       ("https://books.test/d" "<div id='content'>&nbsp;乙\r\n丙</div><a href='e'>下一章</a>"))
+     (lambda ()
+       (emacs-reader-legado-search source "书" (lambda (v e) (should-not e) (setq book (car v))))
+       (emacs-reader-legado-book-info source book (lambda (v e) (should-not e) (setq info v)))
+       (should (equal (plist-get info :kind) "连载\n仙侠"))
+       (emacs-reader-legado-chapters source info (lambda (v e) (should-not e) (setq chapters v)))
+       (should (equal (length chapters) 1))
+       (emacs-reader-legado-content source (car chapters)
+                                    (lambda (v e) (should-not e) (setq lines v)))
+       (should (equal lines "　甲\n乙\n丙"))))))
+
+(ert-deftest emacs-reader-legado-chapter-empty-rows ()
+  (emacs-reader-legado-test--with-pages
+   '(("https://books.test/s" "<li>书名</li>"))
+   (lambda ()
+     (emacs-reader-legado-search
+      '(:bookSourceUrl "https://books.test/" :searchUrl "/s"
+                       :ruleSearch (:bookList "li" :name "a@text" :bookUrl "a@href"))
+      "书" (lambda (books err) (should-not books) (should (string-search "bookList" err)))))))
 
 (provide 'emacs-reader-legado-test)
 ;;; emacs-reader-legado-test.el ends here

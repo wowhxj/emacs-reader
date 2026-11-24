@@ -148,7 +148,16 @@
                                           (memq (emacs-reader-opds--item-kind item)
                                                 '(record download))) items))) "有目录项")
                     (t "搜到书"))
-              (format "「%s」首页 %d 条结果" keyword count))))))
+              (concat (format "「%s」首页 %d 条结果" keyword count)
+                      (when (and (equal type "legado") (> count 0))
+                        (format "，书名或作者含关键词 %d 条"
+                                (cl-count-if
+                                 (lambda (book)
+                                   (cl-some (lambda (field)
+                                              (let ((value (plist-get book field)))
+                                                (and (stringp value)
+                                                     (string-search keyword value))))
+                                            '(:name :author))) items)))))))))
 
 (defun emacs-reader-sources--abort (check)
   "Release the outstanding request for CHECK."
