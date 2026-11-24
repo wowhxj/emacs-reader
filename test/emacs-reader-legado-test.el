@@ -185,5 +185,17 @@
        source '(:url "https://fixture.test:443/c")
        (lambda (v e) (should-not v) (should (string-match-p "禁止自动重定向" e)))))))
 
+(ert-deftest emacs-reader-legado-response-distinguishes-errors ()
+  (dolist (example '((403 nil "denied" "HTTP 403") (nil nil "" "0 字节")
+                     (nil (:error (error connection-failed)) "" "connection-failed")
+                     (200 nil "HTTP/1.1 200 OK\r\n\r\n{}oops" "JSON")
+                     (200 nil "HTTP/1.1 200 OK\r\n\r\n" "空正文")))
+    (pcase-let ((`(,code ,status ,body ,message) example))
+      (with-temp-buffer
+        (setq-local url-http-response-status code)
+        (insert body)
+        (let ((failure (should-error (emacs-reader-legado--response status))))
+          (should (string-search message (error-message-string failure))))))))
+
 (provide 'emacs-reader-legado-test)
 ;;; emacs-reader-legado-test.el ends here

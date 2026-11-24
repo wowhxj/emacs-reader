@@ -38,7 +38,7 @@ JSON 目录也支持书目详情页。把 `recordHref` 设为详情链接字段�
 
 搜索只列出已注册且启用的书源。文渊阁和 Open Library 都是可选配置，删除后可通过 `a p` 再次添加。删除书源会保留书架和已下载的文件。尚需联网加载章节的 Legado 书籍，可以在重新添加对应书源后继续阅读。
 
-Legado 支持声明式 HTML/CSS 选择器、原生 tag/class/id 规则、基础 JSONPath、GET/POST、静态请求头，以及目录和正文分页。导入时标记为 `enabled: false` 的书源不会出现在搜索列表中。依赖 JavaScript、WebView、XPath 或复杂脚本的书源需要额外引擎。在线搜索与抓取 Legado 章节需要联网；已导入的 EPUB、TXT 可断网阅读。
+Legado 支持 HTML/CSS 选择器、tag/class/id 元素链、索引与排除、基础 JSONPath，以及目录和正文分页。搜索 URL 后的 GET/POST 选项和静态请求头可使用单引号或双引号；例如 `{'method':'POST','charset':'gbk','body':'searchkey={{key}}'}` 会按 GBK 编码中文关键词。字段规则支持常见 `##` 正则清洗和 `result.match(/…/)[n]` 捕获。导入时标记为 `enabled: false` 的书源不会出现在搜索列表中。依赖通用 JavaScript、WebView 登录验证或 XPath 的规则目前无法在本地解析。在线搜索与抓取 Legado 章节需要联网；已导入的 EPUB、TXT 可断网阅读。
 
 ## 搜索范围
 
