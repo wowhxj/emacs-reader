@@ -34,7 +34,30 @@
                      `((type . "all") (sources ,legado))))
       (should (equal (emacs-reader-picker-test--read (kbd "o RET"))
                      `((type . "all") (sources ,opds))))
+      (should (equal (emacs-reader-picker-test--read (kbd "s RET"))
+                     `((type . "all") (sources ,json))))
       (should (equal (emacs-reader-picker-test--read (kbd "l DEL RET")) all))
+      (let ((saw-mark nil)
+            (saw-cleared nil))
+        (let ((pre-command-hook
+               (cons (lambda ()
+                       (when-let* ((fn (plist-get completion-extra-properties
+                                                  :affixation-function)))
+                         (let ((prefix (cadar (funcall fn '("Solo [legado] <one>")))))
+                           (cond ((equal prefix "[✓] ") (setq saw-mark t))
+                                 ((and saw-mark (equal prefix "[ ] ")
+                                       (assoc "Solo [legado] <one>" minibuffer-completion-table))
+                                  (setq saw-cleared t))))))
+                     pre-command-hook)))
+          (should (equal (emacs-reader-picker-test--read
+                          (kbd (concat "l S o C-SPC C-a C-k DEL o L i C-SPC C-a C-k DEL "
+                                       "s O p C-SPC C-a C-k DEL l S o C-SPC RET")))
+                         `((type . "all") (sources ,opds ,json))))
+          (should saw-mark)
+          (should saw-cleared)))
+      (should (equal (emacs-reader-picker-test--read (kbd "s C-SPC C-SPC DEL RET")) all))
+      (should (equal (emacs-reader-picker-test--read (kbd "o C-SPC DEL x RET"))
+                     `((type . "all") (sources ,opds))))
       ;; Native completion needs TAB to expand a unique source before RET.
       (should (equal (emacs-reader-picker-test--read (kbd "S o l o TAB RET")) legado))
       (let ((completion-ignore-case t))
@@ -55,7 +78,16 @@
                                               (setq used-vertico t)))
                                  pre-command-hook)))
     (unwind-protect
-        (progn (vertico-mode 1) (emacs-reader-picker-test--exercise) (should used-vertico))
+        (progn
+          (vertico-mode 1)
+          (emacs-reader-picker-test--exercise)
+          (should used-vertico)
+          (let ((sources '(((name . "Alpha") (type . "json") (url . "1"))
+                           ((name . "Alpine") (type . "opds") (url . "2")))))
+            (cl-letf (((symbol-function 'emacs-reader-local--records) (lambda (_) sources)))
+              (should (equal (emacs-reader-picker-test--read
+                              (kbd "A l <down> <up> <down> C-SPC C-SPC C-SPC RET"))
+                             `((type . "all") (sources ,(cadr sources))))))))
       (unless active (vertico-mode -1)))))
 
 (ert-deftest emacs-reader-picker-no-empty-all ()

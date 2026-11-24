@@ -243,11 +243,50 @@
   (json-parse-string (json-serialize record :false-object :false :null-object :null)
                      :object-type 'plist :array-type 'list :false-object nil :null-object nil))
 
+(defvar emacs-reader-local--marked nil
+  "Sources marked in the active search picker.")
+
+(declare-function vertico--candidate "ext:vertico")
+(declare-function vertico--update "ext:vertico")
+
+(defun emacs-reader-local--picker-toggle ()
+  "Toggle the current source without moving point or changing the query."
+  (interactive)
+  (let* ((input (minibuffer-contents-no-properties))
+         (table minibuffer-completion-table)
+         (vertico (bound-and-true-p vertico--input))
+         (candidate (or (when vertico (vertico--update) (vertico--candidate))
+                        (and (fboundp 'completion--selected-candidate)
+                             (completion--selected-candidate))
+                        (and (string-empty-p input) minibuffer-default)
+                        (and (assoc input table) input)
+                        (let ((matches (all-completions input table)))
+                          (and (null (cdr matches)) (car matches)))))
+         (src (cdr (assoc candidate table))))
+    (unless src (user-error "请先选择一个书源或【全部】"))
+    (let ((sources (if (equal (alist-get 'type src) "all") (alist-get 'sources src) (list src))))
+      (if (cl-every (lambda (item) (memq item emacs-reader-local--marked)) sources)
+          (setq emacs-reader-local--marked (cl-set-difference emacs-reader-local--marked sources))
+        (dolist (item sources) (cl-pushnew item emacs-reader-local--marked))))
+    ;; Vertico redraws affixes after every command.  Native completion needs a refresh.
+    (unless vertico
+      (let* ((window (get-buffer-window "*Completions*"))
+             (pos (and window (window-point window)))
+             (completion-auto-select nil))
+        (minibuffer-completion-help)
+        (when (and pos (window-live-p window)) (set-window-point window pos))))))
+
 (defun emacs-reader-local--picker-map (scope)
   "Install the source picker's keys for SCOPE in this minibuffer."
-  (let ((map (make-sparse-keymap)))
+  (let ((map (make-sparse-keymap))
+        (accept (key-binding (kbd "RET"))))
+    (define-key map (kbd "C-SPC") #'emacs-reader-local--picker-toggle)
+    (define-key map (kbd "C-@") #'emacs-reader-local--picker-toggle)
+    (define-key map (kbd "RET")
+                `(menu-item "" ,(lambda () (interactive) (exit-minibuffer))
+                            :filter ,(lambda (cmd) (if emacs-reader-local--marked cmd accept))))
     (dolist (binding (if scope '(("DEL" . nil) ("<backspace>" . nil))
-                       '(("l" . "legado") ("o" . "opds"))))
+                       '(("l" . "legado") ("o" . "opds") ("s" . "json"))))
       (let ((next (cdr binding)))
         (define-key map (kbd (car binding))
                     `(menu-item "" ,(lambda () (interactive) (throw 'reader-picker-scope next))
@@ -257,7 +296,7 @@
     (use-local-map (make-composed-keymap map (current-local-map)))))
 
 (defun emacs-reader-local--pick-scope (choices scope)
-  "Read from CHOICES within SCOPE, returning a source or the next scope."
+  "Read from CHOICES within SCOPE, decorating marked source names."
   (let* ((visible (if scope
                       (cl-remove-if-not (lambda (pair) (equal (alist-get 'type (cdr pair)) scope))
                                         choices)
@@ -266,17 +305,28 @@
          (table (when visible
                   (cons (list default '(type . "all") (cons 'sources (mapcar #'cdr visible)))
                         visible)))
-         (prompt (if scope (format "选择书源 [%s，DEL 返回]：" scope)
-                   "选择书源 [l Legado，o OPDS]：")))
+         (completion-extra-properties
+          (list :affixation-function
+                (lambda (names)
+                  (cl-loop for name in names for src = (cdr (assoc name table))
+                           collect (list name (cond ((equal name default) "    ")
+                                                    ((memq src emacs-reader-local--marked) "[✓] ")
+                                                    (t "[ ] ")) "")))))
+         (prompt (format "选择书源 [%s，C-SPC 勾选/取消，RET 确认]："
+                         (if scope (format "%s，DEL 返回" scope) "l Legado，o OPDS，s JSON"))))
     (catch 'reader-picker-scope
       (let ((choice (minibuffer-with-setup-hook (lambda () (emacs-reader-local--picker-map scope))
                       (completing-read prompt table nil t nil nil default))))
-        (or (cdr (assoc choice table)) (user-error "当前范围没有可选书源"))))))
+        (cond (emacs-reader-local--marked
+               (list '(type . "all") (cons 'sources (reverse emacs-reader-local--marked))))
+              ((cdr (assoc choice table)))
+              (t (user-error "当前范围没有可选书源")))))))
 
 (defun emacs-reader-local--select (types &optional allow-all)
   "Read an enabled source matching TYPES.
 With ALLOW-ALL, offer all sources in the current scope as the default.
-From empty input, l and o limit the scope to Legado or OPDS.  DEL widens it."
+From empty input, l/o/s narrow to Legado/OPDS/JSON and DEL widens.
+C-SPC toggles a source or scope.  RET confirms the marked sources."
   (let* ((sources (emacs-reader-local--records "sources"))
          (choices (cl-loop for src in sources
                            for definition = (alist-get 'definition src)
@@ -288,7 +338,7 @@ From empty input, l and o limit the scope to Legado or OPDS.  DEL widens it."
     (unless choices (user-error "没有可用的匹配书源；请在书架按 S 管理书源"))
     (if (not allow-all)
         (cdr (assoc (completing-read "选择书源：" choices nil t) choices))
-      (let (selection)
+      (let (emacs-reader-local--marked selection)
         (while (not (consp selection))
           (setq selection (emacs-reader-local--pick-scope choices selection)))
         selection))))
