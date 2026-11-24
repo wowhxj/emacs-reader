@@ -35,6 +35,7 @@
   :group 'applications)
 
 (require 'emacs-reader-local)
+(require 'emacs-reader-search-progress)
 
 (defcustom emacs-reader-server-url nil
   "Base URL of the Reader server, without credentials or query parameters."
@@ -755,13 +756,27 @@ Create the tab if necessary; otherwise reuse it."
   "Search parameters: keyword, source, group, page and source cursor.")
 (defvar-local emacs-reader--search-books nil)
 (defvar-local emacs-reader--search-generation 0)
+(put 'emacs-reader--search-generation 'permanent-local t)
 (defvar-local emacs-reader--search-loading nil)
+(defvar-local emacs-reader--search-timeout nil)
+
 (defvar-local emacs-reader--search-ended nil)
 (defvar-local emacs-reader--preview-p nil)
 (defvar-local emacs-reader--preview-start-pending nil)
 
+(defun emacs-reader--stop-search ()
+  "Invalidate the current search and release its timers."
+  (when emacs-reader--search-timeout
+    (cancel-timer emacs-reader--search-timeout)
+    (setq emacs-reader--search-timeout nil))
+  (setq emacs-reader--search-loading nil)
+  (emacs-reader-search-progress-stop))
+
 (define-derived-mode emacs-reader-search-mode tabulated-list-mode "Reader-Search"
   "Source search results: RET previews, a adds to shelf, m loads more."
+  (add-hook 'kill-buffer-hook #'emacs-reader--stop-search nil t)
+  (add-hook 'change-major-mode-hook #'emacs-reader--stop-search nil t)
+  (add-hook 'quit-window-hook #'emacs-reader--stop-search nil t)
   (setq tabulated-list-format [("书名" 32 t) ("作者" 18 t) ("书源" 24 t)
                               ("最新章节" 0 nil)])
   (setq header-line-format "  搜索结果   RET 试读   a 加入书架   m 更多   g 重试   s 新搜索")
@@ -829,7 +844,7 @@ Create the tab if necessary; otherwise reuse it."
     (with-current-buffer buffer
       (unless (derived-mode-p 'emacs-reader-search-mode)
         (emacs-reader-search-mode))
-      (cl-incf emacs-reader--search-generation)
+      (emacs-reader--stop-search)
       (setq emacs-reader--search-config
             (append (list :key keyword :page 1 :last-index -1) config)
             emacs-reader--search-books nil
@@ -851,10 +866,14 @@ Create the tab if necessary; otherwise reuse it."
    (emacs-reader--search-ended (message "没有更多结果；按 s 开始新搜索"))
    (t
     (let* ((buffer (current-buffer))
-           (generation emacs-reader--search-generation)
+           (generation (cl-incf emacs-reader--search-generation))
            (config emacs-reader--search-config)
            (multi (string-empty-p (plist-get config :source))))
-      (setq emacs-reader--search-loading t mode-line-process " 搜索中…")
+      (emacs-reader--stop-search)
+      (setq emacs-reader--search-loading t
+            emacs-reader--search-timeout
+            (run-at-time 30 nil #'emacs-reader--handle-search-response buffer generation multi nil))
+      (emacs-reader-search-progress-start)
       (condition-case nil
           (if-let* ((source (plist-get config :native)))
               (emacs-reader-legado-search
@@ -876,6 +895,7 @@ Create the tab if necessary; otherwise reuse it."
                (page . ,(plist-get config :page)))
              (lambda (response)
                (emacs-reader--handle-search-response buffer generation multi response))))
+        (quit (emacs-reader--stop-search) (signal 'quit nil))
         (error (emacs-reader--handle-search-response buffer generation multi nil)))))))
 
 (defun emacs-reader--handle-search-response (buffer generation multi response)
@@ -883,8 +903,9 @@ Create the tab if necessary; otherwise reuse it."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
       (when (and (derived-mode-p 'emacs-reader-search-mode)
+                 emacs-reader--search-loading
                  (= generation emacs-reader--search-generation))
-        (setq emacs-reader--search-loading nil mode-line-process nil)
+        (emacs-reader--stop-search)
         (let* ((body (plist-get response :ok))
                (json (and (listp body) body))
                (data (alist-get 'data json))

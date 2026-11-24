@@ -9,6 +9,7 @@
 (require 'button)
 (require 'cl-lib)
 (require 'dom)
+(require 'emacs-reader-search-progress)
 (require 'json)
 (require 'seq)
 
@@ -63,7 +64,7 @@ ROOT marks links on the top-level feed."
                         'feed))))
       (when kind
         (emacs-reader-opds--item
-         :kind kind :pagination (and root page t) :url url :title title :author author
+         :kind kind :pagination (and root page (eq kind 'feed)) :url url :title title :author author
          :extension ext :next (and root (eq kind 'feed) (member "next" rels) t)
          :label (pcase kind
                   ('download (format "%s%s [%s]" title
@@ -132,7 +133,8 @@ For RESULTS keep pagination and acquisitions.  NESTED marks subordinate feeds."
                                                   '("next" "previous" "prev" "first" "last")
                                                   :test #'equal))) collect item)
      (cl-loop for link in (alist-get 'navigation feed)
-              for item = (emacs-reader-opds--json-link link base nil nil t) when item collect item)
+              for item = (emacs-reader-opds--json-link link base nil nil t (not nested))
+              when item collect item)
      (cl-loop for nested in (alist-get 'publications feed)
               append (emacs-reader-opds--json-feed nested base nil t))
      (cl-loop for group in (alist-get 'groups feed)
@@ -146,12 +148,20 @@ For RESULTS keep pagination and acquisitions.  NESTED marks subordinate feeds."
   "Read JSON in the response buffer."
   (json-parse-buffer :object-type 'alist :array-type 'list :null-object nil :false-object nil))
 
+(defun emacs-reader-opds--read-json-feed ()
+  "Read JSON and validate that the document contains OPDS feed fields."
+  (let ((feed (emacs-reader-opds--json)))
+    (unless (cl-some (lambda (key) (assq key feed))
+                     '(links navigation publications groups catalogs))
+      (error "Expected an OPDS JSON feed"))
+    feed))
+
 (defun emacs-reader-opds--parse (base &optional results)
   "Parse an OPDS feed at point given the response URL BASE.
 RESULTS limits feed-level actions on a search results page."
   (skip-chars-forward " \t\r\n")
   (if (eq (char-after) ?{)
-      (emacs-reader-opds--json-feed (emacs-reader-opds--json) base results)
+      (emacs-reader-opds--json-feed (emacs-reader-opds--read-json-feed) base results)
     (let* ((root (emacs-reader-opds--xml))
            (tag (car (last (split-string (symbol-name (dom-tag root)) ":")))))
       (unless (member tag '("feed" "entry")) (error "Expected an OPDS feed, received %s" tag))
@@ -196,10 +206,12 @@ RESULTS limits feed-level actions on a search results page."
 (define-derived-mode emacs-reader-opds-mode special-mode "Book Catalog"
   "Browse book links with TAB and RET.  Go back with `b'."
   (add-hook 'kill-buffer-hook #'emacs-reader-opds--stop nil t)
+  (add-hook 'change-major-mode-hook #'emacs-reader-opds--stop nil t)
   (add-hook 'quit-window-hook #'emacs-reader-opds--stop nil t))
 
 (defun emacs-reader-opds--stop ()
   "Cancel the active search in this catalog buffer."
+  (emacs-reader-search-progress-stop)
   (when emacs-reader-opds--cancel
     (funcall emacs-reader-opds--cancel)
     (setq emacs-reader-opds--cancel nil))
@@ -245,9 +257,9 @@ RESULTS limits feed-level actions on a search results page."
 (defun emacs-reader-opds-back ()
   "Return to the previous catalog page."
   (interactive)
+  (unless (cdr emacs-reader-opds--history) (user-error "At first catalog page"))
   (emacs-reader-opds--stop)
   (cl-incf emacs-reader-opds--generation)
-  (unless (cdr emacs-reader-opds--history) (user-error "At first catalog page"))
   (pop emacs-reader-opds--history)
   (emacs-reader-opds--draw))
 
@@ -446,6 +458,7 @@ A single {field} holds a link.  Embedded fields are URL-encoded.
                         (emacs-reader-opds--http (alist-get 'next data) base))
                    (and (integerp size) (> size 0) (numberp total) (< (* size page) total)
                         (string-search "{page}" template)
+                        (emacs-reader-json--field (alist-get 'rows rule) data)
                         (string-replace "{page}" (number-to-string (1+ page)) template)))))
     (when next
       (setq items
@@ -539,6 +552,7 @@ match whenEquals."
             (lambda (reason)
               (setq finished t)
               (with-current-buffer target
+                (emacs-reader-search-progress-stop)
                 (setq emacs-reader-opds--cancel nil
                       header-line-format (format "已加载 %d 条 · %s" count
                                                  (if reason "已停止" "完成")))
@@ -558,17 +572,15 @@ match whenEquals."
             nil link (lambda (items)
                        (with-current-buffer target
                          (emacs-reader-opds--show emacs-reader-opds--name items))))))
-      (unless finished (setq emacs-reader-opds--cancel cancel)))))
+      (unless finished
+        (setq emacs-reader-opds--cancel cancel)
+        (emacs-reader-search-progress-start)))))
 
 (defun emacs-reader-catalog--search-link (base &optional optional)
   "Return the OPDS search link at BASE, or nil if absent and OPTIONAL."
   (skip-chars-forward " \t\r\n")
   (let ((links (if (eq (char-after) ?{)
-                   (let ((feed (emacs-reader-opds--json)))
-                     (unless (cl-some (lambda (key) (assq key feed))
-                                      '(links navigation publications groups catalogs))
-                       (error "Expected an OPDS JSON feed"))
-                     (alist-get 'links feed))
+                   (alist-get 'links (emacs-reader-opds--read-json-feed))
                  (let ((root (emacs-reader-opds--xml)))
                    (unless (equal (car (last (split-string (symbol-name (dom-tag root)) ":")))
                                   "feed")
@@ -679,6 +691,7 @@ HOME receives the root catalog items for interactive browsing."
                                 (if (cdr root) (follow-link (cdr root))
                                   (finish "目录未声明可用的搜索入口，可按 TAB 和 RET 浏览")))))
                     (t (error "Unsupported catalog type"))))
+          (quit (cancel) (signal 'quit nil))
           (error (finish (error-message-string err)))))
       #'cancel)))
 

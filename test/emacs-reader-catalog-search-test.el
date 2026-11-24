@@ -57,6 +57,14 @@
       (should (eq window (selected-window)))
       (should (eq buffer (window-buffer window))))))
 
+(ert-deftest emacs-reader-catalog-root-navigation-first-is-pagination ()
+  (let ((items (with-temp-buffer
+                 (insert "{\"navigation\":[{\"title\":\"First\",\"rel\":\"first\",\"href\":\"/1\"},"
+                         "{\"title\":\"First\",\"href\":\"/books/first\"}]}")
+                 (goto-char (point-min))
+                 (emacs-reader-opds--parse "https://catalog.test" t))))
+    (should (equal (mapcar #'emacs-reader-opds--item-pagination items) '(t nil)))))
+
 (ert-deftest emacs-reader-catalog-search-errors ()
   (dolist (fixture '("<feed><link rel='next' href='browse'/></feed>"
                      "<feed><link rel='search' href='find?unused={count?}'/></feed>"
@@ -245,7 +253,10 @@ rel='http://opds-spec.org/acquisition'/></entry></feed>")
                   (should (string-search "2 条" header-line-format))))
               (funcall next)
               (should (buffer-live-p response))
-              (emacs-reader-json-catalog-search emacs-reader-catalog-test--json "second")
+              (emacs-reader-json-catalog-search
+               (append '((name . "Another catalog")
+                         (url . "https://other.invalid/?q={query}&page={page}"))
+                       emacs-reader-catalog-test--json) "second")
               (push (current-buffer) books)
               (should-not (buffer-live-p response))
               (emacs-reader-catalog-test--respond (emacs-reader-catalog-test--doc "late" 4) late)
@@ -253,8 +264,79 @@ rel='http://opds-spec.org/acquisition'/></entry></feed>")
                 (should (= 2 (length (cdar emacs-reader-opds--history)))))
               (quit-window)
               (funcall next)
-              (should (= 4 (length calls))))
+              (should (= 4 (length calls)))
+              (emacs-reader-json-catalog-search emacs-reader-catalog-test--json "third")
+              (kill-buffer (current-buffer))
+              (funcall next)
+              (should (= 5 (length calls))))
           (dolist (buffer books) (when (buffer-live-p buffer) (kill-buffer buffer))))))))
+
+(ert-deftest emacs-reader-catalog-pages-follow-json-next-to-completion ()
+  (let ((count 0) (pages 0) next replies)
+    (cl-letf (((symbol-function 'url-retrieve)
+               (lambda (url callback &rest _)
+                 (cl-incf count)
+                 (when (> count 1) (should (string-suffix-p (format "/%d" count) url)))
+                 (emacs-reader-catalog-test--respond
+                  (format "{\"docs\":[{\"title\":\"A\",\"key\":\"/book/%d\"}],\"next\":%s}"
+                          count (if (< count 152) (format "\"/%d\"" (1+ count)) "null")) callback)))
+              ((symbol-function 'run-at-time)
+               (lambda (delay _ fn &rest args)
+                 (when (= delay emacs-reader-catalog--page-delay)
+                   (setq next (lambda () (apply fn args))))
+                 (timer-create))))
+      (emacs-reader-catalog-search-pages emacs-reader-catalog-test--json "A"
+                                         (lambda (rows) (cl-incf pages (length rows)))
+                                         (lambda (reason) (push reason replies)))
+      (while next (funcall (prog1 next (setq next nil))))
+      (should (= 152 pages))
+      (should (equal replies '(nil))))))
+
+(ert-deftest emacs-reader-catalog-single-opds-browse-fallback-and-invalid-feed ()
+  (save-window-excursion
+    (let ((body "<feed><entry><title>Browse</title><link type='application/atom+xml'
+ href='browse'/></entry></feed>") reasons)
+      (cl-letf (((symbol-function 'url-retrieve)
+                 (lambda (_ callback &rest _) (emacs-reader-catalog-test--respond body callback))))
+        (emacs-reader-opds-search "Catalog" emacs-reader-catalog-test--root "x")
+        (unwind-protect
+            (should (equal (mapcar #'emacs-reader-opds--item-label
+                                   (cdar emacs-reader-opds--history)) '("Browse")))
+          (kill-buffer (current-buffer)))
+        (dolist (invalid '("<html/>" "{\"error\":\"offline\"}"))
+          (setq body invalid)
+          (emacs-reader-catalog-results emacs-reader-catalog-test--opds "A"
+                                        (lambda (_ reason) (push reason reasons))))
+        (should (= 2 (length reasons)))
+        (should (cl-every (lambda (reason) (string-search "Expected an OPDS" reason)) reasons))))))
+
+(ert-deftest emacs-reader-catalog-single-retry-after-page-failure ()
+  (save-window-excursion
+    (let ((count 0) next)
+      (cl-letf (((symbol-function 'url-retrieve)
+                 (lambda (_ callback &rest _)
+                   (cl-incf count)
+                   (when (= count 2) (error "Offline"))
+                   (emacs-reader-catalog-test--respond
+                    (emacs-reader-catalog-test--doc (if (= count 4) "B" "A") 2) callback)))
+                ((symbol-function 'run-at-time)
+                 (lambda (delay _ fn &rest args)
+                   (when (= delay emacs-reader-catalog--page-delay)
+                     (setq next (lambda () (apply fn args))))
+                   (timer-create))))
+        (emacs-reader-json-catalog-search emacs-reader-catalog-test--json "x")
+        (unwind-protect
+            (progn
+              (funcall next)
+              (should (equal header-line-format "已加载 1 条 · 已停止"))
+              (should (string-search "Offline" (buffer-string)))
+              (button-activate (previous-button (point-max)))
+              (funcall next)
+              (should (equal header-line-format "已加载 2 条 · 完成"))
+              (should (equal (mapcar #'emacs-reader-opds--item-label
+                                     (cdar emacs-reader-opds--history)) '("A" "B")))
+              (should-not (string-search "Offline" (buffer-string))))
+          (kill-buffer (current-buffer)))))))
 
 (provide 'emacs-reader-catalog-search-test)
 ;;; emacs-reader-catalog-search-test.el ends here

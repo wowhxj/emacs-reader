@@ -7,6 +7,7 @@
 ;;; Code:
 (require 'emacs-reader)
 (require 'emacs-reader-opds)
+(require 'emacs-reader-search-progress)
 
 (declare-function emacs-reader-catalog-search-pages "emacs-reader-opds")
 (declare-function emacs-reader-catalog-open-item "emacs-reader-opds")
@@ -22,6 +23,7 @@
 
 (defun emacs-reader-all--stop ()
   "Invalidate outstanding requests and cancel their timers."
+  (emacs-reader-search-progress-stop)
   (let ((runs emacs-reader-all--running))
     (setq emacs-reader-all--running nil emacs-reader-all--queue nil)
     (dolist (run runs)
@@ -111,16 +113,20 @@
                            (emacs-reader-all--append source items)
                            (emacs-reader-all--render)))))
                    (lambda (err) (funcall done nil err)))))
+      (quit (emacs-reader-all--stop) (signal 'quit nil))
       (error (funcall done nil (error-message-string problem))))))
 
 (defun emacs-reader-all--pump ()
   "Fetch queued pages with up to four active sources."
   (unless emacs-reader-all--pumping
+    (when emacs-reader-all--queue (emacs-reader-search-progress-start))
     (setq emacs-reader-all--pumping t)
     (unwind-protect
         (while (and emacs-reader-all--queue (< (length emacs-reader-all--running) 4))
           (emacs-reader-all--start (pop emacs-reader-all--queue)))
-      (setq emacs-reader-all--pumping nil))
+      (setq emacs-reader-all--pumping nil)
+      (unless (or emacs-reader-all--queue emacs-reader-all--running)
+        (emacs-reader-search-progress-stop)))
     (emacs-reader-all--render)))
 
 (defun emacs-reader-all--batch (predicate)
@@ -170,6 +176,7 @@
   (setq tabulated-list-format [("书名 / 目录" 34 t) ("作者" 16 t) ("书源" 19 t) ("操作 / 状态" 0 nil)])
   (tabulated-list-init-header)
   (add-hook 'kill-buffer-hook #'emacs-reader-all--stop nil t)
+  (add-hook 'quit-window-hook #'emacs-reader-all--stop nil t)
   (add-hook 'change-major-mode-hook #'emacs-reader-all--stop nil t))
 
 (define-key emacs-reader-all-mode-map (kbd "RET") #'emacs-reader-all-open)
