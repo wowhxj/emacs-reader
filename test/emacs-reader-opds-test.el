@@ -138,6 +138,22 @@
     (should (equal (emacs-reader-opds--item-url (car files))
                    "https://archive.org/download/archive-id/A%20B.epub"))))
 
+(ert-deftest emacs-reader-opds-shows-acquisition-status-on-buttons ()
+  (let* ((rule (alist-get 'definition (emacs-reader-local--read emacs-reader-opds-test--source)))
+         (docs '(((title . "无电子版") (key . "/1") (ebook_access . "no_ebook"))
+                 ((title . "可借阅") (key . "/2") (ebook_access . "borrowable") (ia . ("id")))
+                 ((title . "公开版") (key . "/3") (ebook_access . "public") (ia . ("id")))))
+         (items (emacs-reader-json--items rule `((docs . ,docs)) "https://example.org/" nil nil)))
+    (with-temp-buffer
+      (emacs-reader-opds--show
+       "结果" (append items (list (emacs-reader-opds--item :kind 'download :label "book.epub")
+                                (emacs-reader-opds--item :kind 'feed :label "下一页"))))
+      (dolist (label '("【仅书目信息】 无电子版" "【仅书目信息】 可借阅" "【可查版本】 公开版"
+                       "【可下载】 book.epub" "下一页"))
+        (let ((button (next-button (point))))
+          (should (equal label (button-label button)))
+          (goto-char (button-end button)))))))
+
 (ert-deftest emacs-reader-opds-select-and-import-through-http ()
   (let* ((start "https://a.invalid/catalog")
          (book "https://a.invalid/book")

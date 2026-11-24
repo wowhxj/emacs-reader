@@ -189,6 +189,13 @@ RESULTS limits feed-level actions on a search results page."
 (define-derived-mode emacs-reader-opds-mode special-mode "Book Catalog"
   "Browse book links with TAB and RET.  Go back with `b'.")
 
+(defun emacs-reader-opds--availability (item)
+  "Return the local acquisition status of book ITEM, or nil for navigation."
+  (pcase (emacs-reader-opds--item-kind item)
+    ('download "可下载")
+    ('record (when (emacs-reader-opds--item-title item)
+               (if (emacs-reader-opds--item-action item) "可查版本" "仅书目信息")))))
+
 (defun emacs-reader-opds--draw ()
   "Draw the current catalog page."
   (pcase-let ((`(,heading . ,items) (car emacs-reader-opds--history))
@@ -200,7 +207,10 @@ RESULTS limits feed-level actions on a search results page."
       (insert "\n\n"))
     (unless items (insert "No available EPUB, TXT or navigation links.\n"))
     (dolist (item items)
-      (insert-text-button (emacs-reader-opds--item-label item) 'follow-link t
+      (insert-text-button (concat (when-let* ((status (emacs-reader-opds--availability item)))
+                                    (format "【%s】 " status))
+                                  (emacs-reader-opds--item-label item))
+                          'follow-link t
                           'action (lambda (_) (emacs-reader-opds--activate item)))
       (insert "\n"))
     (goto-char (point-min))))
