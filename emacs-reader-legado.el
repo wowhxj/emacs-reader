@@ -350,11 +350,36 @@
                  (string-search "&&" (car (split-string rule "##")))) (string-join values "\n")
           (car values))))))
 
+(defconst emacs-reader-legado--free-title-rule
+  "{$.free}{$.name}@js:result.replace('false', '🔒 ').replace('true', '')")
+
+(defun emacs-reader-legado--search-access (row source url)
+  "Return access metadata supported by the search ROW, SOURCE rules and URL."
+  (let* ((toc (plist-get source :ruleToc))
+         (data (and (eq (car row) 'json) (hash-table-p (cdr row)) (cdr row)))
+         (label
+          (cond
+           ((and (member (plist-get source :bookSourceUrl)
+                         '("http://api.ieasou.com/" "https://api.ieasou.com/"))
+                 (equal (plist-get toc :isVip)
+                        "$.charge@js:result.replace(/0!/, '').replace(/1!/, '🔒')"))
+            (pcase (and data (equal url "https://book.eayue.com/ta/searchMoreBoosAjax.m")
+                        (gethash "isCharge" data))
+              (1 "含收费章节") (0 "免费") (_ "可能含收费章节")))
+           ((equal (plist-get toc :chapterName) emacs-reader-legado--free-title-rule)
+            (pcase (and data (string-match-p
+                              (rx string-start "http" (? "s") "://app2.motie.com/search?") url)
+                        (gethash "free" data))
+              ('t "免费") (:false "含收费章节") (_ "可能含收费章节")))
+           ((and (stringp (plist-get toc :isVip))
+                 (not (string-blank-p (plist-get toc :isVip))))
+            "可能含收费章节"))))
+    (when label (list :accessLabel label))))
+
 (defun emacs-reader-legado--chapter-title (row rules)
   "Read a chapter title from ROW under RULES, including its availability label."
   (if (and (eq (car row) 'json) (hash-table-p (cdr row))
-           (equal (plist-get rules :chapterName)
-                  "{$.free}{$.name}@js:result.replace('false', '🔒 ').replace('true', '')"))
+           (equal (plist-get rules :chapterName) emacs-reader-legado--free-title-rule))
       (when-let* ((title (gethash "name" (cdr row))) ((stringp title)))
         (concat (if (eq t (gethash "free" (cdr row))) "" "🔒 ") title))
     (emacs-reader-legado--field row rules :chapterName)))
@@ -629,10 +654,11 @@ Pass SEARCH to `emacs-reader-legado--fetch' for search substitutions."
                           doc))
                 (name (car (emacs-reader-legado--values detail name-rule)))
                 ((equal name (string-trim query))))
-      (list (list :bookUrl url :name name
-                  :author (ignore-errors (emacs-reader-legado--field detail rules :author))
-                  :origin (plist-get source :bookSourceUrl)
-                  :originName (plist-get source :bookSourceName))))))
+      (list (append (list :bookUrl url :name name
+                          :author (ignore-errors (emacs-reader-legado--field detail rules :author))
+                          :origin (plist-get source :bookSourceUrl)
+                          :originName (plist-get source :bookSourceName))
+                    (emacs-reader-legado--search-access nil source url))))))
 
 (autoload 'emacs-reader-legado-static-html--site "emacs-reader-legado-static-html")
 (autoload 'emacs-reader-legado-static-html-search "emacs-reader-legado-static-html")
@@ -674,10 +700,12 @@ Pass SEARCH to `emacs-reader-legado--fetch' for search substitutions."
                    (lambda (row)
                      (when-let* ((name (emacs-reader-legado--search-field row rules :name))
                                  (link (emacs-reader-legado--field row rules :bookUrl)))
-                       (list :bookUrl (emacs-reader-legado--url link url) :name name
-                             :author (ignore-errors
-                                       (emacs-reader-legado--search-field row rules :author))
-                             :origin origin :originName (plist-get source :bookSourceName)))))
+                       (append
+                        (list :bookUrl (emacs-reader-legado--url link url) :name name
+                              :author (ignore-errors
+                                        (emacs-reader-legado--search-field row rules :author))
+                              :origin origin :originName (plist-get source :bookSourceName))
+                        (emacs-reader-legado--search-access row source url)))))
                   (when (and (= page 1) (not (equal url requested)))
                     (emacs-reader-legado--direct-result source doc url query))))
             (list query page))))))
@@ -732,10 +760,11 @@ Pass SEARCH to `emacs-reader-legado--fetch' for search substitutions."
     (unless (cl-every (lambda (x) (string-match-p (rx string-start (+ digit) string-end)
                                                   (format "%s" x))) (list nid sort))
       (error "宜搜章节缺少有效的编号"))
-    (list :title (if locked (concat "🔒 " name) name) :easouLocked locked
-          :url (format (concat "https://book.easou.com/ta/show.m?gid=%s&nid=%s&st=%s"
-                               "&gst=0&cu=&autoBuy=0&cName=%s")
-                       gid nid sort (url-hexify-string name)))))
+    (append (list :title (if locked (concat "🔒 " name) name) :easouLocked locked
+                  :url (format (concat "https://book.easou.com/ta/show.m?gid=%s&nid=%s&st=%s"
+                                       "&gst=0&cu=&autoBuy=0&cName=%s")
+                               gid nid sort (url-hexify-string name)))
+            (pcase charge ((or 0 "0") '(:access free)) ((or 1 "1") '(:access paid))))))
 
 (defun emacs-reader-legado--book-bindings (doc rules)
   "Collect scalar JSON field assignments declared by book details RULES in DOC."
@@ -763,7 +792,12 @@ Pass SEARCH to `emacs-reader-legado--fetch' for search substitutions."
                                            (cdr row) rule bindings))
                                      (error "章节链接缺少书籍或章节字段"))
                                (emacs-reader-legado--field row rules :chapterUrl))))
-             (list :title name :url (emacs-reader-legado--url link url)))))))))
+             (append (list :title name :url (emacs-reader-legado--url link url))
+                     (when (and (equal (plist-get rules :chapterName)
+                                       emacs-reader-legado--free-title-rule)
+                                (eq (car row) 'json) (hash-table-p (cdr row)))
+                       (pcase (gethash "free" (cdr row))
+                         ('t '(:access free)) (:false '(:access paid))))))))))))
 
 (defun emacs-reader-legado--pages (source target first-doc next-rule read-page callback)
   "Collect lists from READ-PAGE, following NEXT-RULE in SOURCE.

@@ -7,6 +7,29 @@
 (require 'ert)
 (require 'emacs-reader-search-all)
 
+(ert-deftest emacs-reader-search-access-for-same-title ()
+  (let* ((emacs-reader--catalog-access (make-hash-table :test #'equal))
+         (book '((name . "三国演义") (origin . "宜搜") (bookUrl . "one")
+                 (readerType . "legado") (accessLabel . "含收费章节")))
+         (other '((name . "三国演义") (origin . "其他") (bookUrl . "two")))
+         (chapters '(((native . (:access free))) ((native . (:access paid))))))
+    (with-temp-buffer
+      (emacs-reader-search-mode)
+      (setq emacs-reader--search-books (list book other))
+      (emacs-reader--render-search)
+      (should (string-search "含收费章节" (buffer-string)))
+      (emacs-reader--remember-access book chapters)
+      (emacs-reader-filter--set "部分收费")
+      (should (equal (mapcar #'car tabulated-list-entries) (list book)))
+      (should (equal (alist-get 'name book) "三国演义")))
+    (with-temp-buffer
+      (emacs-reader-all-mode)
+      (setq emacs-reader-all--seen (make-hash-table :test #'equal))
+      (emacs-reader-all--append '((type . "legado") (name . "宜搜") (url . "宜搜"))
+                                '((:name "三国演义" :origin "宜搜" :bookUrl "one")))
+      (emacs-reader-all--render)
+      (should (string-search "[部分收费] 三国演义" (buffer-string))))))
+
 (ert-deftest emacs-reader-search-filter-single-source-page ()
   (with-temp-buffer
     (emacs-reader-search-mode)

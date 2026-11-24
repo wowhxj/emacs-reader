@@ -41,6 +41,10 @@
                                             (alist-get 'name (emacs-reader-search-task-source task))
                                             reason))))
         (pending (+ (length emacs-reader-all--queue) (length emacs-reader-all--running))))
+    (dolist (row emacs-reader-all--rows)
+      (let ((id (car row)))
+        (when (equal (alist-get 'type (car id)) "legado")
+          (aset (cadr row) 0 (emacs-reader--result-title (cdr id))))))
     (setq tabulated-list-entries (emacs-reader-filter-rows (append emacs-reader-all--rows errors))
           header-line-format
           (format (concat "%s  %s · %d 个书源 · %d 条结果 · 待返回 %d · 失败 %d"

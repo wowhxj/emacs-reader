@@ -35,6 +35,7 @@
   :group 'applications)
 
 (require 'emacs-reader-filter)
+(require 'emacs-reader-access)
 (require 'emacs-reader-local)
 (require 'emacs-reader-wendian-recovery)
 (require 'emacs-reader-search-progress)
@@ -781,7 +782,7 @@ Create the tab if necessary; otherwise reuse it."
   (setq tabulated-list-entries
         (emacs-reader-filter-rows
          (mapcar (lambda (book)
-                   (list book (vector (emacs-reader--book-field book 'name)
+                   (list book (vector (emacs-reader--result-title book)
                                       (emacs-reader--book-field book 'author)
                                       (emacs-reader--book-source book)
                                       (emacs-reader--book-field book 'latestChapterTitle))))
@@ -1573,6 +1574,7 @@ Resume speech if SPEECH-GENERATION is still active.  With AT-END, show the end."
                                                  (stringp (alist-get 'title chapter)))))
                        (progn
                          (setq emacs-reader--chapters (vconcat chapters))
+                          (emacs-reader--remember-access emacs-reader--current-book chapters)
                          (emacs-reader--update-reading-header)
                          (when emacs-reader--preview-start-pending
                            (setq emacs-reader--preview-start-pending nil)
