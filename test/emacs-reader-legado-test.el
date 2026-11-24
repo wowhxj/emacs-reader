@@ -10,6 +10,32 @@
 (require 'ert)
 (require 'emacs-reader-legado)
 
+(ert-deftest emacs-reader-legado-easou-catalog-links ()
+  (let* ((rule (concat "@js:'https://book.easou.com/ta/show.m?esid=fixture"
+                       "&gid=@get:{gid}&nid={{$.nid}}&st={{$.sort}}"
+                       "&gst=0&cu=&cName={{$.chapterName}}"
+                       "&autoBuy=1'+',{\"webView\":true}'"))
+         (src (list :bookSourceUrl "http://api.ieasou.com/" :ruleToc
+                    (list :chapterList "$..chapters[*]" :chapterName "$.chapterName"
+                          :chapterUrl rule)))
+         (url "https://book.eayue.com/ta/listAjax.m?nid=123&gid=id-01")
+         (doc (emacs-reader-legado--parse
+               (concat "{\"chapters\":[{\"chapterName\":\"A&B\",\"nid\":1,\"sort\":1,\"charge\":0},"
+                       "{\"chapterName\":\"续\",\"nid\":1,\"sort\":2,\"charge\":1}]}")))
+         (chapters (emacs-reader-legado--catalog src doc url))
+         (link (plist-get (car chapters) :url)))
+    (should (= 2 (length chapters)))
+    (should (string-search "gid=id-01&nid=1&st=1" link))
+    (should (string-search "autoBuy=0&cName=A%26B" link))
+    (should-not (string-search "esid" link))
+    (should-not (emacs-reader-legado--easou-gid src url (concat rule ";unexpected()")))
+    (cl-letf (((symbol-function 'emacs-reader-legado--fetch)
+               (lambda (&rest _) (ert-fail "收费章节不应触发请求"))))
+      (emacs-reader-legado-content
+       src (cadr chapters) (lambda (text err)
+                             (should-not text)
+                             (should (string-search "免费" err)))))))
+
 (ert-deftest emacs-reader-legado-boolean-chapter-filter ()
   (let ((doc (emacs-reader-legado--parse
               (concat "{\"rows\":[{\"id\":0,\"v\":true},{\"id\":1,\"v\":false},"

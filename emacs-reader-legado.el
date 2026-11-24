@@ -698,15 +698,45 @@ Pass SEARCH to `emacs-reader-legado--fetch' for search substitutions."
    (lambda (doc url _requested)
      (emacs-reader-legado--info doc url book (plist-get source :ruleBookInfo)))))
 
+(defun emacs-reader-legado--easou-gid (source url rule)
+  "Return the book ID for a recognized Easou SOURCE, chapter RULE and catalog URL."
+  (when (and (member (plist-get source :bookSourceUrl)
+                     '("http://api.ieasou.com/" "https://api.ieasou.com/"))
+             (stringp rule)
+             (string-match-p
+              (rx string-start "@js:'https://book.easou.com/ta/show.m?esid=" (+ (any alnum "_-"))
+                  "&gid=@get:{gid}&nid={{$.nid}}&st={{$.sort}}&gst=0&cu=&cName={{$.chapterName}}"
+                  "&autoBuy=1'+',{\"webView\":true}'" string-end) rule)
+             (string-prefix-p "https://book.eayue.com/ta/listAjax.m?" url))
+    (let* ((params (url-parse-query-string (substring url (1+ (string-search "?" url)))))
+           (gid (cadr (assoc "gid" params))))
+      (unless (and gid (string-match-p (rx string-start (+ (any alnum "_-")) string-end) gid))
+        (error "宜搜目录缺少有效的书籍编号"))
+      gid)))
+
+(defun emacs-reader-legado--easou-chapter (row name gid)
+  "Map one Easou catalog ROW for GID to a chapter named NAME."
+  (let* ((data (cdr row)) (nid (gethash "nid" data)) (sort (gethash "sort" data))
+         (charge (gethash "charge" data)) (locked (not (member charge '(0 "0")))))
+    (unless (cl-every (lambda (x) (string-match-p (rx string-start (+ digit) string-end)
+                                                  (format "%s" x))) (list nid sort))
+      (error "宜搜章节缺少有效的编号"))
+    (list :title (if locked (concat "🔒 " name) name) :easouLocked locked
+          :url (format (concat "https://book.easou.com/ta/show.m?gid=%s&nid=%s&st=%s"
+                               "&gst=0&cu=&autoBuy=0&cName=%s")
+                       gid nid sort (url-hexify-string name)))))
+
 (defun emacs-reader-legado--catalog (source doc url)
   "Read the catalog from DOC at URL according to SOURCE."
-  (let ((rules (plist-get source :ruleToc)))
+  (let* ((rules (plist-get source :ruleToc))
+         (gid (emacs-reader-legado--easou-gid source url (plist-get rules :chapterUrl))))
     (emacs-reader-legado--rows
      doc rules :chapterList
      (lambda (row)
-       (when-let* ((name (emacs-reader-legado--chapter-title row rules))
-                   (link (emacs-reader-legado--field row rules :chapterUrl)))
-         (list :title name :url (emacs-reader-legado--url link url)))))))
+       (when-let* ((name (emacs-reader-legado--chapter-title row rules)))
+         (if gid (emacs-reader-legado--easou-chapter row name gid)
+           (when-let* ((link (emacs-reader-legado--field row rules :chapterUrl)))
+             (list :title name :url (emacs-reader-legado--url link url)))))))))
 
 (defun emacs-reader-legado--pages (source target first-doc next-rule read-page callback)
   "Collect lists from READ-PAGE, following NEXT-RULE in SOURCE.
@@ -763,9 +793,11 @@ Start at TARGET with optional FIRST-DOC and call CALLBACK with the complete list
 
 (defun emacs-reader-legado-content (source chapter callback)
   "Read CHAPTER from SOURCE; call CALLBACK with its text/error."
-  (if (emacs-reader-legado--wendian-p source)
-      (emacs-reader-wendian-content source chapter callback)
-    (emacs-reader-legado--content-rules source chapter callback)))
+  (cond ((plist-get chapter :easouLocked)
+         (funcall callback nil "宜搜未将此章标为免费，未发起购买请求"))
+        ((emacs-reader-legado--wendian-p source)
+         (emacs-reader-wendian-content source chapter callback))
+        (t (emacs-reader-legado--content-rules source chapter callback))))
 
 (defun emacs-reader-legado--clean-content (text)
   "Normalize web page line endings and paragraph margins in TEXT."
