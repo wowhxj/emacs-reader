@@ -1,31 +1,26 @@
 # emacs-reader
 
-[hectorqin/reader](https://github.com/hectorqin/reader) 的轻量 Emacs 客户端：最近阅读优先的卡片书架、中文段落排版、居中阅读与章节切换。
+Emacs 原生阅读客户端。书架、已导入的文件和章节进度保存在本机。启动和阅读本地书籍无需 NAS、Reader3 账号或 API 服务。在线书源由 Emacs 直接访问。
 
-目前支持 Reader3（`/reader3/`）文本与 EPUB 章节阅读（EPUB 需 Emacs 带 libxml 支持），**尚未实现进度同步和 EmuReader 集成**。已在 Emacs 32.0.50 验证。
-
-## 安装与配置
-
-Emacs 30+ 可用内置 `use-package` 的 `:vc` 从 GitHub 安装：
+## 从本分支加载
 
 ```elisp
-(use-package emacs-reader
-  :vc (:url "https://github.com/wowhxj/emacs-reader"
-       :rev :newest)
-  :commands (emacs-reader-login emacs-reader-shelf emacs-reader-search)
-  :bind ("C-c r" . emacs-reader-shelf)
-  :custom
-  (emacs-reader-server-url "https://reader.example.com")
-  (emacs-reader-username "your-username")
-  (emacs-reader-text-width 80) ; 约 40 个汉字
-  :config
-  ;; 推荐加密保存密码，不要将密码写进配置。
-  (add-to-list 'auth-sources "~/.authinfo.gpg"))
+(add-to-list 'load-path "~/sandbox/emacs-reader") ; 改为本地检出目录
+(require 'emacs-reader)
+(global-set-key (kbd "C-c r") #'emacs-reader-shelf)
 ```
 
-首次运行 `M-x emacs-reader-login`，输入服务器地址、用户名和密码；登录成功后可确认保存密码。地址和用户名通过 Customize 保存，密码由 `auth-source` 管理；以后打开书架会自动登录，会话过期会尝试重新登录。GPG 解密可能需要口令。
+运行 `M-x emacs-reader-shelf`，按 `i` 导入 TXT 或 EPUB，按 `RET` 阅读。EPUB 需要 Python 3 和带 libxml 的 Emacs。默认数据目录是 `user-emacs-directory` 下的 `emacs-reader/`，可通过 `emacs-reader-directory` 更改。备份或迁移时复制整个目录即可。本地书架与旧 NAS 书架分别保存；要访问旧书架，请将 `emacs-reader-backend` 设为 `reader3`，使用原有服务器配置运行 `M-x emacs-reader-login`。
 
-服务器地址和用户名也可以不预先配置，登录时会提示输入。默认允许 HTTP，但会明文传输凭据；设置 `emacs-reader-allow-insecure-http` 为 `nil` 可禁止。
+## 添加书源
+
+| 来源 | 添加与阅读 |
+|---|---|
+| Legado | `M-x emacs-reader-import-legado` 导入 JSON 文件，支持单个书源或书源数组。用 `C-u M-x emacs-reader-import-legado` 输入订阅 URL。相同书源地址再次导入会更新规则。书架按 `s` 输入关键词并选择书源，结果按 `RET` 试读、按 `a` 加入本地书架。 |
+| OPDS | `M-x emacs-reader-add-opds` 保存目录名称和 URL。书架按 `o` 打开目录，支持 OPDS 1.x Atom 和 2.0 JSON。用 `TAB` 选择分类、搜索、下一页或下载链接，`RET` 打开，`b` 返回。直接获取的 EPUB、TXT 下载到本地书架。 |
+| Open Library | 书架按 `s` 选择内置的 Open Library，也可运行 `M-x emacs-reader-openlibrary-search`。在结果中选择公开版本和 EPUB / TXT 文件。需要借阅、登录或 DRM 的版本不提供本地下载。 |
+
+Legado 支持声明式 HTML/CSS 选择器、原生 tag/class/id 规则、基础 JSONPath、GET/POST、静态请求头，以及目录和正文分页。导入时标记为 `enabled: false` 的书源不会出现在搜索列表中。依赖 JavaScript、WebView、XPath 或复杂脚本的书源需要额外引擎。在线搜索与抓取 Legado 章节需要联网；已导入的 EPUB、TXT 可断网阅读。
 
 ## 使用
 
@@ -37,10 +32,10 @@ Emacs 30+ 可用内置 `use-package` 的 `:vc` 从 GitHub 安装：
 |---|---|---|
 | 书架 | `n` / `p` | 下一本 / 上一本 |
 | 书架 | `g` | 刷新 |
-| 书架 | `s` | 在服务器配置的书源中搜索 |
+| 书架 | `s` | 搜索 Legado 书源或 Open Library |
 | 搜索 | `n` / `p` | 下一条 / 上一条结果 |
 | 搜索 | `RET` | 试读，不加入书架 |
-| 搜索 | `a` | 确认后加入服务器书架 |
+| 搜索 | `a` | 确认后加入书架 |
 | 搜索 | `m` / `g` | 搜索下一批；失败时重试当前批 |
 | 搜索 | `s` | 输入新关键词并选择搜索范围 |
 | 阅读 | `a` | 将当前试读书籍加入书架 |
@@ -58,7 +53,9 @@ Emacs 30+ 可用内置 `use-package` 的 `:vc` 从 GitHub 安装：
 
 ### 朗读配置
 
-Emacs 直接向配置的 OpenAI 兼容 TTS 端点发送段落，不再使用 Reader 的 HttpTTS 配置或登录凭据。`emacs-reader-tts-url` 默认不设置，不会自动发送正文。以下配置二选一：
+默认 `emacs-reader-tts-url` 为 `nil`，按 `r` 调用 macOS 的 `say` 或本机安装的 `espeak-ng` / `espeak`。可用 `emacs-reader-tts-native-voice` 指定本机已安装的音色，例如 macOS 的 `Tingting`。
+
+如已配置 OpenAI 兼容 TTS 端点，`r` 会继续使用该端点。以下为两种配置示例。
 
 **本地 mac-tts**（按其 README 启动服务）：
 
@@ -80,7 +77,7 @@ Emacs 直接向配置的 OpenAI 兼容 TTS 端点发送段落，不再使用 Rea
 
 `emacs-reader-tts-rate` 调节语速，默认 `1.0`。如服务需要 Bearer token，设置 `emacs-reader-tts-api-key-env` 为 Emacs 进程可读的环境变量名（不是密钥本身）；仅 HTTPS 或本机回环 HTTP 可以发送 token。在线合成会把正文发送给该服务，上面的 HTTP 地址不加密；敏感内容请使用本地服务。
 
-播放需本机有 `afplay`（macOS 自带）、`mpv` 或 `ffplay`。`r` 从光标所在段落开始朗读，播放时高亮并预取下一段。本章读完后自动加载下一章，从首段继续，直到全书读完；下一章加载失败时会停止。等待自动翻章时也可按 `r` 停止朗读；手动切章或关闭缓冲区会停止并清理预取。朗读不同步服务器进度。
+端点返回的音频需本机有 `afplay`（macOS 自带）、`mpv` 或 `ffplay`。`r` 从光标所在段落开始朗读，播放时高亮并预取下一段。本章读完后自动加载下一章，从首段继续，直到全书读完；下一章加载失败时会停止。等待自动翻章时也可按 `r` 停止朗读；手动切章或关闭缓冲区会停止并清理预取。朗读不同步服务器进度。
 
 WSL2 + WSLg 可安装 Linux 侧 `mpv` 播放。没有 Linux 音频输出时，可在 Windows 安装 `mpv` 或 `ffplay` 并加入 PATH，WSL 中确认 `command -v mpv.exe` 或 `command -v ffplay.exe` 能找到；客户端会用 `wslpath` 转换音频路径。若需要强制使用 Windows 播放器：
 
@@ -88,33 +85,12 @@ WSL2 + WSLg 可安装 Linux 侧 `mpv` 播放。没有 Linux 音频输出时，�
 (setq emacs-reader-tts-player-command '("mpv.exe" "--no-video" "--really-quiet"))
 ```
 
-## 书源搜索与试读
-
-`M-x emacs-reader-search`（或在书架按 `s`）输入书名/作者后，从服务器读取已配置的书源，选择单源、全部书源或一个书源分组。这里调用书源搜索，不是过滤现有书架。服务器需已配置可用书源；搜索成败取决于书源站点和规则。
-
-搜索结果显示书名、作者、书源、最新章节。`RET` 先带书源信息初始化目录，再打开首章；可使用现有目录、翻章及朗读功能。试读不发送 `saveBook` 或进度保存请求；服务器仍会处理搜索及章节缓存。`a` 经确认后才写入服务器书架，已打开的书架会刷新。
-
-搜索使用部署版 Web 已有的 `searchBook` / `searchBookMulti` JSON 接口，默认多源并发数为 4；`m` 继续下一批，失败时 `g` 重试而不丢失已有结果。多源搜索中一批无结果但源游标仍前进时，可以继续搜索。与 Web 的展示区别：此版本按书源分别列出同一本书，便于直接选择试读来源，不折叠为一个“来源数量”条目；不使用 SSE 流式展示，等待当前批返回后显示。
-
-## Android 本地 EPUB 如何跨端阅读
-
-**Android 能打开某个本地文件，不代表 Reader 服务器已拥有它。** 仅凭文件名或 Android 书架记录无法确认上传状态；同步书架、备份或进度也不能代替上传 EPUB 文件。尤其 Android 的本地路径不能由远端服务器或另一台电脑直接读取。
-
-建议按以下顺序操作：
-
-1. 从 Android 的原文件位置、文件管理器或客户端支持的导出方式，取得原始 EPUB（不是只导出书架 JSON）。Android 客户端的具体导出入口未在本项目验证。
-2. 登录 Reader **Web 端同一个账号**，查看书架是否已有该书，并尝试打开目录和正文。能打开才说明 Web 端实际可读；仅有书架条目并不足以证明文件可用。
-3. 如果 Web 没有该书，或条目指向手机本地文件，在 Web 设置中使用本地书籍导入入口选择原始 EPUB。部署版 Web 的实际流程是 `importBookPreview` 上传文件、显示“导入本地书籍”预览，再通过 `saveBook` 确认导入；不要停在预览对话框就认为已加入书架。
-4. 确认 Web 可以阅读后，在 Emacs 运行 `emacs-reader-shelf`（已有书架按 `g`），选择该书按 `RET`。客户端通过服务器的 `getChapterList` / `getBookContent` 读取，EPUB 章节资源由现有 HTML 渲染路径显示，要求 Emacs 带 libxml；无需另在 Emacs 下载/导入同一文件。
-
-若 Web 端有条目却读不了，先确认文件上传完成、账号一致、服务器文件仍在以及目录解析成功；不要直接修改书架里的手机路径或反复加书。本客户端本次未增加 EPUB 上传功能，也未实现跨端进度同步；重新导入的书籍不保证与 Android 原记录共享标识或阅读位置。服务器上的文件及其持久化存储需要另行备份。
-
 ## 开发验证
 
 ```sh
-emacs -Q --batch -L . -l test/emacs-reader-test.el -f ert-run-tests-batch-and-exit
+emacs -Q --batch -L . --eval '(setq load-prefer-newer t)' \
+  --eval '(mapc (lambda (f) (load f nil t)) (directory-files "test" t "-test\\.el$"))' \
+  -f ert-run-tests-batch-and-exit
 ```
-
-测试使用合成书籍数据和本机 HTTP fixture，不向真实服务器添加或修改书籍。搜索契约依据部署版 Web `v3.2.14-05250935` 的公开前端源码核对；尚未进行真实账号的搜索/试读/入架端到端验收。
 
 `M-x customize-group RET emacs-reader` 可调整阅读宽度、书架字体和颜色。

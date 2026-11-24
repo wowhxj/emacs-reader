@@ -1362,7 +1362,7 @@
     (should (equal (plist-get (cdr (assoc "多源分组：小说" choices)) :group) "小说"))))
 
 (ert-deftest emacs-reader-search-loads-server-sources-not-shelf ()
-  (let (started)
+  (let ((emacs-reader-backend 'reader3) started)
     (cl-letf (((symbol-function 'emacs-reader--reader3-request)
                (lambda (name method data callback &rest _)
                  (should (equal name "getBookSources"))

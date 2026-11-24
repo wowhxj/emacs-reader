@@ -1,4 +1,4 @@
-;;; emacs-reader.el --- Read books from a Reader server -*- lexical-binding: t; -*-
+;;; emacs-reader.el --- Local bookshelf and native reader -*- lexical-binding: t; -*-
 
 ;; Copyright (C) 2026
 ;; Version: 0.1.0
@@ -8,10 +8,7 @@
 
 ;;; Commentary:
 
-;; A personal client for hectorqin/reader.  The current implementation
-;; provides Reader3 login (remembered via Customize and auth-source), a
-;; recent-first shelf, and read-only text-chapter navigation.  Progress
-;; synchronization remains intentionally unimplemented.
+;; Local file, Legado and OPDS reading with optional Reader3 access.
 
 ;;; Code:
 
@@ -33,8 +30,10 @@
 (defvar shr-fill-text) ; Available in Emacs 30 and later.
 
 (defgroup emacs-reader nil
-  "Read books from a Reader server."
+  "Browse book sources, manage a shelf and read books in Emacs."
   :group 'applications)
+
+(require 'emacs-reader-local)
 
 (defcustom emacs-reader-server-url nil
   "Base URL of the Reader server, without credentials or query parameters."
@@ -70,8 +69,9 @@ A CJK character occupies two columns."
 
 (defcustom emacs-reader-tts-url nil
   "Full HTTP(S) URL of an OpenAI-compatible speech endpoint, or nil.
-Paragraph text is sent directly to this endpoint, not to the Reader API."
-  :type '(choice (const :tag "Not configured" nil) string) :group 'emacs-reader)
+With a URL, send paragraph text directly to the endpoint.
+With nil or an empty string, use macOS say, espeak-ng, or espeak."
+  :type '(choice (const :tag "Use native speech" nil) string) :group 'emacs-reader)
 
 (defcustom emacs-reader-tts-model "tts-1"
   "Speech model ID accepted by the TTS service."
@@ -80,6 +80,12 @@ Paragraph text is sent directly to this endpoint, not to the Reader API."
 (defcustom emacs-reader-tts-voice "zf_001"
   "Voice ID accepted by the TTS service."
   :type 'string :group 'emacs-reader)
+
+(defcustom emacs-reader-tts-native-voice nil
+  "Voice for local speech, or nil to use the speech program's default.
+For Mandarin, try Tingting with macOS say, or zh with espeak."
+  :type '(choice (const :tag "System default" nil) string)
+  :group 'emacs-reader)
 
 (defcustom emacs-reader-tts-format 'wav
   "Audio format requested from the TTS service."
@@ -106,6 +112,8 @@ For WSL without Linux audio, use e.g. (\"mpv.exe\" \"--no-video\")."
 (defvar-local emacs-reader--tts-active nil)
 (defvar-local emacs-reader--tts-generation 0)
 (defvar-local emacs-reader--tts-process nil)
+(defvar-local emacs-reader--tts-native-command nil
+  "Native speech command for the current session, or nil for endpoint audio.")
 (defvar-local emacs-reader--tts-file nil)
 (defvar-local emacs-reader--tts-overlay nil)
 (defvar-local emacs-reader--tts-request-buffer nil)
@@ -622,10 +630,8 @@ Create the tab if necessary; otherwise reuse it."
 (define-derived-mode emacs-reader-shelf-mode special-mode "Reader-Shelf"
   "Major mode for the Reader bookshelf."
   (setq-local truncate-lines t)
-  (setq-local line-spacing 0.2)
-  (setq header-line-format
-        (propertize "  Bookshelf   RET open   s search   g refresh   n/p move"
-                    'face 'emacs-reader-shelf-meta)))
+  (setq-local line-spacing 0.2))
+
 
 (define-key emacs-reader-shelf-mode-map (kbd "q") #'emacs-reader-quit)
 
@@ -662,8 +668,9 @@ Create the tab if necessary; otherwise reuse it."
   (interactive "p")
   (emacs-reader-shelf-next (- (or n 1))))
 
+;;;###autoload
 (defun emacs-reader-shelf ()
-  "Fetch and display the Reader3 bookshelf, newest reading activity first."
+  "Display the selected bookshelf, newest reading activity first."
   (interactive)
   (let ((buffer (get-buffer-create "*Reader Shelf*")))
     (with-current-buffer buffer
@@ -678,11 +685,20 @@ Create the tab if necessary; otherwise reuse it."
   (unless (derived-mode-p 'emacs-reader-shelf-mode)
     (user-error "Not in a Reader shelf buffer"))
   (let ((buffer (current-buffer)))
-    (setq mode-line-process " Loading...")
-    (emacs-reader--reader3-request
-     "getBookshelf" "GET" nil
-     (lambda (response)
-       (emacs-reader--handle-bookshelf-response buffer response)))))
+    (setq header-line-format
+          (propertize (if (eq emacs-reader-backend 'local)
+                          "  本地书架   RET 阅读   i 导入书籍   s 搜索   o 浏览目录   g 刷新"
+                        "  Bookshelf   RET open   s search   g refresh   n/p move")
+                      'face 'emacs-reader-shelf-meta)
+          mode-line-process " Loading...")
+    (if (eq emacs-reader-backend 'local)
+        (emacs-reader--handle-bookshelf-response
+         buffer `(:ok ((isSuccess . t) (data . ,(emacs-reader-local--records "shelf")))))
+      (emacs-reader--reader3-request
+       "getBookshelf" "GET" nil
+       (lambda (response)
+         (when (eq emacs-reader-backend 'reader3)
+           (emacs-reader--handle-bookshelf-response buffer response)))))))
 
 (defun emacs-reader--handle-bookshelf-response (buffer response)
   "Render RESPONSE in BUFFER, or report a generic failure."
@@ -735,6 +751,8 @@ Create the tab if necessary; otherwise reuse it."
   (tabulated-list-init-header)
   (hl-line-mode 1))
 
+(define-key emacs-reader-shelf-mode-map (kbd "i") #'emacs-reader-import-file)
+(define-key emacs-reader-shelf-mode-map (kbd "o") #'emacs-reader-browse-catalog)
 (define-key emacs-reader-shelf-mode-map (kbd "s") #'emacs-reader-search)
 (define-key emacs-reader-search-mode-map (kbd "s") #'emacs-reader-search)
 (define-key emacs-reader-search-mode-map (kbd "q") #'emacs-reader-quit)
@@ -763,10 +781,16 @@ Create the tab if necessary; otherwise reuse it."
 
 ;;;###autoload
 (defun emacs-reader-search (keyword)
-  "Search configured server sources for KEYWORD, not the bookshelf."
+  "Search a configured book source for KEYWORD."
   (interactive (list (read-string "搜索书名或作者：")))
   (setq keyword (string-trim keyword))
   (when (string-empty-p keyword) (user-error "请输入搜索关键词"))
+  (if (eq emacs-reader-backend 'local)
+      (emacs-reader-local--search keyword)
+    (emacs-reader--search-reader3 keyword)))
+
+(defun emacs-reader--search-reader3 (keyword)
+  "Select Reader3 search scope for KEYWORD."
   (message "正在读取服务器书源…")
   (emacs-reader--reader3-request
    "getBookSources" "GET" nil
@@ -815,16 +839,26 @@ Create the tab if necessary; otherwise reuse it."
            (multi (string-empty-p (plist-get config :source))))
       (setq emacs-reader--search-loading t mode-line-process " 搜索中…")
       (condition-case nil
-          (emacs-reader--reader3-request
-           (if multi "searchBookMulti" "searchBook") "POST"
-           `((key . ,(plist-get config :key))
-             (bookSourceUrl . ,(plist-get config :source))
-             (bookSourceGroup . ,(plist-get config :group))
-             (concurrentCount . 4)
-             (lastIndex . ,(plist-get config :last-index))
-             (page . ,(plist-get config :page)))
-           (lambda (response)
-             (emacs-reader--handle-search-response buffer generation multi response)))
+          (if-let* ((source (plist-get config :native)))
+              (emacs-reader-legado-search
+               source (plist-get config :key)
+               (lambda (books err)
+                 (emacs-reader--handle-search-response
+                  buffer generation nil
+                  (unless err `(:ok ((isSuccess . t)
+                                     (data . ,(mapcar #'emacs-reader-local--book books))))))
+                 (when err (message "Legado 搜索失败：%s" err)))
+               (plist-get config :page))
+            (emacs-reader--reader3-request
+             (if multi "searchBookMulti" "searchBook") "POST"
+             `((key . ,(plist-get config :key))
+               (bookSourceUrl . ,(plist-get config :source))
+               (bookSourceGroup . ,(plist-get config :group))
+               (concurrentCount . 4)
+               (lastIndex . ,(plist-get config :last-index))
+               (page . ,(plist-get config :page)))
+             (lambda (response)
+               (emacs-reader--handle-search-response buffer generation multi response))))
         (error (emacs-reader--handle-search-response buffer generation multi nil)))))))
 
 (defun emacs-reader--handle-search-response (buffer generation multi response)
@@ -891,7 +925,7 @@ Create the tab if necessary; otherwise reuse it."
   (emacs-reader-open-book (emacs-reader--selected-search-book) t))
 
 (defun emacs-reader-add-to-shelf ()
-  "Add the selected search result or current preview to the server shelf."
+  "Add the selected search result or current preview to its bookshelf."
   (interactive)
   (let ((book (if (derived-mode-p 'emacs-reader-reading-mode)
                   emacs-reader--current-book
@@ -900,24 +934,32 @@ Create the tab if necessary; otherwise reuse it."
                  (not (string-empty-p (emacs-reader--book-field book 'bookUrl)))
                  (not (string-empty-p (emacs-reader--book-field book 'origin))))
       (user-error "书籍缺少链接或书源信息"))
-    (when (yes-or-no-p (format "将《%s》加入服务器书架？ "
-                              (emacs-reader--book-field book 'name)))
-      (emacs-reader--reader3-request
-       "saveBook" "POST" book
-       (lambda (response)
-         (if (and (listp (plist-get response :ok))
-                  (eq (alist-get 'isSuccess (plist-get response :ok)) t))
-             (progn
-               (message "已加入书架；书架按 g 刷新")
-               (let ((shelf (get-buffer "*Reader Shelf*")))
-                 (when (buffer-live-p shelf)
-                   (with-current-buffer shelf (emacs-reader-shelf-refresh)))))
-           (message "加入书架失败；可重试，未确认保存成功")))))))
+    (when (yes-or-no-p (format "将《%s》加入书架？ "
+                               (emacs-reader--book-field book 'name)))
+      (if (alist-get 'readerType book)
+          (progn
+            (emacs-reader-local--add book)
+            (when (derived-mode-p 'emacs-reader-reading-mode)
+              (setq emacs-reader--preview-p nil)
+              (when (integerp emacs-reader--current-chapter-index)
+                (emacs-reader--save-local-progress emacs-reader--current-chapter-index)))
+            (message "已加入本地书架"))
+        (emacs-reader--reader3-request
+         "saveBook" "POST" book
+         (lambda (response)
+           (if (and (listp (plist-get response :ok))
+                    (eq (alist-get 'isSuccess (plist-get response :ok)) t))
+               (progn
+                 (message "已加入书架；书架按 g 刷新")
+                 (let ((shelf (get-buffer "*Reader Shelf*")))
+                   (when (buffer-live-p shelf)
+                     (with-current-buffer shelf (emacs-reader-shelf-refresh)))))
+             (message "加入书架失败；可重试，未确认保存成功"))))))))
 
 (defun emacs-reader-open-book (book &optional preview)
   "Open BOOK in a native text-reading buffer.
 With PREVIEW, fetch the catalog with source information before reading.
-This command does not add books to the shelf or write reading progress."
+Local shelf books resume and save their current chapter."
   (interactive (list (emacs-reader--selected-shelf-book)))
   (let ((book-url (alist-get 'bookUrl book))
         (name (emacs-reader--book-field book 'name)))
@@ -933,13 +975,13 @@ This command does not add books to the shelf or write reading progress."
         (emacs-reader-reading-mode)
         (setq-local emacs-reader--current-book book
                     emacs-reader--preview-p preview
-                    emacs-reader--preview-start-pending preview))
+                    emacs-reader--preview-start-pending (or preview (alist-get 'readerType book))))
       (emacs-reader--display-buffer buffer)
-      (unless preview (emacs-reader--load-chapter chapter))
+      (unless (or preview (alist-get 'readerType book)) (emacs-reader--load-chapter chapter))
       (emacs-reader--load-catalog))))
 
 (define-derived-mode emacs-reader-reading-mode special-mode "Reader"
-  "Major mode for reading text chapters from a Reader server."
+  "Major mode for reading book chapters."
   (setq-local truncate-lines nil)
   (setq-local word-wrap t)
   ;; Break between any CJK characters, honoring kinsoku punctuation rules.
@@ -1052,7 +1094,8 @@ full-width U+3000 indents, are normalized."
         emacs-reader--tts-generation (1+ emacs-reader--tts-generation))
   (when (process-live-p emacs-reader--tts-process)
     (delete-process emacs-reader--tts-process))
-  (setq emacs-reader--tts-process nil)
+  (setq emacs-reader--tts-process nil
+        emacs-reader--tts-native-command nil)
   (dolist (buffer (list emacs-reader--tts-request-buffer emacs-reader--tts-prefetch-buffer))
     (when (buffer-live-p buffer)
       (let ((process (get-buffer-process buffer)))
@@ -1123,8 +1166,20 @@ full-width U+3000 indents, are normalized."
                 path))))
     (append command (list file))))
 
+(defun emacs-reader--tts-native-command ()
+  "Build a local speech command that accepts UTF-8 text on standard input."
+  (let* ((say (and (eq system-type 'darwin) (executable-find "say")))
+         (program (or say (executable-find "espeak-ng") (executable-find "espeak")
+                      (user-error "本机朗读需要 say、espeak-ng 或 espeak，也可设置 emacs-reader-tts-url")))
+         (speed (unless (= emacs-reader-tts-rate 1)
+                  (list (if say "-r" "-s")
+                        (number-to-string (max 1 (round (* 175 emacs-reader-tts-rate))))))))
+    (append (list program)
+            (when emacs-reader-tts-native-voice (list "-v" emacs-reader-tts-native-voice))
+            speed (unless say '("-b" "1" "--stdin")))))
+
 (defun emacs-reader-toggle-read-aloud ()
-  "Toggle paragraph-by-paragraph speech using the Reader server's HttpTTS."
+  "Toggle paragraph speech using the configured endpoint or a local voice."
   (interactive)
   (unless (derived-mode-p 'emacs-reader-reading-mode)
     (user-error "请在阅读页面使用朗读"))
@@ -1135,13 +1190,17 @@ full-width U+3000 indents, are normalized."
     (unless (and (integerp emacs-reader--current-chapter-index)
                  (equal emacs-reader--current-chapter-index emacs-reader--requested-chapter-index))
       (user-error "请等待章节加载完成"))
-    (emacs-reader--tts-endpoint)
-    (emacs-reader--tts-player)
-    (emacs-reader--tts-stop)
-    (setq emacs-reader--tts-active t
-          emacs-reader--tts-position nil
-          emacs-reader--tts-follow-pending nil)
-    (emacs-reader--tts-read-paragraph (point))))
+    (let ((native (if (member emacs-reader-tts-url '(nil ""))
+                      (emacs-reader--tts-native-command)
+                    (emacs-reader--tts-endpoint)
+                    (emacs-reader--tts-player)
+                    nil)))
+      (emacs-reader--tts-stop)
+      (setq emacs-reader--tts-active t
+            emacs-reader--tts-native-command native
+            emacs-reader--tts-position nil
+            emacs-reader--tts-follow-pending nil)
+      (emacs-reader--tts-read-paragraph (point)))))
 
 (defun emacs-reader--tts-paragraph (position)
   "Return (START END TEXT) for POSITION's paragraph, or nil at chapter end."
@@ -1210,6 +1269,15 @@ full-width U+3000 indents, are normalized."
          (job emacs-reader--tts-prefetch))
     (cond
      ((null paragraph) (emacs-reader--tts-advance-chapter))
+     (emacs-reader--tts-native-command
+      (condition-case err
+          (progn
+            (emacs-reader--tts-start-process (car paragraph) (cadr paragraph)
+                                             emacs-reader--tts-native-command)
+            (process-send-string emacs-reader--tts-process (nth 2 paragraph))
+            (process-send-eof emacs-reader--tts-process))
+        (error (emacs-reader--tts-stop)
+               (message "本机朗读失败：%s" (error-message-string err)))))
      ((and job (= (car paragraph) (plist-get job :start)))
       (if (plist-get job :ready)
           (progn
@@ -1259,6 +1327,40 @@ full-width U+3000 indents, are normalized."
           (error (setf (plist-get job :ready) t
                        (plist-get job :response) '(:error transport))))))))
 
+(defun emacs-reader--tts-start-process (start end command)
+  "Highlight the paragraph from START to END and play it using COMMAND."
+  (let ((buffer (current-buffer))
+        (generation emacs-reader--tts-generation))
+    (when (overlayp emacs-reader--tts-overlay) (delete-overlay emacs-reader--tts-overlay))
+    (setq emacs-reader--tts-position start
+          emacs-reader--tts-follow-pending t)
+    (goto-char start)
+    (setq emacs-reader--tts-overlay (make-overlay start end))
+    (overlay-put emacs-reader--tts-overlay 'face 'emacs-reader-tts-paragraph)
+    (dolist (window (get-buffer-window-list buffer nil t))
+      (emacs-reader--tts-follow-window window))
+    (setq emacs-reader--tts-process
+          (make-process
+           :name "emacs-reader-speech" :buffer nil :connection-type 'pipe :noquery t
+           :coding 'utf-8-unix :command command
+           :sentinel
+           (lambda (process _event)
+             (when (and (memq (process-status process) '(exit signal))
+                        (emacs-reader--tts-current-p buffer generation))
+               (with-current-buffer buffer
+                 (when (eq process emacs-reader--tts-process)
+                   (setq emacs-reader--tts-process nil)
+                   (if (zerop (process-exit-status process))
+                       (progn
+                         (when emacs-reader--tts-file (delete-file emacs-reader--tts-file))
+                         (setq emacs-reader--tts-file nil)
+                         (delete-overlay emacs-reader--tts-overlay)
+                         (setq emacs-reader--tts-overlay nil)
+                         (emacs-reader--tts-read-paragraph end))
+                     (emacs-reader--tts-stop)
+                     (message "朗读播放失败，请检查语音程序"))))))))
+    (message "正在朗读；r 停止")))
+
 (defun emacs-reader--tts-play-response (buffer generation start end response)
   "Play RESPONSE for BUFFER's paragraph START to END if GENERATION is current."
   (when (emacs-reader--tts-current-p buffer generation)
@@ -1274,37 +1376,9 @@ full-width U+3000 indents, are normalized."
                   (make-temp-file "emacs-reader-speech-" nil (concat "." (symbol-name format))))
             (let ((coding-system-for-write 'no-conversion))
               (write-region audio nil emacs-reader--tts-file nil 'silent))
-            (when (overlayp emacs-reader--tts-overlay) (delete-overlay emacs-reader--tts-overlay))
-            (setq emacs-reader--tts-position start
-                  emacs-reader--tts-follow-pending t)
-            (goto-char start)
-            (setq emacs-reader--tts-overlay (make-overlay start end))
-            (overlay-put emacs-reader--tts-overlay 'face 'emacs-reader-tts-paragraph)
-            (dolist (window (get-buffer-window-list buffer nil t))
-              (emacs-reader--tts-follow-window window))
-            (setq emacs-reader--tts-process
-                  (make-process
-                   :name "emacs-reader-speech" :buffer nil :connection-type 'pipe :noquery t
-                   :command (emacs-reader--tts-player-command emacs-reader--tts-file)
-                   :sentinel
-                   (lambda (process _event)
-                     (when (and (memq (process-status process) '(exit signal))
-                                (emacs-reader--tts-current-p buffer generation))
-                       (with-current-buffer buffer
-                         (when (eq process emacs-reader--tts-process)
-                           (setq emacs-reader--tts-process nil)
-                           (if (= (process-exit-status process) 0)
-                               (progn
-                                 (when emacs-reader--tts-file (delete-file emacs-reader--tts-file))
-                                 (setq emacs-reader--tts-file nil)
-                                 (when (overlayp emacs-reader--tts-overlay)
-                                   (delete-overlay emacs-reader--tts-overlay))
-                                 (setq emacs-reader--tts-overlay nil)
-                                 (emacs-reader--tts-read-paragraph end))
-                             (emacs-reader--tts-stop)
-                             (message "朗读播放失败，请检查播放器"))))))))
-            (emacs-reader--tts-prefetch-next end)
-            (message "正在朗读；r 停止"))
+            (emacs-reader--tts-start-process
+             start end (emacs-reader--tts-player-command emacs-reader--tts-file))
+            (emacs-reader--tts-prefetch-next end))
         (user-error (emacs-reader--tts-stop) (message "%s" (error-message-string err)))
         (error (emacs-reader--tts-stop) (message "朗读播放失败，请检查播放器"))))))
 
@@ -1312,7 +1386,7 @@ full-width U+3000 indents, are normalized."
   "Request zero-based chapter INDEX for the current Reader book.
 Resume speech if SPEECH-GENERATION is still active.  With AT-END, show the end."
   (when emacs-reader--preview-start-pending
-    (user-error "试读目录尚未就绪，请按 c 加载或重试"))
+    (user-error "目录尚未就绪，请按 c 加载或重试"))
   (unless (and (integerp index) (>= index 0))
     (user-error "Chapter index must be a nonnegative integer"))
   (let* ((book emacs-reader--current-book)
@@ -1330,12 +1404,22 @@ Resume speech if SPEECH-GENERATION is still active.  With AT-END, show the end."
           mode-line-process " Loading...")
     (let ((request-id emacs-reader--chapter-request-id))
       (condition-case err
-          (emacs-reader--reader3-request
-           "getBookContent" "POST"
-           `((url . ,book-url) (index . ,index))
-           (lambda (response)
-             (emacs-reader--handle-chapter-response
-              buffer request-id index response speech-generation at-end)))
+          (if (alist-get 'readerType book)
+              (emacs-reader-local--fetch
+               book (alist-get 'native (aref emacs-reader--chapters index))
+               (lambda (text err)
+                 (emacs-reader--display-chapter
+                  buffer request-id index text
+                  (and (equal (alist-get 'readerType book) "file")
+                       (equal (file-name-extension book-url) "epub") 'paragraphs)
+                  speech-generation at-end)
+                 (when err (message "正文加载失败：%s" err))))
+            (emacs-reader--reader3-request
+             "getBookContent" "POST"
+             `((url . ,book-url) (index . ,index))
+             (lambda (response)
+               (emacs-reader--handle-chapter-response
+                buffer request-id index response speech-generation at-end))))
         (error
          (if (or speech-generation at-end)
              (emacs-reader--display-chapter buffer request-id index nil nil speech-generation at-end)
@@ -1375,6 +1459,23 @@ Resume speech if SPEECH-GENERATION is still active.  With AT-END, show the end."
                            emacs-reader--current-book emacs-reader--current-chapter-index)))
     (force-mode-line-update)))
 
+(defun emacs-reader--request-catalog (book callback)
+  "Fetch the catalog for BOOK and deliver its indexed chapters to CALLBACK."
+  (if (alist-get 'readerType book)
+      (emacs-reader-local--fetch
+       book nil
+       (lambda (items err)
+         (let ((chapters (cl-loop for item in items for i from 0
+                                  collect `((index . ,i) (title . ,(plist-get item :title))
+                                            (native . ,item)))))
+           (funcall callback `(:ok ((isSuccess . ,(null err)) (data . ,chapters))))
+           (when err (message "目录加载失败：%s" err)))))
+    (emacs-reader--reader3-request
+     "getChapterList" "POST"
+     `((url . ,(alist-get 'bookUrl book)) (refresh . 0)
+       ,@(when emacs-reader--preview-p `((bookSourceUrl . ,(alist-get 'origin book)))))
+     callback)))
+
 (defun emacs-reader--load-catalog (&optional show)
   "Fetch the current book's catalog once; with SHOW, open it when ready."
   (if emacs-reader--chapters
@@ -1386,11 +1487,8 @@ Resume speech if SPEECH-GENERATION is still active.  With AT-END, show the end."
         (unless (and (stringp url) (not (string-empty-p url)))
           (user-error "No Reader book is open"))
         (setq emacs-reader--catalog-loading t)
-        (emacs-reader--reader3-request
-         "getChapterList" "POST"
-         `((url . ,url) (refresh . 0)
-           ,@(when emacs-reader--preview-p
-               `((bookSourceUrl . ,(alist-get 'origin emacs-reader--current-book)))))
+        (emacs-reader--request-catalog
+         emacs-reader--current-book
          (lambda (response)
            (when (buffer-live-p buffer)
              (with-current-buffer buffer
@@ -1412,8 +1510,11 @@ Resume speech if SPEECH-GENERATION is still active.  With AT-END, show the end."
                          (emacs-reader--update-reading-header)
                          (when emacs-reader--preview-start-pending
                            (setq emacs-reader--preview-start-pending nil)
-                           (emacs-reader--load-chapter 0))
-                         (when show (emacs-reader--show-catalog buffer)))
+                           (emacs-reader--load-chapter
+                             (if emacs-reader--preview-p 0
+                               (min (1- (length chapters))
+                                    (max 0 (or (alist-get 'durChapterIndex emacs-reader--current-book) 0))))))
+                          (when show (emacs-reader--show-catalog buffer)))
                      (message "Reader 目录加载失败，可按 c 重试"))))))))))))
 
 (define-derived-mode emacs-reader-toc-mode tabulated-list-mode "Reader-TOC"
@@ -1515,18 +1616,27 @@ Resume speech if SPEECH-GENERATION is still active.  With AT-END, show the end."
            '((hr . emacs-reader--html-horizontal-rule))))
       (erase-buffer)
       (shr-insert-document (car (dom-by-tag dom 'body)))
-      ;; HTML already defines paragraph boundaries; do not merge headings or verse.
-      (mapconcat
-       (lambda (paragraph)
-         (concat "　　" (string-trim paragraph "[ \t\n　 ]+" "[ \t\n　 ]+")))
-       (split-string (buffer-substring-no-properties (point-min) (point-max))
-                     "\n[ \t]*\n+" t) "\n\n"))))
+      (emacs-reader--format-paragraphs (buffer-string)))))
+
+(defun emacs-reader--format-paragraphs (content)
+  "Indent paragraphs in CONTENT while retaining explicit line breaks."
+  (mapconcat (lambda (paragraph)
+               (concat "　　" (string-trim paragraph "[ \t\n　 ]+" "[ \t\n　 ]+")))
+             (split-string content "\n[ \t]*\n+" t) "\n\n"))
 
 (defun emacs-reader--chapter-request-current-p (buffer request-id)
   "Whether BUFFER still expects the chapter response for REQUEST-ID."
   (and (buffer-live-p buffer)
        (= request-id
           (buffer-local-value 'emacs-reader--chapter-request-id buffer))))
+
+(defun emacs-reader--save-local-progress (index)
+  "Record the successfully displayed chapter INDEX for a local shelf book."
+  (when (and (alist-get 'readerType emacs-reader--current-book)
+             (not emacs-reader--preview-p))
+    (emacs-reader-local--progress emacs-reader--current-book
+                                 (aref emacs-reader--chapters index) index
+                                 (length emacs-reader--chapters))))
 
 (defun emacs-reader--display-chapter (buffer request-id index content &optional html-p speech-generation at-end)
   "Display CONTENT for INDEX in BUFFER if REQUEST-ID is current.
@@ -1537,8 +1647,11 @@ Continue SPEECH-GENERATION only if it is still active.  AT-END shows the end."
       (setq mode-line-process nil)
       (let ((text (and (stringp content)
                        (condition-case nil
-                           (if html-p (emacs-reader--html-chapter-text content)
-                             (emacs-reader--format-chapter content))
+                           (cond ((eq html-p 'paragraphs)
+                                   (if (string-blank-p content) "本页没有可显示的文字。"
+                                     (emacs-reader--format-paragraphs content)))
+                                  (html-p (emacs-reader--html-chapter-text content))
+                                  (t (emacs-reader--format-chapter content)))
                          (error nil)))))
         (if (and text (not (string-blank-p text)))
             (let ((inhibit-read-only t))
@@ -1549,6 +1662,7 @@ Continue SPEECH-GENERATION only if it is still active.  AT-END shows the end."
               (setq emacs-reader--current-chapter-index index
                     emacs-reader--requested-chapter-index index)
               (emacs-reader--update-reading-header)
+              (emacs-reader--save-local-progress index)
               (dolist (window (get-buffer-window-list buffer nil t))
                 (set-window-point window (point))
                 (if at-end
