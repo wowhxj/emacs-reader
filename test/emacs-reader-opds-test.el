@@ -144,5 +144,25 @@
         (emacs-reader-search "红 A")
         (should (equal result (list (concat url "?q=%E7%BA%A2%20A") "红 A")))))))
 
+(ert-deftest emacs-reader-opds-empty-reply-can-retry-search ()
+  (with-temp-buffer
+    (emacs-reader-opds-mode)
+    (setq emacs-reader-opds--name "文渊阁")
+    (let (requests)
+      (cl-letf (((symbol-function 'url-retrieve)
+                 (lambda (url callback &rest _)
+                   (push url requests)
+                   (with-current-buffer (generate-new-buffer " *mock OPDS*")
+                     (setq-local url-http-response-status nil)
+                     (when (cdr requests)
+                       (setq url-http-response-status 200)
+                       (insert "HTTP/1.1 200 OK\r\n\r\n<feed/>"))
+                     (funcall callback nil)))))
+        (emacs-reader-opds--feed "https://example.invalid/opds/" "西游记")
+        (should (string-match-p "未收到 HTTP 状态码（收到 0 字节）" (buffer-string)))
+        (button-activate (next-button (point-min)))
+        (should (equal requests (make-list 2 "https://example.invalid/opds/")))
+        (should (equal (caar emacs-reader-opds--history) "西游记"))))))
+
 (provide 'emacs-reader-opds-test)
 ;;; emacs-reader-opds-test.el ends here

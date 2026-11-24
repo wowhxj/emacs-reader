@@ -226,11 +226,14 @@ preserves raw response bytes for acquisition."
                                (buffer-local-value 'emacs-reader-opds--generation target)))
                    (condition-case err
                        (progn
-                         (when (or (plist-get status :error)
-                                   (not (and (integerp url-http-response-status)
-                                             (<= 200 url-http-response-status 299))))
-                           (error "Request failed (%s)"
-                                  (or url-http-response-status (plist-get status :error))))
+                         (cond
+                          ((and (integerp url-http-response-status)
+                                (not (<= 200 url-http-response-status 299)))
+                           (error "HTTP %d" url-http-response-status))
+                          ((plist-get status :error)
+                           (error "网络请求失败 %S" (plist-get status :error)))
+                          ((null url-http-response-status)
+                           (error "连接结束时未收到 HTTP 状态码（收到 %d 字节）" (buffer-size))))
                          (goto-char (point-min))
                          (unless (re-search-forward "\r?\n\r?\n" nil t)
                            (error "Missing HTTP headers"))
@@ -241,7 +244,20 @@ preserves raw response bytes for acquisition."
                              (decode-coding-region (point) (point-max) 'utf-8))
                            (let ((result (funcall read-body base)))
                              (with-current-buffer target (funcall done result)))))
-                     (error (message "Book catalog: %s" (error-message-string err)))))
+                     (error
+                      (with-current-buffer target
+                        (let ((inhibit-read-only t)
+                              (reason (error-message-string err)))
+                          (if emacs-reader-opds--history (emacs-reader-opds--draw) (erase-buffer))
+                          (goto-char (point-min))
+                          (insert (format "%s · %s\n" emacs-reader-opds--name reason))
+                          (insert-text-button "重试" 'follow-link t
+                                              'action (lambda (_)
+                                                        (emacs-reader-opds--get
+                                                         url read-body done binary)))
+                          (insert "\n\n")
+                          (goto-char (point-min))
+                          (message "%s · %s" emacs-reader-opds--name reason))))))
                (when (buffer-live-p response) (kill-buffer response))))) nil t t)))
 
 (defun emacs-reader-opds--feed (url heading)
