@@ -86,6 +86,19 @@ ROOT marks links on the top-level feed."
   (if (stringp node) node
     (string-trim (mapconcat #'emacs-reader-opds--text (dom-children node) ""))))
 
+(defun emacs-reader-opds--alternate (links base title author)
+  "Find an alternate HTML detail among LINKS for TITLE and AUTHOR at BASE."
+  (cl-loop for link in links
+           when (and (member (dom-attr link 'rel) '(nil "alternate"))
+                     (equal (car (split-string (or (dom-attr link 'type) "") ";")) "text/html"))
+           thereis (when-let* ((url (emacs-reader-opds--http
+                                     (dom-attr link 'href)
+                                     (or (emacs-reader-opds--http (dom-attr link 'xml:base) base)
+                                         base))))
+                     (list (emacs-reader-opds--item
+                            :kind 'record :title title :label title :author author :url url
+                            :action (lambda () (emacs-reader-opds--detail url title)))))))
+
 (defun emacs-reader-opds--atom (node base &optional publication)
   "Return catalog items from Atom NODE relative to BASE.
 PUBLICATION means NODE describes a book or navigation entry."
@@ -95,15 +108,18 @@ PUBLICATION means NODE describes a book or navigation entry."
          (authors (cl-loop for a in (emacs-reader-opds--children node "author")
                            collect (emacs-reader-opds--text
                                     (car (emacs-reader-opds--children a "name")))))
-         (author (and authors (string-join authors ", "))))
+         (author (and authors (string-join authors ", ")))
+         (links (emacs-reader-opds--children node "link")))
     (append
-     (cl-loop for link in (emacs-reader-opds--children node "link")
-              for item = (emacs-reader-opds--link
-                          (dom-attr link 'href) (dom-attr link 'rel) (dom-attr link 'type)
-                          (dom-attr link 'title)
-                          (or (emacs-reader-opds--http (dom-attr link 'xml:base) base) base)
-                          title author nil (not publication))
-              when item collect item)
+     (or (cl-loop for link in links
+                  for item = (emacs-reader-opds--link
+                              (dom-attr link 'href) (dom-attr link 'rel) (dom-attr link 'type)
+                              (dom-attr link 'title)
+                              (or (emacs-reader-opds--http (dom-attr link 'xml:base) base) base)
+                              title author nil (not publication))
+                  when item collect item)
+         (when (and publication (not (string-empty-p title)))
+           (emacs-reader-opds--alternate links base title author)))
      (cl-loop for entry in (emacs-reader-opds--children node "entry")
               append (emacs-reader-opds--atom entry base t)))))
 
@@ -368,6 +384,19 @@ preserves raw response bytes for acquisition."
                         (emacs-reader-opds--request-error url read-body done binary
                                                           (error-message-string err))))))
                (when (buffer-live-p response) (kill-buffer response))))) nil t t)))
+
+(defun emacs-reader-opds--detail (url title)
+  "Open the Atom catalog or web page advertised as HTML at URL for TITLE."
+  (emacs-reader-opds--get
+   url (lambda (base)
+         (skip-chars-forward " \t\r\n")
+         (when (looking-at "<[?]xml ") (search-forward "?>") (skip-chars-forward " \t\r\n"))
+         (if (looking-at (rx "<" (? (+ (any alnum "_-")) ":") (or "feed" "entry") (or space ">" "/")))
+             (cons 'catalog (emacs-reader-opds--parse base))
+           (cons 'web base)))
+   (lambda (page)
+     (if (eq 'catalog (car page)) (emacs-reader-opds--show title (cdr page))
+       (browse-url (cdr page))))))
 
 (defun emacs-reader-opds--feed (url heading)
   "Fetch the catalog at URL and display it under HEADING."

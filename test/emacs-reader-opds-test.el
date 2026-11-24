@@ -16,6 +16,26 @@
     (goto-char (point-min))
     (emacs-reader-opds--parse "https://a.invalid/catalog/root")))
 
+(ert-deftest emacs-reader-opds-alternate-html-or-atom-detail ()
+  (let* ((item (car (emacs-reader-opds-test--parse
+                     "<entry><title>Book</title><link href='detail' type='text/html'/></entry>")))
+         (url (emacs-reader-opds--item-url item)) body shown web)
+    (cl-letf (((symbol-function 'emacs-reader-opds--get)
+               (lambda (target parse done)
+                 (should (equal target url))
+                 (with-temp-buffer (insert body) (goto-char (point-min))
+                                   (funcall done (funcall parse url)))))
+              ((symbol-function 'emacs-reader-opds--show) (lambda (_ items) (setq shown items)))
+              ((symbol-function 'browse-url) (lambda (target) (setq web target))))
+      (setq body (concat "<?xml version='1.0'?><feed><entry><title>Book</title>"
+                         "<link rel='http://opds-spec.org/acquisition' href='b.epub'"
+                         " type='application/epub+zip'/></entry></feed>"))
+      (emacs-reader-opds--activate item)
+      (should (eq 'download (emacs-reader-opds--item-kind (car shown))))
+      (setq body "<!doctype html><html><title>Book</title></html>")
+      (emacs-reader-opds--activate item)
+      (should (equal web url)))))
+
 (ert-deftest emacs-reader-opds-atom-navigation-and-acquisition ()
   (let ((items (emacs-reader-opds-test--parse
                 (concat "<a:feed xmlns:a='http://www.w3.org/2005/Atom' xml:base='../'>"
