@@ -6,6 +6,7 @@
 
 ;;; Code:
 (require 'emacs-reader)
+(require 'emacs-reader-filter)
 (require 'emacs-reader-opds)
 (require 'emacs-reader-search-progress)
 
@@ -40,11 +41,13 @@
                                             (alist-get 'name (emacs-reader-search-task-source task))
                                             reason))))
         (pending (+ (length emacs-reader-all--queue) (length emacs-reader-all--running))))
-    (setq tabulated-list-entries (append emacs-reader-all--rows errors)
+    (setq tabulated-list-entries (emacs-reader-filter-rows (append emacs-reader-all--rows errors))
           header-line-format
-          (format "  %s · %d 个书源 · %d 条结果 · 待返回 %d · 失败 %d    RET 试读 / 打开   a 加入书架   m 更多   g 重试"
-                  emacs-reader-all--keyword (length emacs-reader-all--tasks)
-                  (length emacs-reader-all--rows) pending (length errors)))
+          (format (concat "%s  %s · %d 个书源 · %d 条结果 · 待返回 %d · 失败 %d"
+                          "    RET 试读 / 打开   a 加入书架   m 更多   g 重试   / 筛选")
+                  (emacs-reader-filter-description) emacs-reader-all--keyword
+                  (length emacs-reader-all--tasks) (length emacs-reader-all--rows)
+                  pending (length errors)))
     (tabulated-list-print t)))
 
 (defun emacs-reader-all--append (source items)
@@ -173,6 +176,7 @@
 
 (define-derived-mode emacs-reader-all-mode emacs-reader-search-mode "Reader-All"
   "Display results from multiple local sources."
+  (setq-local emacs-reader-filter-refresh-function #'emacs-reader-all--render)
   (setq tabulated-list-format [("书名 / 目录" 34 t) ("作者" 16 t) ("书源" 19 t) ("操作 / 状态" 0 nil)])
   (tabulated-list-init-header)
   (add-hook 'kill-buffer-hook #'emacs-reader-all--stop nil t)

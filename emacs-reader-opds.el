@@ -9,6 +9,7 @@
 (require 'button)
 (require 'cl-lib)
 (require 'dom)
+(require 'emacs-reader-filter)
 (require 'emacs-reader-search-progress)
 (require 'json)
 (require 'seq)
@@ -192,6 +193,9 @@ RESULTS limits feed-level actions on a search results page."
 (defvar-local emacs-reader-opds--history nil)
 (defvar emacs-reader-opds--active-buffer nil
   "Buffer owning the latest interactive catalog search.")
+(defvar-local emacs-reader-opds--status nil)
+(defvar-local emacs-reader-opds--result-region nil
+  "Markers around result buttons, excluding navigation and retry controls.")
 (defvar-local emacs-reader-opds--cancel nil)
 (defvar-local emacs-reader-opds--on-error nil
   "Error callback for a background catalog request.")
@@ -206,8 +210,26 @@ RESULTS limits feed-level actions on a search results page."
 
 (define-key emacs-reader-opds-mode-map (kbd "a") #'emacs-reader-opds-add)
 
+(define-minor-mode emacs-reader-opds-result-mode
+  "Enable local filtering on a catalog search result page."
+  :lighter nil
+  :keymap (let ((map (make-sparse-keymap)))
+            (define-key map (kbd "/") #'emacs-reader-filter-edit)
+            (define-key map (kbd "C-c C-l") #'emacs-reader-filter-clear)
+            map))
+
+(defun emacs-reader-opds--update-header ()
+  "Display the current search status and applied filter."
+  (setq header-line-format
+        (if emacs-reader-opds-result-mode
+            (string-join (seq-remove #'string-empty-p
+                                     (list (emacs-reader-filter-description)
+                                           (or emacs-reader-opds--status ""))) "  ")
+          emacs-reader-opds--status)))
+
 (define-derived-mode emacs-reader-opds-mode special-mode "Book Catalog"
   "Follow links or preview books with RET.  Add with `a', go back with `b'."
+  (setq-local emacs-reader-filter-refresh-function #'emacs-reader-opds--refresh-results)
   (add-hook 'kill-buffer-hook #'emacs-reader-opds--stop nil t)
   (add-hook 'change-major-mode-hook #'emacs-reader-opds--stop nil t)
   (add-hook 'quit-window-hook #'emacs-reader-opds--stop nil t))
@@ -218,7 +240,8 @@ RESULTS limits feed-level actions on a search results page."
   (when emacs-reader-opds--cancel
     (funcall emacs-reader-opds--cancel)
     (setq emacs-reader-opds--cancel nil))
-  (setq header-line-format nil)
+  (setq emacs-reader-opds--status nil)
+  (emacs-reader-opds--update-header)
   (when (eq (current-buffer) emacs-reader-opds--active-buffer)
     (setq emacs-reader-opds--active-buffer nil)))
 
@@ -232,24 +255,46 @@ RESULTS limits feed-level actions on a search results page."
 (defun emacs-reader-opds--insert-items (items)
   "Insert buttons for ITEMS at point."
   (dolist (item items)
-    (insert-text-button (concat (when-let* ((status (emacs-reader-opds--availability item)))
-                                  (format "【%s】 " status))
-                                (emacs-reader-opds--item-label item))
-                        'emacs-reader-item item 'follow-link t
-                        'action (lambda (_) (emacs-reader-opds--activate item)))
-    (insert "\n")))
+    (let ((label (concat (when-let* ((status (emacs-reader-opds--availability item)))
+                           (format "【%s】 " status))
+                         (emacs-reader-opds--item-label item))))
+      (when (or (not emacs-reader-opds-result-mode) (emacs-reader-filter-match-p label))
+        (insert-text-button label 'emacs-reader-item item 'follow-link t
+                            'action (lambda (_) (emacs-reader-opds--activate item)))
+        (insert "\n")))))
+
+(defun emacs-reader-opds--refresh-results ()
+  "Refilter result buttons while retaining the page's navigation and errors."
+  (emacs-reader-opds--update-header)
+  (when emacs-reader-opds--result-region
+    (let ((inhibit-read-only t)
+          (start (car emacs-reader-opds--result-region))
+          (end (cdr emacs-reader-opds--result-region)))
+      (goto-char start)
+      (delete-region start end)
+      (emacs-reader-opds--insert-items (cdar emacs-reader-opds--history))
+      (set-marker end (point))
+      (goto-char start))))
 
 (defun emacs-reader-opds--draw ()
   "Draw the current catalog page."
   (pcase-let ((`(,heading . ,items) (car emacs-reader-opds--history))
               (inhibit-read-only t))
+    (emacs-reader-opds-result-mode
+     (if (get-text-property 0 'emacs-reader-search-results heading) 1 -1))
+    (setq emacs-reader-opds--result-region nil)
+    (emacs-reader-opds--update-header)
     (erase-buffer)
-    (insert (propertize heading 'face 'bold) "\nRET 试读 / 打开   a 加入书架\n\n")
+    (insert (propertize heading 'face 'bold) "\nRET 试读 / 打开   a 加入书架"
+            (if emacs-reader-opds-result-mode "   / 筛选   C-c C-l 清除" "") "\n\n")
     (when (cdr emacs-reader-opds--history)
       (insert-text-button "Back" 'action (lambda (_) (emacs-reader-opds-back)))
       (insert "\n\n"))
     (unless items (insert "No available EPUB, TXT or navigation links.\n"))
-    (emacs-reader-opds--insert-items items)
+    (let ((start (point-marker)))
+      (emacs-reader-opds--insert-items items)
+      (when emacs-reader-opds-result-mode
+        (setq emacs-reader-opds--result-region (cons start (point-marker)))))
     (goto-char (point-min))))
 
 (defun emacs-reader-opds--show (heading items)
@@ -537,33 +582,40 @@ match whenEquals."
   (when (buffer-live-p emacs-reader-opds--active-buffer)
     (with-current-buffer emacs-reader-opds--active-buffer (emacs-reader-opds--stop)))
   (let ((target (current-buffer)) (history emacs-reader-opds--history)
+        (result-heading (propertize keyword 'emacs-reader-search-results t))
         (count 0) tail finished received)
-    (setq emacs-reader-opds--active-buffer target header-line-format "已加载 0 条 · 加载中")
+    (setq emacs-reader-opds--active-buffer target emacs-reader-opds--status "已加载 0 条 · 加载中"
+          emacs-reader-opds--result-region nil)
+    (emacs-reader-opds-result-mode 1)
+    (emacs-reader-opds--update-header)
     (let ((cancel
            (emacs-reader-catalog--search
             source keyword
             (lambda (items)
               (with-current-buffer target
                 (cl-incf count (length items))
-                (setq received t header-line-format (format "已加载 %d 条 · 加载中" count))
+                (setq received t emacs-reader-opds--status (format "已加载 %d 条 · 加载中" count))
+                (emacs-reader-opds--update-header)
                 (when items
                   (if tail
                       (progn
                         (setcdr tail items)
                         (save-excursion
                           (let ((inhibit-read-only t))
-                            (goto-char (point-max))
-                            (emacs-reader-opds--insert-items items))))
-                    (emacs-reader-opds--show keyword items))
+                            (goto-char (cdr emacs-reader-opds--result-region))
+                            (emacs-reader-opds--insert-items items)
+                            (set-marker (cdr emacs-reader-opds--result-region) (point)))))
+                    (emacs-reader-opds--show result-heading items))
                   (setq tail (last items)))))
             (lambda (reason)
               (setq finished t)
               (with-current-buffer target
                 (emacs-reader-search-progress-stop)
                 (setq emacs-reader-opds--cancel nil
-                      header-line-format (format "已加载 %d 条 · %s" count
-                                                 (if reason "已停止" "完成")))
-                (when (and received (null tail)) (emacs-reader-opds--show keyword nil))
+                      emacs-reader-opds--status
+                      (format "已加载 %d 条 · %s" count (if reason "已停止" "完成")))
+                (emacs-reader-opds--update-header)
+                (when (and received (null tail)) (emacs-reader-opds--show result-heading nil))
                 (when reason
                   (save-excursion
                     (let ((inhibit-read-only t))
@@ -572,6 +624,9 @@ match whenEquals."
                       (insert-text-button "重试" 'follow-link t
                                           'action (lambda (_)
                                                     (setq emacs-reader-opds--history history)
+                                                    (let ((inhibit-read-only t))
+                                                      (if history (emacs-reader-opds--draw)
+                                                        (erase-buffer)))
                                                     (emacs-reader-opds--search-buffer
                                                      source keyword link)))
                       (insert "\n")))

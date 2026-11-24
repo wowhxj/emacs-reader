@@ -34,6 +34,7 @@
   "Browse book sources, manage a shelf and read books in Emacs."
   :group 'applications)
 
+(require 'emacs-reader-filter)
 (require 'emacs-reader-local)
 (require 'emacs-reader-wendian-recovery)
 (require 'emacs-reader-search-progress)
@@ -775,6 +776,18 @@ Create the tab if necessary; otherwise reuse it."
   (setq emacs-reader--search-loading nil)
   (emacs-reader-search-progress-stop))
 
+(defun emacs-reader--render-search ()
+  "Display matching rows from the full set of search results."
+  (setq tabulated-list-entries
+        (emacs-reader-filter-rows
+         (mapcar (lambda (book)
+                   (list book (vector (emacs-reader--book-field book 'name)
+                                      (emacs-reader--book-field book 'author)
+                                      (emacs-reader--book-source book)
+                                      (emacs-reader--book-field book 'latestChapterTitle))))
+                 emacs-reader--search-books)))
+  (tabulated-list-print t))
+
 (define-derived-mode emacs-reader-search-mode tabulated-list-mode "Reader-Search"
   "Source search results: RET previews, a adds to shelf, m loads more."
   (add-hook 'kill-buffer-hook #'emacs-reader--stop-search nil t)
@@ -782,13 +795,18 @@ Create the tab if necessary; otherwise reuse it."
   (add-hook 'quit-window-hook #'emacs-reader--stop-search nil t)
   (setq tabulated-list-format [("书名" 32 t) ("作者" 18 t) ("书源" 24 t)
                               ("最新章节" 0 nil)])
-  (setq header-line-format "  搜索结果   RET 试读   a 加入书架   m 更多   g 重试   s 新搜索")
+  (setq-local emacs-reader-filter-refresh-function
+              #'emacs-reader--render-search)
+  (setq mode-name
+        '("Reader-Search" (:eval (emacs-reader-filter-description))))
   (tabulated-list-init-header)
   (hl-line-mode 1))
 
 (define-key emacs-reader-shelf-mode-map (kbd "i") #'emacs-reader-import-file)
 (define-key emacs-reader-shelf-mode-map (kbd "o") #'emacs-reader-browse-catalog)
 (define-key emacs-reader-shelf-mode-map (kbd "s") #'emacs-reader-search)
+(define-key emacs-reader-search-mode-map (kbd "/") #'emacs-reader-filter-edit)
+(define-key emacs-reader-search-mode-map (kbd "C-c C-l") #'emacs-reader-filter-clear)
 (define-key emacs-reader-search-mode-map (kbd "s") #'emacs-reader-search)
 (define-key emacs-reader-search-mode-map (kbd "q") #'emacs-reader-quit)
 (define-key emacs-reader-search-mode-map (kbd "n") #'next-line)
@@ -848,7 +866,8 @@ Create the tab if necessary; otherwise reuse it."
       (unless (derived-mode-p 'emacs-reader-search-mode)
         (emacs-reader-search-mode))
       (emacs-reader--stop-search)
-      (setq emacs-reader--search-config
+      (setq emacs-reader-filter-query ""
+            emacs-reader--search-config
             (append (list :key keyword :page 1 :last-index -1) config)
             emacs-reader--search-books nil
             emacs-reader--search-loading nil
@@ -941,15 +960,7 @@ Create the tab if necessary; otherwise reuse it."
             (when multi
               (setf (plist-get emacs-reader--search-config :last-index) cursor))
             (cl-incf (plist-get emacs-reader--search-config :page))
-            (setq tabulated-list-entries
-                  (mapcar (lambda (book)
-                            (list book
-                                  (vector (emacs-reader--book-field book 'name)
-                                          (emacs-reader--book-field book 'author)
-                                          (emacs-reader--book-source book)
-                                          (emacs-reader--book-field book 'latestChapterTitle))))
-                          emacs-reader--search-books))
-            (tabulated-list-print t)
+            (emacs-reader--render-search)
             (message "搜索结果 %d 条%s" (length emacs-reader--search-books)
                      (if emacs-reader--search-ended "，没有更多结果"
                        "；按 m 继续搜索"))))))))
