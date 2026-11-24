@@ -59,21 +59,25 @@
 
 (ert-deftest emacs-reader-opds-opensearch-description ()
   (let ((description "https://a.invalid/catalog/search.xml") result)
-    (cl-letf (((symbol-function 'read-string) (lambda (&rest _) "红 A"))
-              ((symbol-function 'emacs-reader-opds--get)
-               (lambda (url read-body done &optional _binary)
-                 (should (equal url description))
-                 (with-temp-buffer
-                   (insert "<OpenSearchDescription>"
-                           "<Url type='text/html' template='/ignore?q={searchTerms}'/>"
-                           "<Url type='application/atom+xml' template='results?q={searchTerms}'/>"
-                           "</OpenSearchDescription>")
-                   (goto-char (point-min))
-                   (funcall done (funcall read-body url)))))
-              ((symbol-function 'emacs-reader-opds--feed)
-               (lambda (url heading) (setq result (list url heading)))))
-      (emacs-reader-opds--search description)
-      (should (equal result '("https://a.invalid/catalog/results?q=%E7%BA%A2%20A" "红 A"))))))
+    (with-temp-buffer
+      (cl-letf (((symbol-function 'read-string) (lambda (&rest _) "红 A"))
+                ((symbol-function 'emacs-reader-opds--get)
+                 (lambda (url read-body done &optional _binary)
+                   (push url result)
+                   (funcall done
+                            (with-temp-buffer
+                              (insert (if (equal url description)
+                                          (concat "<OpenSearchDescription><Url type='text/html'"
+                                                  " template='/ignore?q={searchTerms}'/>"
+                                                  "<Url type='application/atom+xml'"
+                                                  " template='results?q={searchTerms}'/>"
+                                                  "</OpenSearchDescription>")
+                                        "<feed/>"))
+                              (goto-char (point-min)) (funcall read-body url))))))
+        (emacs-reader-opds--search description)
+        (should (equal result (list "https://a.invalid/catalog/results?q=%E7%BA%A2%20A"
+                                    description)))
+        (should (equal (caar emacs-reader-opds--history) "红 A"))))))
 
 (ert-deftest emacs-reader-json-catalog-direct-downloads-and-pagination ()
   (let* ((source '((type . "json") (name . "Example")
@@ -83,9 +87,14 @@
          (doc '((count . 4) (result . ((books . (((name . "A") (url . "../a.epub"))
                                                  ((name . "B") (url . "https://b.invalid/b.txt"))
                                                  ((name . "C") (url . "file:///tmp/c.txt"))))))))
-         requests)
+         requests next)
     (with-temp-buffer
-      (cl-letf (((symbol-function 'emacs-reader-opds--start) #'ignore)
+      (cl-letf (((symbol-function 'run-at-time)
+                 (lambda (delay _ fn &rest args)
+                   (when (= delay emacs-reader-catalog--page-delay)
+                     (setq next (lambda () (apply fn args))))
+                   (timer-create)))
+                ((symbol-function 'emacs-reader-opds--start) #'ignore)
                 ((symbol-function 'emacs-reader-opds--get)
                  (lambda (url parse done)
                    (push url requests)
@@ -94,11 +103,16 @@
         (emacs-reader-json-catalog-search source "红 &")
         (let ((items (cdar emacs-reader-opds--history)))
           (should (equal (mapcar #'emacs-reader-opds--item-kind items)
-                         '(download download json-page)))
+                         '(download download)))
           (should (equal (mapcar #'emacs-reader-opds--item-url (seq-take items 2))
                          '("https://a.invalid/a.epub" "https://b.invalid/b.txt")))
-          (emacs-reader-opds--activate (car (last items)))
-          (should (= 2 (length (cdar emacs-reader-opds--history))))
+          (setq doc '((count . 4) (result . ((books . (((name . "D") (url . "/d.txt"))))))))
+          (goto-char (button-start (next-button (point-min))))
+          (let ((point-before (point)))
+            (funcall next)
+            (should (= point-before (point))))
+          (should (= 1 (length emacs-reader-opds--history)))
+          (should (= 3 (length (cdar emacs-reader-opds--history))))
           (should (equal requests '("https://a.invalid/api/search?q=%E7%BA%A2%20%26&page=2"
                                     "https://a.invalid/api/search?q=%E7%BA%A2%20%26&page=1"))))))))
 
@@ -147,7 +161,7 @@
     (with-temp-buffer
       (emacs-reader-opds--show
        "结果" (append items (list (emacs-reader-opds--item :kind 'download :label "book.epub")
-                                (emacs-reader-opds--item :kind 'feed :label "下一页"))))
+                                  (emacs-reader-opds--item :kind 'feed :label "下一页"))))
       (dolist (label '("【仅书目信息】 无电子版" "【仅书目信息】 可借阅" "【可查版本】 公开版"
                        "【可下载】 book.epub" "下一页"))
         (let ((button (next-button (point))))
@@ -200,18 +214,19 @@
                  (lambda (_ choices &rest _args)
                    (or (car (assoc-string (concat "文渊阁 [opds] <" url ">") choices))
                        (ert-fail "Registered OPDS catalog missing from shelf search"))))
-                ((symbol-function 'emacs-reader-opds--start) #'ignore)
+                ((symbol-function 'emacs-reader-opds--start)
+                 (lambda (name) (setq emacs-reader-opds--name name)))
                 ((symbol-function 'emacs-reader-opds--get)
                  (lambda (target parser done)
-                   (should (equal target url))
+                   (push target result)
                    (funcall done (with-temp-buffer
-                                   (insert "<feed><link rel='search' "
-                                           "href='?q={searchTerms}'/></feed>")
-                                   (goto-char (point-min)) (funcall parser target)))))
-                ((symbol-function 'emacs-reader-opds--feed)
-                 (lambda (target query) (setq result (list target query)))))
+                                   (insert (if (equal url target)
+                                               "<feed><link rel='search' href='?q={searchTerms}'/>
+</feed>" "<feed/>"))
+                                   (goto-char (point-min)) (funcall parser target))))))
         (emacs-reader-search "红 A")
-        (should (equal result (list (concat url "?q=%E7%BA%A2%20A") "红 A")))))))
+        (should (equal result (list (concat url "?q=%E7%BA%A2%20A") url)))
+        (should (equal (mapcar #'car emacs-reader-opds--history) '("红 A" "文渊阁")))))))
 
 (ert-deftest emacs-reader-opds-empty-reply-can-retry-search ()
   (with-temp-buffer

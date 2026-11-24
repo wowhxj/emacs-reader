@@ -1,14 +1,14 @@
 ;;; emacs-reader-search-all.el --- Search several local sources -*- lexical-binding: t; indent-tabs-mode: nil; fill-column: 100; -*-
 
 ;;; Commentary:
-;; Fetch one result page per selected source and retain its native book or
+;; Stream catalog pages and retain each source's native book or
 ;; catalog item for preview, acquisition and navigation.
 
 ;;; Code:
 (require 'emacs-reader)
 (require 'emacs-reader-opds)
 
-(declare-function emacs-reader-catalog-results "emacs-reader-opds")
+(declare-function emacs-reader-catalog-search-pages "emacs-reader-opds")
 (declare-function emacs-reader-catalog-open-item "emacs-reader-opds")
 
 (cl-defstruct emacs-reader-search-task source (page 1) error more)
@@ -22,8 +22,12 @@
 
 (defun emacs-reader-all--stop ()
   "Invalidate outstanding requests and cancel their timers."
-  (mapc (lambda (run) (cancel-timer (cdr run))) emacs-reader-all--running)
-  (setq emacs-reader-all--running nil emacs-reader-all--queue nil))
+  (let ((runs emacs-reader-all--running))
+    (setq emacs-reader-all--running nil emacs-reader-all--queue nil)
+    (dolist (run runs)
+      (let ((token (cdr run)))
+        (if (timerp token) (cancel-timer token)
+          (when (functionp (cdr token)) (funcall (cdr token))))))))
 
 (defun emacs-reader-all--render ()
   "Show results, retryable failures and current progress."
@@ -38,13 +42,7 @@
           header-line-format
           (format "  %s · %d 个书源 · %d 条结果 · 待返回 %d · 失败 %d    RET 打开   a 入架   m 更多   g 重试"
                   emacs-reader-all--keyword (length emacs-reader-all--tasks)
-                  (cl-count-if-not
-                   (lambda (row)
-                     (let ((item (cdar row)))
-                       (and (emacs-reader-opds--item-p item)
-                            (emacs-reader-opds--item-pagination item))))
-                   emacs-reader-all--rows)
-                  pending (length errors)))
+                  (length emacs-reader-all--rows) pending (length errors)))
     (tabulated-list-print t)))
 
 (defun emacs-reader-all--append (source items)
@@ -60,44 +58,59 @@
                           (vector (emacs-reader--book-field book 'name)
                                   (emacs-reader--book-field book 'author)
                                   (alist-get 'name source) "试读 / 入架")) entries)))
-        (push (list (cons source item)
-                    (vector (or (emacs-reader-opds--item-label item) "")
-                            (or (emacs-reader-opds--item-author item) "") (alist-get 'name source)
-                            (or (emacs-reader-opds--availability item) "打开目录"))) entries)))
+        ;; Retrying a failed catalog starts again at its first page.
+        (let ((key (list (alist-get 'type source) (alist-get 'url source)
+                         (emacs-reader-opds--item-kind item) (emacs-reader-opds--item-url item)
+                         (emacs-reader-opds--item-label item))))
+          (unless (gethash key emacs-reader-all--seen)
+            (puthash key t emacs-reader-all--seen)
+            (push (list (cons source item)
+                        (vector (or (emacs-reader-opds--item-label item) "")
+                                (or (emacs-reader-opds--item-author item) "")
+                                (alist-get 'name source)
+                                (or (emacs-reader-opds--availability item) "打开目录"))) entries)))))
     (let ((count (length entries)))
       (setq emacs-reader-all--rows (nconc emacs-reader-all--rows (nreverse entries)))
       count)))
 
-(defun emacs-reader-all--finish (buffer task timer items err)
-  "Accept ITEMS or ERR from TASK only while TIMER belongs to BUFFER."
+(defun emacs-reader-all--finish (buffer task token items err)
+  "Accept ITEMS or ERR from TASK only while TOKEN belongs to BUFFER."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
-      (when (eq (cdr (assq task emacs-reader-all--running)) timer)
-        (cancel-timer timer)
+      (when (eq (cdr (assq task emacs-reader-all--running)) token)
+        (when (timerp token) (cancel-timer token))
         (setq emacs-reader-all--running (assq-delete-all task emacs-reader-all--running))
         (condition-case problem
-            (unless err
-              (let* ((source (emacs-reader-search-task-source task))
-                     (added (emacs-reader-all--append source items)))
-                (setf (emacs-reader-search-task-more task)
-                      (and (> added 0) (equal (alist-get 'type source) "legado")))
-                (cl-incf (emacs-reader-search-task-page task))))
+            (when (and (not err) (timerp token))
+              (setf (emacs-reader-search-task-more task)
+                    (> (emacs-reader-all--append (emacs-reader-search-task-source task) items) 0))
+              (cl-incf (emacs-reader-search-task-page task)))
           (error (setq err (error-message-string problem))))
         (setf (emacs-reader-search-task-error task) err)
         (emacs-reader-all--pump)))))
 
 (defun emacs-reader-all--start (task)
-  "Fetch one page for TASK in the current search buffer."
-  (let* ((buffer (current-buffer)) (source (emacs-reader-search-task-source task)) timer
-         (done (lambda (items err) (emacs-reader-all--finish buffer task timer items err))))
-    (setq timer (run-at-time 30 nil done nil "请求超时"))
-    (push (cons task timer) emacs-reader-all--running)
+  "Start TASK, appending catalog pages to the current result buffer."
+  (let* ((buffer (current-buffer)) (source (emacs-reader-search-task-source task))
+         (legado (equal (alist-get 'type source) "legado")) token
+         (done (lambda (items err) (emacs-reader-all--finish buffer task token items err))))
+    (setq token (if legado (run-at-time 30 nil done nil "请求超时") (list 'catalog)))
+    (push (cons task token) emacs-reader-all--running)
     (condition-case problem
-        (if (equal (alist-get 'type source) "legado")
+        (if legado
             (emacs-reader-legado-search (emacs-reader-local--plist (alist-get 'definition source))
                                         emacs-reader-all--keyword done
                                         (emacs-reader-search-task-page task))
-          (emacs-reader-catalog-results source emacs-reader-all--keyword done))
+          (setcdr token
+                  (emacs-reader-catalog-search-pages
+                   source emacs-reader-all--keyword
+                   (lambda (items)
+                     (when (buffer-live-p buffer)
+                       (with-current-buffer buffer
+                         (when (eq (cdr (assq task emacs-reader-all--running)) token)
+                           (emacs-reader-all--append source items)
+                           (emacs-reader-all--render)))))
+                   (lambda (err) (funcall done nil err)))))
       (error (funcall done nil (error-message-string problem))))))
 
 (defun emacs-reader-all--pump ()

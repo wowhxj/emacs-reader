@@ -144,5 +144,117 @@
               (should (equal imported '("Book" "A" "Open Library"))))
           (kill-buffer (current-buffer)))))))
 
+(defconst emacs-reader-catalog-test--json
+  '((type . "json") (name . "Paged") (url . "https://books.invalid/?q={query}&page={page}")
+    (definition . ((rows . "docs") (label . "title") (recordHref . "{key}")
+                   (pageSize . 1) (total . "count")))))
+
+(defun emacs-reader-catalog-test--doc (key total)
+  "Build a numbered search page with book KEY and catalog TOTAL."
+  (format "{\"count\":%d,\"docs\":[{\"title\":\"%s\",\"key\":\"/%s\"}]}" total key key))
+
+(ert-deftest emacs-reader-catalog-pages-follow-only-root-next ()
+  (let* ((home emacs-reader-catalog-test--root)
+         (first (concat home "?q=A")) (second (concat home "two"))
+         (fixtures `((,home . "<feed><link rel='search' href='?q={searchTerms}'/></feed>")
+                     (,first . "<feed><link rel='next' href='two'/><entry><title>A</title>
+<link rel='next' type='application/atom+xml' href='versions'/><link href='a.txt'
+rel='http://opds-spec.org/acquisition'/></entry></feed>")
+                     (,second . "{\"links\":[{\"rel\":\"next\",\"href\":\"/catalog/?q=A\"}],
+\"publications\":[{\"metadata\":{\"title\":\"A\"},\"links\":[{\"href\":\"a.txt\",
+\"rel\":\"http://opds-spec.org/acquisition\"},{\"href\":\"b.txt\",
+\"rel\":\"http://opds-spec.org/acquisition\"}]}]}")))
+         calls pages replies next)
+    (cl-letf (((symbol-function 'url-retrieve)
+               (lambda (url callback &rest _)
+                 (push url calls)
+                 (emacs-reader-catalog-test--respond (cdr (assoc url fixtures)) callback)))
+              ((symbol-function 'run-at-time)
+               (lambda (delay _ fn &rest args)
+                 (when (= delay emacs-reader-catalog--page-delay)
+                   (setq next (lambda () (apply fn args))))
+                 (timer-create))))
+      (emacs-reader-catalog-search-pages
+       emacs-reader-catalog-test--opds "A"
+       (lambda (items) (push (mapcar #'emacs-reader-opds--item-url items) pages))
+       (lambda (reason) (push reason replies)))
+      (should (equal calls (list first home)))
+      (funcall next)
+      (should (equal calls (list second first home)))
+      (should (equal pages (list (list (concat home "b.txt"))
+                                 (list (concat home "versions") (concat home "a.txt")))))
+      (should (equal replies '(nil))))))
+
+(ert-deftest emacs-reader-catalog-pages-repeat-and-late-failure ()
+  (dolist (second '(repeated failure))
+    (let (next calls pages replies)
+      (cl-letf (((symbol-function 'url-retrieve)
+                 (lambda (url callback &rest _)
+                   (push url calls)
+                   (if (and (eq second 'failure) (cdr calls)) (error "Offline")
+                     (emacs-reader-catalog-test--respond
+                      (emacs-reader-catalog-test--doc "A" 99999) callback))))
+                ((symbol-function 'run-at-time)
+                 (lambda (delay _ fn &rest args)
+                   (when (= delay emacs-reader-catalog--page-delay)
+                     (setq next (lambda () (apply fn args))))
+                   (timer-create))))
+        (emacs-reader-catalog-search-pages
+         emacs-reader-catalog-test--json "needle"
+         (lambda (items) (push (mapcar #'emacs-reader-opds--item-label items) pages))
+         (lambda (reason) (push reason replies)))
+        (funcall next)
+        (funcall next)
+        (should (= 2 (length calls)))
+        (should (equal (apply #'append pages) '("A")))
+        (should (= (length replies) 1))
+        (should (string-match-p (if (eq second 'failure) "Offline" "重复") (car replies)))))))
+
+(ert-deftest emacs-reader-catalog-single-source-preserves-window-and-stops ()
+  (save-window-excursion
+    (let (next calls late response books)
+      (cl-letf (((symbol-function 'url-retrieve)
+                 (lambda (url callback &rest _)
+                   (push url calls)
+                   (if (string-suffix-p "page=3" url)
+                       (progn (setq late callback)
+                              (setq response (generate-new-buffer " *catalog pending*")))
+                     (emacs-reader-catalog-test--respond
+                      (emacs-reader-catalog-test--doc (number-to-string (length calls)) 3)
+                      callback))))
+                ((symbol-function 'run-at-time)
+                 (lambda (delay _ fn &rest args)
+                   (when (= delay emacs-reader-catalog--page-delay)
+                     (setq next (lambda () (apply fn args))))
+                   (timer-create))))
+        (unwind-protect
+            (progn
+              (emacs-reader-json-catalog-search emacs-reader-catalog-test--json "first")
+              (push (current-buffer) books)
+              (goto-char (button-start (next-button (point-min))))
+              (let* ((win (selected-window)) (pos (point)) (start (window-start win))
+                     (other (split-window)))
+                (select-window other)
+                (switch-to-buffer (get-buffer-create "*scratch*"))
+                (funcall next)
+                (should (eq other (selected-window)))
+                (should (eq (window-buffer win) (car books)))
+                (should (= pos (window-point win)))
+                (should (= start (window-start win)))
+                (with-current-buffer (car books)
+                  (should (string-search "2 条" header-line-format))))
+              (funcall next)
+              (should (buffer-live-p response))
+              (emacs-reader-json-catalog-search emacs-reader-catalog-test--json "second")
+              (push (current-buffer) books)
+              (should-not (buffer-live-p response))
+              (emacs-reader-catalog-test--respond (emacs-reader-catalog-test--doc "late" 4) late)
+              (with-current-buffer (cadr books)
+                (should (= 2 (length (cdar emacs-reader-opds--history)))))
+              (quit-window)
+              (funcall next)
+              (should (= 4 (length calls))))
+          (dolist (buffer books) (when (buffer-live-p buffer) (kill-buffer buffer))))))))
+
 (provide 'emacs-reader-catalog-search-test)
 ;;; emacs-reader-catalog-search-test.el ends here
