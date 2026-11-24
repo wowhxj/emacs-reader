@@ -124,6 +124,12 @@
       (when (file-exists-p path) (delete-file path))
       (delete-directory emacs-reader-directory t))))
 
+(ert-deftest emacs-reader-local-interactive-import-uses-worker ()
+  (cl-letf (((symbol-function 'read-file-name) (lambda (&rest _) "picked.epub"))
+            ((symbol-function 'emacs-reader-import-file-async) #'list))
+    (should (equal (call-interactively #'emacs-reader-import-file)
+                   '("picked.epub" nil nil nil)))))
+
 (ert-deftest emacs-reader-local-epub-picker-ignores-stale-callbacks ()
   (let (callbacks chosen)
     (save-window-excursion

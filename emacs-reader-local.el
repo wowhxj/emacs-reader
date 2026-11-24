@@ -173,10 +173,11 @@ TEMPORARY input until close.  The caller owns it if opening signals."
                (with-current-buffer buffer (emacs-reader-local--choose-epub choices))))))))))
 
 ;;;###autoload
-(defun emacs-reader-import-file (path &optional title author origin)
-  "Copy an EPUB or TXT at PATH to the local shelf with TITLE, AUTHOR and ORIGIN."
-  (interactive "f导入 EPUB 或 TXT：")
-  (if (called-interactively-p 'interactive)
+(defun emacs-reader-import-file (path &optional title author origin background)
+  "Import PATH with TITLE, AUTHOR and ORIGIN.  With BACKGROUND, return a worker.
+Interactive imports run in the background.  Lisp callers normally receive a book."
+  (interactive (list (read-file-name "导入 EPUB 或 TXT：" nil nil t) nil nil nil t))
+  (if background
       (emacs-reader-import-file-async path title author origin)
     (prog1 (emacs-reader-local--add
             (emacs-reader-local--prepare-import path title author origin emacs-reader-directory))
