@@ -501,7 +501,7 @@ HEADER also permits an equals sign between a quoted header name and its value."
                     (encode-coding-string value 'utf-8)) result)))
     result))
 
-(defun emacs-reader-legado--response (status &optional fallback)
+(defun emacs-reader-legado--response-body (status &optional fallback)
   "Decode the HTTP response for STATUS, using FALLBACK if charset is absent."
   (cond ((and (integerp url-http-response-status) (not (<= 200 url-http-response-status 299)))
          (if (= url-http-response-status 403) (error "HTTP 403：书源站点拒绝了搜索或阅读请求")
@@ -521,8 +521,31 @@ HEADER also permits an equals sign between a quoted header name and its value."
                                      (if (and charset (coding-system-p charset)) charset
                                        (or fallback 'utf-8)))))
     (when (string-blank-p body) (error "书源返回了空正文"))
-    (condition-case nil (emacs-reader-legado--parse body)
-      (json-error (error "书源响应正文不是有效的 JSON")))))
+    body))
+
+(defun emacs-reader-legado--document (body)
+  "Parse decoded response BODY and report malformed JSON."
+  (condition-case nil (emacs-reader-legado--parse body)
+    (json-error (error "书源响应正文不是有效的 JSON"))))
+
+(defun emacs-reader-legado--response (status &optional fallback)
+  "Parse the HTTP response for STATUS with optional FALLBACK charset."
+  (emacs-reader-legado--document (emacs-reader-legado--response-body status fallback)))
+
+(autoload 'emacs-reader-legado-worker-run "emacs-reader-legado-worker")
+
+(defvar emacs-reader-legado--worker-bytes 16384
+  "Minimum decoded response size for parsing reading rules in a subprocess.")
+
+(defun emacs-reader-legado--compute (function args bytes callback)
+  "Apply FUNCTION to ARGS and deliver value/error to CALLBACK.
+Use a local process when BYTES reaches the reading worker threshold."
+  (if (>= bytes emacs-reader-legado--worker-bytes)
+      (emacs-reader-legado-worker-run function args callback)
+    (let (value message)
+      (condition-case err (setq value (apply function args))
+        (error (setq message (error-message-string err))))
+      (funcall callback value message))))
 
 (defun emacs-reader-legado--origin (address)
   "Return normalized HTTP scheme, host and effective port for ADDRESS."
@@ -547,9 +570,10 @@ For a JSON body, escape string values for insertion in serialized JSON."
            (pcase token ("{{key}}" key) ("{{page}}" page) ("{{page-1}}" index) (_ base-value)))
          text t t)))))
 
-(defun emacs-reader-legado--fetch (source target base callback &optional search)
+(defun emacs-reader-legado--fetch (source target base callback &optional search projection)
   "Fetch TARGET relative to BASE for SOURCE using optional SEARCH substitutions.
-Call CALLBACK with DOC, final URL, ERROR and the originally requested URL."
+Call CALLBACK with DOC, final URL, ERROR and the originally requested URL.
+With PROJECTION, deliver the extracted reading data in place of DOC."
   (let (delivered)
     (condition-case err
         (let* ((parts (emacs-reader-legado--request-parts target search))
@@ -605,16 +629,20 @@ Call CALLBACK with DOC, final URL, ERROR and the originally requested URL."
              url (lambda (status)
                    (let ((buffer (current-buffer))
                          (final (if url-current-object (url-recreate-url url-current-object) url))
-                         doc message)
+                         body message)
                      (unwind-protect
                          (condition-case problem
                              (if (and credentials (<= 300 (or url-http-response-status 0) 399))
                                  (error "带凭据的书源请求禁止自动重定向")
-                               (setq doc (emacs-reader-legado--response status charset)))
+                               (setq body (emacs-reader-legado--response-body status charset)))
                            (error (setq message (error-message-string problem))))
                        (kill-buffer buffer))
                      (setq delivered t)
-                     (funcall callback doc final message url)))
+                     (if message (funcall callback nil final message url)
+                       (emacs-reader-legado--compute
+                        #'emacs-reader-legado--project (list body final projection)
+                        (if projection (string-bytes body) 0)
+                        (lambda (value failure) (funcall callback value final failure url))))))
              nil t t)))
       (error (if delivered (signal (car err) (cdr err))
                (funcall callback nil nil (error-message-string err) nil))))))
@@ -799,33 +827,65 @@ Pass SEARCH to `emacs-reader-legado--fetch' for search substitutions."
                        (pcase (gethash "free" (cdr row))
                          ('t '(:access free)) (:false '(:access paid))))))))))))
 
-(defun emacs-reader-legado--pages (source target first-doc next-rule read-page callback)
-  "Collect lists from READ-PAGE, following NEXT-RULE in SOURCE.
-Start at TARGET with optional FIRST-DOC and call CALLBACK with the complete list."
+(defun emacs-reader-legado--page (doc url projection)
+  "Apply reading PROJECTION to DOC at URL and return (items . next-links)."
+  (pcase-let* ((`(,kind ,source ,bindings) projection)
+               (catalog (eq kind 'catalog))
+               (rules (plist-get source (if catalog :ruleToc :ruleContent)))
+               (next (plist-get rules (if catalog :nextTocUrl :nextContentUrl))))
+    (cons (if catalog (emacs-reader-legado--catalog source doc url bindings)
+            (emacs-reader-legado--content-page doc url source rules))
+          (when (and next (not (equal next "")))
+            (mapcar (lambda (value) (emacs-reader-legado--url value url))
+                    (emacs-reader-legado--values doc next))))))
+
+(defun emacs-reader-legado--project (body url projection)
+  "Parse BODY and apply optional reading PROJECTION at URL."
+  (let ((doc (emacs-reader-legado--document body)))
+    (pcase projection
+      ('nil doc)
+      (`(single-content ,source)
+       (let ((rules (plist-get source :ruleContent)))
+         (emacs-reader-legado--finish-content
+          (emacs-reader-legado--content-page doc url source rules)
+          (plist-get rules :replaceRegex))))
+      (`(detail ,source ,toc ,needs-vars)
+       (let* ((rules (plist-get source :ruleBookInfo))
+              (toc-rule (plist-get rules :tocUrl))
+              (target (or toc (and toc-rule (not (equal toc-rule ""))
+                                   (plist-get (emacs-reader-legado--info doc url nil rules)
+                                              :tocUrl))
+                          url))
+              (bindings (and needs-vars (emacs-reader-legado--book-bindings doc rules)))
+              (catalog (list 'catalog source bindings)))
+         (list target catalog
+               (and (equal target url) (emacs-reader-legado--page doc url catalog)))))
+      (_ (emacs-reader-legado--page doc url projection)))))
+
+(defun emacs-reader-legado--pages (source target first-page projection callback)
+  "Collect pages from SOURCE at TARGET using PROJECTION, then call CALLBACK.
+Reuse FIRST-PAGE when details and catalog share a URL."
   (let ((seen (make-hash-table :test #'equal)) pieces pending)
     (cl-labels
-        ((consume (doc url message &optional _requested)
+        ((consume (page url message &optional _requested)
            (let (next)
              (unless message
                (condition-case err
                    (progn
                      (when (gethash url seen) (error "书源分页链接循环 %s" url))
                      (puthash url t seen)
-                     (push (funcall read-page doc url) pieces)
-                     (when (and next-rule (not (equal next-rule "")))
-                       (let (links)
-                         (dolist (value (emacs-reader-legado--values doc next-rule))
-                           (let ((link (emacs-reader-legado--url value url)))
-                             (when (gethash link seen) (error "书源分页链接循环 %s" link))
-                             (push link links)))
-                         (setq pending (delete-dups (append (nreverse links) pending)))))
-                     (setq next (pop pending)))
+                     (push (car page) pieces)
+                     (dolist (link (cdr page))
+                       (when (gethash link seen) (error "书源分页链接循环 %s" link)))
+                     (setq pending (delete-dups (append (cdr page) pending))
+                           next (pop pending)))
                  (error (setq message (error-message-string err)))))
              (cond (message (funcall callback nil message))
-                   (next (emacs-reader-legado--fetch source next url #'consume))
-                   (t (funcall callback (apply #'append (nreverse pieces)) nil))))))
-      (if first-doc (consume first-doc target nil)
-        (emacs-reader-legado--fetch source target (plist-get source :bookSourceUrl) #'consume)))))
+                   (next (emacs-reader-legado--fetch source next url #'consume nil projection))
+                   (t (funcall callback (apply #'nconc (nreverse pieces)) nil))))))
+      (if first-page (consume first-page target nil)
+        (emacs-reader-legado--fetch source target (plist-get source :bookSourceUrl)
+                                    #'consume nil projection)))))
 
 (defun emacs-reader-legado-chapters (source book callback)
   "Read BOOK's catalog from SOURCE; call CALLBACK with chapters/error."
@@ -835,27 +895,20 @@ Start at TARGET with optional FIRST-DOC and call CALLBACK with the complete list
 
 (defun emacs-reader-legado--chapters-rules (source book callback)
   "Read BOOK's catalog from SOURCE; call CALLBACK with chapters/error."
-  (let ((toc (plist-get book :tocUrl))
-        (next (plist-get (plist-get source :ruleToc) :nextTocUrl))
-        (needs-vars (string-search "@get:{"
-                                   (or (plist-get (plist-get source :ruleToc) :chapterUrl) "")))
-        bindings)
-    (let ((read-page (lambda (doc url) (emacs-reader-legado--catalog source doc url bindings))))
-      (if (and toc (not needs-vars))
-          (emacs-reader-legado--pages source toc nil next read-page callback)
-        (emacs-reader-legado--map-page
-         source (plist-get book :bookUrl) (plist-get source :bookSourceUrl)
-         (lambda (value message)
-           (if message (funcall callback nil message)
-             (emacs-reader-legado--pages source (car value) (cdr value) next read-page callback)))
-         (lambda (doc url _requested)
-           (let* ((rules (plist-get source :ruleBookInfo))
-                  (toc-rule (plist-get rules :tocUrl))
-                  (target (if (and toc-rule (not (equal toc-rule "")))
-                              (plist-get (emacs-reader-legado--info doc url book rules) :tocUrl)
-                            url)))
-             (when needs-vars (setq bindings (emacs-reader-legado--book-bindings doc rules)))
-             (cons (or toc target) (and (equal (or toc target) url) doc)))))))))
+  (let* ((toc (plist-get book :tocUrl))
+         (toc-rules (plist-get source :ruleToc))
+         (needs-vars (string-search "@get:{" (or (plist-get toc-rules :chapterUrl) "")))
+         (rules (list :bookSourceUrl (plist-get source :bookSourceUrl)
+                      :ruleToc toc-rules :ruleBookInfo (plist-get source :ruleBookInfo))))
+    (if (and toc (not needs-vars))
+        (emacs-reader-legado--pages source toc nil (list 'catalog rules nil) callback)
+      (emacs-reader-legado--fetch
+       source (plist-get book :bookUrl) (plist-get source :bookSourceUrl)
+       (lambda (value _url message _requested)
+         (if message (funcall callback nil message)
+           (pcase-let ((`(,target ,catalog ,page) value))
+             (emacs-reader-legado--pages source target page catalog callback))))
+       nil (list 'detail rules toc needs-vars)))))
 
 (defun emacs-reader-legado-content (source chapter callback)
   "Read CHAPTER from SOURCE; call CALLBACK with its text/error."
@@ -872,36 +925,47 @@ Start at TARGET with optional FIRST-DOC and call CALLBACK with the complete list
                              (split-string lines "\n") "\n")))
     (string-trim (replace-regexp-in-string "\n\n\n+" "\n\n" trimmed))))
 
+(defun emacs-reader-legado--content-page (doc url source rules)
+  "Extract text fragments from one DOC at URL for SOURCE under RULES."
+  (when (and (equal (plist-get source :bookSourceUrl) "https://ts.txs12.com/")
+             (string-prefix-p "https://res.txs12.com/" url)
+             (eq (car doc) 'json)
+             (when-let* ((body (car (emacs-reader-legado--json-values
+                                     (cdr doc) "$.chapter.body"))))
+               (and (stringp body) (< (length body) 500)
+                    (string-match-p "当前版本过低，已停止使用" body))))
+    (error "听小说正文接口提示「当前版本过低，已停止使用」，未返回本章正文"))
+  (or (emacs-reader-legado--values doc (plist-get rules :content))
+      (error "正文规则未提取到文本")))
+
+(defun emacs-reader-legado--finish-content (parts regex)
+  "Join chapter PARTS and apply optional replacement REGEX."
+  (let ((joined (string-join parts "\n")))
+    (when (and regex (not (equal regex "")))
+      (unless (and (stringp regex) (string-prefix-p "##" regex))
+        (emacs-reader-legado--unsupported regex))
+      (setq joined (car (emacs-reader-legado--values (cons 'json joined) (concat "$" regex)))))
+    (let ((text (emacs-reader-legado--clean-content (or joined ""))))
+      (when (string-empty-p text) (error "正文规则未提取到文本"))
+      text)))
+
 (defun emacs-reader-legado--content-rules (source chapter callback)
   "Read CHAPTER from SOURCE; call CALLBACK with its text/error."
-  (let ((rules (plist-get source :ruleContent)))
-    (emacs-reader-legado--pages
-     source (plist-get chapter :url) nil (plist-get rules :nextContentUrl)
-     (lambda (doc url)
-       (when (and (equal (plist-get source :bookSourceUrl) "https://ts.txs12.com/")
-                  (string-prefix-p "https://res.txs12.com/" url)
-                  (eq (car doc) 'json)
-                  (when-let* ((body (car (emacs-reader-legado--json-values
-                                          (cdr doc) "$.chapter.body"))))
-                    (and (stringp body) (< (length body) 500)
-                         (string-match-p "当前版本过低，已停止使用" body))))
-         (error "听小说正文接口提示「当前版本过低，已停止使用」，未返回本章正文"))
-       (or (emacs-reader-legado--values doc (plist-get rules :content))
-           (error "正文规则未提取到文本")))
-     (lambda (parts message)
-       (let (text)
-         (unless message
-           (condition-case err
-               (let ((joined (string-join parts "\n")) (regex (plist-get rules :replaceRegex)))
-                 (when (and regex (not (equal regex "")))
-                   (unless (and (stringp regex) (string-prefix-p "##" regex))
-                     (emacs-reader-legado--unsupported regex))
-                   (setq joined (car (emacs-reader-legado--values (cons 'json joined)
-                                                                  (concat "$" regex)))))
-                 (setq text (emacs-reader-legado--clean-content (or joined "")))
-                 (when (string-empty-p text) (error "正文规则未提取到文本")))
-             (error (setq text nil message (error-message-string err)))))
-         (funcall callback text message))))))
+  (let* ((rules (plist-get source :ruleContent))
+         (reader (list :bookSourceUrl (plist-get source :bookSourceUrl) :ruleContent rules))
+         (target (plist-get chapter :url)))
+    (if (member (plist-get rules :nextContentUrl) '(nil ""))
+        (emacs-reader-legado--fetch
+         source target (plist-get source :bookSourceUrl)
+         (lambda (value _url message _request) (funcall callback value message))
+         nil (list 'single-content reader))
+      (emacs-reader-legado--pages
+       source target nil (list 'content reader nil)
+       (lambda (parts message)
+         (if message (funcall callback nil message)
+           (emacs-reader-legado--compute
+            #'emacs-reader-legado--finish-content (list parts (plist-get rules :replaceRegex))
+            (cl-loop for part in parts sum (string-bytes part)) callback)))))))
 
 (provide 'emacs-reader-legado)
 ;;; emacs-reader-legado.el ends here
