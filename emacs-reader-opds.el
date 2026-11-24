@@ -20,7 +20,9 @@
 (require 'url-http)
 (require 'xml)
 
-(autoload 'emacs-reader-preview-file "emacs-reader")
+(autoload 'emacs-reader-preview-file-async "emacs-reader-local")
+(autoload 'emacs-reader-import-file-async "emacs-reader-local")
+(defvar emacs-reader--background-preview)
 (autoload 'emacs-reader-import-file "emacs-reader-local")
 
 (cl-defstruct (emacs-reader-opds--item (:constructor emacs-reader-opds--item))
@@ -450,6 +452,7 @@ preserves raw response bytes for acquisition."
 (defun emacs-reader-opds--download (item &optional add)
   "Download ITEM for preview, or import it when ADD is non-nil."
   (let ((ext (emacs-reader-opds--item-extension item))
+        (window (selected-window))
         (title (emacs-reader-opds--item-title item))
         (author (emacs-reader-opds--item-author item))
         (origin (if (string-prefix-p "https://gutenberg.pglaf.org/cache/epub/"
@@ -472,8 +475,17 @@ preserves raw response bytes for acquisition."
            (when path (delete-file path)))))
      (lambda (path)
        (unwind-protect
-           (if add (emacs-reader-import-file path title author origin)
-             (emacs-reader-preview-file path title author origin t)
+           (progn
+             (if add
+                 (emacs-reader-import-file-async
+                  path title author origin
+                  (lambda (_book err) (when err (message "加入书架失败：%s" err))) t)
+               (let* ((emacs-reader--background-preview
+                       (not (and (eq window (selected-window))
+                                 (eq (current-buffer) (window-buffer window)))))
+                      (reader (emacs-reader-preview-file-async path title author origin t)))
+                 (when (and emacs-reader--background-preview (buffer-live-p reader))
+                   (message "试读已在后台打开：%s" (buffer-name reader)))))
              (setq path nil))
          (when (and path (file-exists-p path)) (delete-file path)))) t)))
 

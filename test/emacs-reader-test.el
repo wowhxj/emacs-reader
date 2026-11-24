@@ -20,6 +20,19 @@
     (process-send-string process emacs-reader-test--http-response)
     (process-send-eof process)))
 
+(ert-deftest emacs-reader-background-preview-preserves-selected-window ()
+  (let ((emacs-reader--background-preview t)
+        (original (window-buffer (selected-window))) loaded reader)
+    (unwind-protect
+        (cl-letf (((symbol-function 'emacs-reader--load-catalog)
+                   (lambda () (setq loaded (current-buffer))))
+                  ((symbol-function 'emacs-reader--display-buffer)
+                   (lambda (&rest _) (ert-fail "后台试读不应切换窗口"))))
+          (setq reader (emacs-reader-open-book '((name . "后台书") (bookUrl . "book")) t))
+          (should (eq loaded reader))
+          (should (eq original (window-buffer (selected-window)))))
+      (when (buffer-live-p reader) (kill-buffer reader)))))
+
 (ert-deftest emacs-reader-server-url-allows-http-by-default ()
   (let ((emacs-reader-server-url "http://reader.example:8084"))
     (should emacs-reader-allow-insecure-http)

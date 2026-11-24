@@ -990,17 +990,31 @@ Create the tab if necessary; otherwise reuse it."
     (when (yes-or-no-p (format "将《%s》加入书架？ "
                                (emacs-reader--book-field book 'name)))
       (if (alist-get 'readerType book)
-          (progn
-            (setq book (if (alist-get 'previewFile book)
-                           (emacs-reader-import-file
-                            (alist-get 'bookUrl book) (alist-get 'name book)
-                            (alist-get 'author book) (alist-get 'originName book))
-                         (emacs-reader-local--add book)))
-            (when (derived-mode-p 'emacs-reader-reading-mode)
-              (setq emacs-reader--current-book book emacs-reader--preview-p nil)
-              (when (integerp emacs-reader--current-chapter-index)
-                (emacs-reader--save-local-progress emacs-reader--current-chapter-index)))
-            (message "已加入本地书架"))
+          (let* ((buffer (current-buffer))
+                 (complete
+                  (lambda (saved err)
+                    (if err (message "加入书架失败：%s" err)
+                      (when (buffer-live-p buffer)
+                        (with-current-buffer buffer
+                          (when (and (derived-mode-p 'emacs-reader-reading-mode)
+                                     (eq emacs-reader--current-book book))
+                            (setq emacs-reader--current-book saved emacs-reader--preview-p nil)
+                            (when (integerp emacs-reader--current-chapter-index)
+                              (emacs-reader--save-local-progress
+                               emacs-reader--current-chapter-index)))))
+                      (message "已加入本地书架")))))
+            (if (alist-get 'previewFile book)
+                (let ((release (emacs-reader-local--retain-preview-file)))
+                  (condition-case err
+                      (emacs-reader-import-file-async
+                       (alist-get 'bookUrl book)
+                       (unless (alist-get 'readFileTitle book) (alist-get 'name book))
+                       (unless (alist-get 'readFileAuthor book) (alist-get 'author book))
+                       (alist-get 'originName book)
+                       (lambda (saved failure)
+                         (unwind-protect (funcall complete saved failure) (funcall release))))
+                    (error (funcall release) (signal (car err) (cdr err)))))
+              (funcall complete (emacs-reader-local--add book) nil)))
         (emacs-reader--reader3-request
          "saveBook" "POST" book
          (lambda (response)
@@ -1012,6 +1026,9 @@ Create the tab if necessary; otherwise reuse it."
                    (when (buffer-live-p shelf)
                      (with-current-buffer shelf (emacs-reader-shelf-refresh)))))
              (message "加入书架失败；可重试，未确认保存成功"))))))))
+
+(defvar emacs-reader--background-preview nil
+  "Open a completed download without changing the selected window when non-nil.")
 
 (defun emacs-reader-open-book (book &optional preview)
   "Open BOOK in a native text-reading buffer.
@@ -1033,9 +1050,10 @@ Local shelf books resume and save their current chapter."
         (setq-local emacs-reader--current-book book
                     emacs-reader--preview-p preview
                     emacs-reader--preview-start-pending (or preview (alist-get 'readerType book))))
-      (emacs-reader--display-buffer buffer)
-      (unless (or preview (alist-get 'readerType book)) (emacs-reader--load-chapter chapter))
-      (emacs-reader--load-catalog)
+      (unless emacs-reader--background-preview (emacs-reader--display-buffer buffer))
+      (with-current-buffer buffer
+        (unless (or preview (alist-get 'readerType book)) (emacs-reader--load-chapter chapter))
+        (emacs-reader--load-catalog))
       buffer)))
 
 (define-derived-mode emacs-reader-reading-mode special-mode "Reader"
@@ -1068,15 +1086,13 @@ Local shelf books resume and save their current chapter."
   "Return CONTENT as indented paragraphs separated by blank lines.
 Server lines broken mid-sentence are joined; surrounding spaces, including
 full-width U+3000 indents, are normalized."
-  (let (paragraphs)
+  (let (pieces new-paragraph)
     (dolist (line (split-string content "\r?\n" t "[ \t\u3000\u00a0]+"))
-      ;; ponytail: punctuation heuristic; a title line without punctuation merges too.
-      (if (and paragraphs
-               (not (string-match-p "[。！？!?…”’」』）)]\\'" (car paragraphs))))
-          (setcar paragraphs (concat (car paragraphs) line))
-        (push line paragraphs)))
-    (mapconcat (lambda (paragraph) (concat "\u3000\u3000" paragraph))
-               (nreverse paragraphs) "\n\n")))
+      (cond ((null pieces) (push "\u3000\u3000" pieces))
+            (new-paragraph (push "\n\n\u3000\u3000" pieces)))
+      (push line pieces)
+      (setq new-paragraph (string-match-p "[。！？!?…”’」』）)]\\'" line)))
+    (mapconcat #'identity (nreverse pieces) "")))
 
 (defun emacs-reader-scroll-half-up ()
   "Scroll the text up by half a window."
@@ -1552,7 +1568,9 @@ Resume speech if SPEECH-GENERATION is still active.  With AT-END, show the end."
         (unless (and (stringp url) (not (string-empty-p url)))
           (user-error "No Reader book is open"))
         (emacs-reader--clear-recovery)
-        (setq emacs-reader--catalog-loading request)
+        (setq emacs-reader--catalog-loading request
+               mode-line-process " 正在加载目录…")
+         (force-mode-line-update)
         (emacs-reader--request-catalog
          emacs-reader--current-book
          (lambda (response)
@@ -1561,7 +1579,7 @@ Resume speech if SPEECH-GENERATION is still active.  With AT-END, show the end."
                (when (and (derived-mode-p 'emacs-reader-reading-mode)
                           (eq request emacs-reader--catalog-loading)
                           (equal url (alist-get 'bookUrl emacs-reader--current-book)))
-                 (setq emacs-reader--catalog-loading nil)
+                 (setq emacs-reader--catalog-loading nil mode-line-process nil)
                  (let* ((json (plist-get response :ok))
                         (chapters (and (listp json) (eq (alist-get 'isSuccess json) t)
                                        (alist-get 'data json)))

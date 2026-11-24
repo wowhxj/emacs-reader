@@ -116,12 +116,15 @@ with zipfile.ZipFile(sys.argv[1]) as book:
   "Return a plist with :title and optional :author for local book PATH."
   (if (equal (emacs-reader-files--format path) "txt")
       (list :title (file-name-base path))
-    (let* ((meta (car (dom-by-tag (cdr (emacs-reader-files--package path))
-                                  'metadata)))
-           (title (string-trim (emacs-reader-files--text (car (dom-by-tag meta 'title)))))
-           (author (string-trim (emacs-reader-files--text (car (dom-by-tag meta 'creator))))))
-      (append (list :title (if (string-empty-p title) (file-name-base path) title))
-              (unless (string-empty-p author) (list :author author))))))
+    (emacs-reader-files--epub-metadata path (cdr (emacs-reader-files--package path)))))
+
+(defun emacs-reader-files--epub-metadata (path doc)
+  "Read metadata for PATH from package document DOC."
+  (let* ((meta (car (dom-by-tag doc 'metadata)))
+         (title (string-trim (emacs-reader-files--text (car (dom-by-tag meta 'title)))))
+         (author (string-trim (emacs-reader-files--text (car (dom-by-tag meta 'creator))))))
+    (append (list :title (if (string-empty-p title) (file-name-base path) title))
+            (unless (string-empty-p author) (list :author author)))))
 
 (defun emacs-reader-files--labels (path package items)
   "Index chapter labels of EPUB PATH from PACKAGE and manifest ITEMS."
@@ -155,19 +158,31 @@ with zipfile.ZipFile(sys.argv[1]) as book:
   "Return the chapters of local book PATH as plists with :title and :url."
   (if (equal (emacs-reader-files--format path) "txt")
       (emacs-reader-files--txt-chapters path)
-    (pcase-let* ((`(,package . ,doc) (emacs-reader-files--package path))
-                 (items (dom-by-tag (car (dom-by-tag doc 'manifest)) 'item))
-                 (manifest (make-hash-table :test #'equal))
-                 (labels (emacs-reader-files--labels path package items))
-                 (chapters nil))
-      (dolist (item items) (puthash (dom-attr item 'id) item manifest))
-      (dolist (ref (dom-by-tag (car (dom-by-tag doc 'spine)) 'itemref))
-        (let ((item (gethash (dom-attr ref 'idref) manifest)))
-          (when (member (dom-attr item 'media-type) '("application/xhtml+xml" "text/html"))
-            (let ((member (emacs-reader-files--resource (dom-attr item 'href) package)))
-              (push (list :title (or (gethash member labels) (file-name-base member))
-                          :url member) chapters)))))
-      (or (nreverse chapters) (user-error "EPUB has no readable chapters")))))
+    (emacs-reader-files--epub-chapters path (emacs-reader-files--package path))))
+
+(defun emacs-reader-files--inspect (path)
+  "Return (METADATA CHAPTERS) for PATH after reading its package once."
+  (if (equal (emacs-reader-files--format path) "txt")
+      (list (list :title (file-name-base path)) (emacs-reader-files--txt-chapters path))
+    (let ((package (emacs-reader-files--package path)))
+      (list (emacs-reader-files--epub-metadata path (cdr package))
+            (emacs-reader-files--epub-chapters path package)))))
+
+(defun emacs-reader-files--epub-chapters (path package-document)
+  "Return chapters of PATH using PACKAGE-DOCUMENT."
+  (pcase-let* ((`(,package . ,doc) package-document)
+               (items (dom-by-tag (car (dom-by-tag doc 'manifest)) 'item))
+               (manifest (make-hash-table :test #'equal))
+               (labels (emacs-reader-files--labels path package items))
+               (chapters nil))
+    (dolist (item items) (puthash (dom-attr item 'id) item manifest))
+    (dolist (ref (dom-by-tag (car (dom-by-tag doc 'spine)) 'itemref))
+      (let ((item (gethash (dom-attr ref 'idref) manifest)))
+        (when (member (dom-attr item 'media-type) '("application/xhtml+xml" "text/html"))
+          (let ((member (emacs-reader-files--resource (dom-attr item 'href) package)))
+            (push (list :title (or (gethash member labels) (file-name-base member))
+                        :url member) chapters)))))
+    (or (nreverse chapters) (user-error "EPUB has no readable chapters"))))
 
 (defun emacs-reader-files--render (node)
   "Insert plain text for HTML NODE, preserving paragraph and line breaks."

@@ -22,6 +22,8 @@
   "Bookshelf and search backend used by Reader commands."
   :type '(choice (const local) (const reader3)) :group 'emacs-reader-local)
 
+(autoload 'emacs-reader-file-worker-start "emacs-reader-file-worker")
+(autoload 'emacs-reader-files--inspect "emacs-reader-files")
 (autoload 'emacs-reader-files-chapters "emacs-reader-files")
 (autoload 'emacs-reader-files-content "emacs-reader-files")
 (autoload 'emacs-reader-files-metadata "emacs-reader-files")
@@ -94,69 +96,136 @@
 
 (declare-function emacs-reader-open-book "emacs-reader")
 
-(defun emacs-reader-preview-file (path &optional title author origin temporary)
-  "Preview PATH with TITLE, AUTHOR and ORIGIN.  Own TEMPORARY files until close."
+(defvar emacs-reader-local--sync-preview nil)
+(defvar emacs-reader--current-book)
+(defvar-local emacs-reader-local--retain-file nil)
+
+(defun emacs-reader-local--retain-preview-file ()
+  "Keep this preview's source available until the returned function is called."
+  (if emacs-reader-local--retain-file (funcall emacs-reader-local--retain-file) #'ignore))
+
+(defun emacs-reader-local--own-preview (path)
+  "Release temporary PATH once its preview and outstanding imports finish."
+  (let ((users 0))
+    (setq-local emacs-reader-local--retain-file
+                (lambda ()
+                  (cl-incf users)
+                  (let ((active t))
+                    (lambda ()
+                      (when active
+                        (setq active nil)
+                        (when (and (zerop (cl-decf users)) (file-exists-p path))
+                          (delete-file path)))))))
+    (let ((release (emacs-reader-local--retain-preview-file)))
+      (add-hook 'kill-buffer-hook release nil t)
+      (add-hook 'change-major-mode-hook release nil t))))
+
+(defun emacs-reader-preview-file-async (path &optional title author origin temporary)
+  "Open PATH immediately and parse its metadata and chapters in the background.
+TITLE, AUTHOR and ORIGIN override book metadata.  A returned preview owns
+TEMPORARY input until close.  The caller owns it if opening signals."
   (setq path (expand-file-name path))
   (unless (and (not (file-remote-p path)) (file-regular-p path)
                (member (downcase (or (file-name-extension path) "")) '("epub" "txt")))
     (user-error "请选择本地 EPUB 或 TXT 文件"))
-  (let* ((meta (emacs-reader-files-metadata path))
-         (book `((readerType . "file") (previewFile . t) (bookUrl . ,path) (origin . "file")
-                 (name . ,(or title (plist-get meta :title) (file-name-base path)))
-                 (author . ,(or author (plist-get meta :author) ""))
-                 (originName . ,(or origin "本地文件"))))
+  (let* ((book `((readerType . "file") (previewFile . t) (bookUrl . ,path) (origin . "file")
+                 (name . ,(or title (file-name-base path))) (author . ,(or author ""))
+                 (originName . ,(or origin "本地文件"))
+                 (readFileTitle . ,(null title)) (readFileAuthor . ,(null author))))
          (buffer (emacs-reader-open-book book t)))
-    (when temporary
-      (with-current-buffer buffer
-        (let ((cleanup (lambda () (when (file-exists-p path) (delete-file path)))))
-          (add-hook 'kill-buffer-hook cleanup nil t)
-          (add-hook 'change-major-mode-hook cleanup nil t))))
+    (when temporary (with-current-buffer buffer (emacs-reader-local--own-preview path)))
     buffer))
+
+(defun emacs-reader-preview-file (path &optional title author origin temporary)
+  "Synchronously preview PATH with TITLE, AUTHOR, ORIGIN and TEMPORARY ownership."
+  (let ((emacs-reader-local--sync-preview t)
+        (meta (emacs-reader-files-metadata path)))
+    (emacs-reader-preview-file-async path (or title (plist-get meta :title))
+                                     (or author (plist-get meta :author) "") origin temporary)))
+
+(defvar emacs-reader-local--picker-request nil)
+
+(defun emacs-reader-local--choose-epub (choices)
+  "Open the EPUB selected from labelled CHOICES or the file browser."
+  (let* ((other "选择其他 EPUB 文件…")
+         (choice (when choices
+                   (completing-read "试读本地版本：" (append choices (list (list other))) nil t)))
+         (file (or (cdr (assoc choice choices)) (read-file-name "选择要试读的 EPUB：" nil nil t))))
+    (emacs-reader-preview-file-async file)))
 
 ;;;###autoload
 (defun emacs-reader-preview-epub (file)
-  "Preview local EPUB FILE without adding it to the shelf."
-  (interactive
-   (list
-    (let* ((dir (expand-file-name "~/Library/Application Support/com.yzfly.lightread/books/"))
-           (files (when (file-directory-p dir) (directory-files dir t "\\.epub\\'")))
-           (other "选择其他 EPUB 文件…")
-           (choices (cl-loop for path in files
-                             for meta = (ignore-errors (emacs-reader-files-metadata path))
-                             collect (cons (format "%s 〔%s〕" (or (plist-get meta :title) "EPUB")
-                                                   (file-name-nondirectory path)) path)))
-           (choice (when choices
-                     (completing-read "试读本地版本：" (append choices (list (list other))) nil t))))
-      (or (cdr (assoc choice choices)) (read-file-name "选择要试读的 EPUB：" nil nil t)))))
-  (emacs-reader-preview-file file))
+  "Preview local EPUB FILE.  Interactively collect LightRead titles in the background."
+  (interactive (list nil))
+  (if file (emacs-reader-preview-file file)
+    (let ((dir (expand-file-name "~/Library/Application Support/com.yzfly.lightread/books/"))
+          (window (selected-window)) (buffer (current-buffer)) (request (list 'preview)))
+      (setq emacs-reader-local--picker-request request)
+      (if (not (file-directory-p dir)) (emacs-reader-local--choose-epub nil)
+        (message "正在读取本地 EPUB 书名…")
+        (emacs-reader-file-worker-start
+         'titles (list dir)
+         (lambda (choices failure)
+           (when (and (eq request emacs-reader-local--picker-request)
+                      (eq window (selected-window)) (eq buffer (window-buffer window))
+                      (not (active-minibuffer-window)))
+             (if failure (message "读取本地书名失败：%s" failure)
+               (with-current-buffer buffer (emacs-reader-local--choose-epub choices))))))))))
 
 ;;;###autoload
 (defun emacs-reader-import-file (path &optional title author origin)
   "Copy an EPUB or TXT at PATH to the local shelf with TITLE, AUTHOR and ORIGIN."
   (interactive "f导入 EPUB 或 TXT：")
+  (if (called-interactively-p 'interactive)
+      (emacs-reader-import-file-async path title author origin)
+    (prog1 (emacs-reader-local--add
+            (emacs-reader-local--prepare-import path title author origin emacs-reader-directory))
+      (message "已加入本地书架"))))
+
+(defun emacs-reader-local--prepare-import (path title author origin directory)
+  "Copy PATH into DIRECTORY and return a shelf record with TITLE, AUTHOR and ORIGIN."
   (let ((ext (downcase (or (file-name-extension path) ""))))
     (unless (member ext '("epub" "txt")) (user-error "支持 EPUB 和 TXT 文件"))
-    (let* ((metadata (emacs-reader-files-metadata path))
-           (chapters (emacs-reader-files-chapters path))
+    (let* ((inspection (emacs-reader-files--inspect path))
+           (metadata (car inspection))
+           (chapters (cadr inspection))
            (digest (with-temp-buffer
                      (set-buffer-multibyte nil)
                      (insert-file-contents-literally path)
                      (secure-hash 'sha256 (current-buffer))))
            (relative (concat "books/" digest "." ext))
-           (target (expand-file-name relative emacs-reader-directory)))
+           (target (expand-file-name relative directory)))
       (unless chapters (user-error "文件中没有可读章节"))
       (make-directory (file-name-directory target) t)
       (unless (file-exists-p target)
         (let ((temp (make-temp-file (expand-file-name ".book-" (file-name-directory target)))))
           (unwind-protect (progn (copy-file path temp t) (rename-file temp target t))
             (when (file-exists-p temp) (delete-file temp)))))
-      (prog1 (emacs-reader-local--add
-              `((readerType . "file") (bookUrl . ,relative) (origin . "file")
-                (originName . ,(or origin "本地文件"))
-                (name . ,(or title (plist-get metadata :title) (file-name-base path)))
-                (author . ,(or author (plist-get metadata :author) ""))
-                (totalChapterNum . ,(length chapters))))
-        (message "已加入本地书架")))))
+      `((readerType . "file") (bookUrl . ,relative) (origin . "file")
+        (originName . ,(or origin "本地文件"))
+        (name . ,(or title (plist-get metadata :title) (file-name-base path)))
+        (author . ,(or author (plist-get metadata :author) ""))
+        (totalChapterNum . ,(length chapters))))))
+
+(defun emacs-reader-import-file-async (path &optional title author origin callback temporary)
+  "Import PATH with TITLE, AUTHOR and ORIGIN, then call CALLBACK with (BOOK ERROR).
+Once the worker starts, it owns TEMPORARY input until completion."
+  (let ((directory (expand-file-name emacs-reader-directory))
+        (path (expand-file-name path)))
+    (emacs-reader-file-worker-start
+     'import (list path title author origin directory)
+     (lambda (book failure)
+       (unwind-protect
+           (unless failure
+             (condition-case err
+                 (let ((emacs-reader-directory directory))
+                   (emacs-reader-local--add book))
+               (error (setq failure (error-message-string err) book nil))))
+         (when (and temporary (file-exists-p path))
+           (condition-case err (delete-file path)
+             (file-error (message "临时书籍清理失败：%s" (error-message-string err))))))
+       (if callback (funcall callback book failure)
+         (if failure (message "导入失败：%s" failure) (message "已加入本地书架")))))))
 
 (declare-function emacs-reader--selected-shelf-book "emacs-reader")
 
@@ -438,25 +507,53 @@ C-SPC toggles a source or scope.  RET confirms the marked sources."
                      (seq-contains-p (alist-get 'aliases src) url #'equal)))
               records))
 
+(defun emacs-reader-local--fetch-file (book chapter callback)
+  "Fetch BOOK's file CHAPTER or catalog, delivering its value to CALLBACK."
+  (let* ((path (expand-file-name (alist-get 'bookUrl book) emacs-reader-directory))
+         (buffer (current-buffer))
+         (inspect (and (not chapter) (or (alist-get 'readFileTitle book)
+                                         (alist-get 'readFileAuthor book))))
+         (done
+          (lambda (result failure)
+            (when (and result (not chapter))
+              (when inspect
+                (let ((metadata (car result)))
+                  (setq result (cadr result))
+                  (when (and (buffer-live-p buffer)
+                             (eq book (buffer-local-value 'emacs-reader--current-book buffer)))
+                    (with-current-buffer buffer
+                      (when (alist-get 'readFileTitle book)
+                        (setf (alist-get 'name book) (plist-get metadata :title))
+                        (rename-buffer (format "*Reader: %s*" (alist-get 'name book)) t))
+                      (when (alist-get 'readFileAuthor book)
+                        (setf (alist-get 'author book) (or (plist-get metadata :author) "")))))))
+              ;; A stored TXT preface is named after the digest on disk.
+              (when (equal (plist-get (car result) :title) (file-name-base path))
+                (setf (plist-get (car result) :title) (alist-get 'name book))))
+            (funcall callback result failure))))
+    (if emacs-reader-local--sync-preview
+        (let (value failure)
+          (condition-case err
+              (setq value (if chapter (emacs-reader-files-content path chapter)
+                            (emacs-reader-files-chapters path)))
+            (error (setq failure (error-message-string err))))
+          (funcall done value failure))
+      (condition-case err
+          (emacs-reader-file-worker-start
+           (cond (chapter 'content) (inspect 'inspect) (t 'chapters))
+           (if chapter (list path chapter) (list path)) done)
+        (error (funcall callback nil (error-message-string err)))))))
+
 (defun emacs-reader-local--fetch (book chapter callback)
   "Fetch BOOK's catalog or CHAPTER, calling CALLBACK with value and error."
-  (let ((filep (equal (alist-get 'readerType book) "file")) result failure)
-    (condition-case err
-        (setq result
-              (if filep
-                  (let ((path (expand-file-name (alist-get 'bookUrl book) emacs-reader-directory)))
-                    (if chapter (emacs-reader-files-content path chapter)
-                      (let ((items (emacs-reader-files-chapters path)))
-                        ;; The stored filename is a digest.  Use the shelf title for a TXT preface.
-                        (when (equal (plist-get (car items) :title) (file-name-base path))
-                          (setf (plist-get (car items) :title) (alist-get 'name book)))
-                        items)))
-                (emacs-reader-local--source book)))
-      (error (setq failure (error-message-string err))))
-    (cond (failure (funcall callback nil failure))
-          (filep (funcall callback result nil))
-          (chapter (emacs-reader-legado-content result chapter callback))
-          (t (emacs-reader-legado-chapters result (emacs-reader-local--plist book) callback)))))
+  (if (equal (alist-get 'readerType book) "file")
+      (emacs-reader-local--fetch-file book chapter callback)
+    (let (source failure)
+      (condition-case err (setq source (emacs-reader-local--source book))
+        (error (setq failure (error-message-string err))))
+      (cond (failure (funcall callback nil failure))
+            (chapter (emacs-reader-legado-content source chapter callback))
+            (t (emacs-reader-legado-chapters source (emacs-reader-local--plist book) callback))))))
 
 (provide 'emacs-reader-local)
 ;;; emacs-reader-local.el ends here
