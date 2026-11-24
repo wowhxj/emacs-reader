@@ -9,6 +9,24 @@
 (require 'emacs-reader)
 (require 'emacs-reader-opds)
 
+(ert-deftest emacs-reader-open-library-short-search ()
+  (dolist (case '(("openlibrary.org" "ai" "title=ai")
+                  ("openlibrary.org" "三体" "title=%E4%B8%89%E4%BD%93")
+                  ("openlibrary.org" "Austen" "q=Austen")
+                  ("catalog.example" "ai" "q=ai")))
+    (let* ((base (concat "https://" (car case) "/search.json?limit=24&"))
+           (src `((type . "json") (url . ,(concat base "q={query}&page={page}")))) url)
+      (cl-letf (((symbol-function 'emacs-reader-opds--get)
+                 (lambda (target &rest _) (setq url target) nil)))
+        (funcall (emacs-reader-catalog-results src (nth 1 case) #'ignore))
+        (should (equal url (concat base (nth 2 case) "&page=1")))))))
+
+(ert-deftest emacs-reader-opds-http-validation-message ()
+  (with-temp-buffer
+    (insert "HTTP/1.1 422 Unprocessable Entity\r\n\r\n{\"detail\":[{\"msg\":\"Query too short\"}]}")
+    (should (equal (emacs-reader-opds--http-error 422) "HTTP 422 · Query too short"))
+    (should (equal (emacs-reader-opds--http-error 404) "HTTP 404"))))
+
 (defun emacs-reader-opds-test--parse (body)
   "Parse fixture BODY relative to a nested catalog."
   (with-temp-buffer

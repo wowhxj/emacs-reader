@@ -357,6 +357,22 @@ RESULTS limits feed-level actions on a search results page."
       (goto-char (point-min))
       (message "%s · %s" emacs-reader-opds--name reason))))
 
+(defun emacs-reader-opds--http-error (status)
+  "Describe HTTP STATUS with the validation message of a JSON 422 response."
+  (let ((reason (when (= status 422)
+                  (ignore-errors
+                    (save-excursion
+                      (goto-char (point-min))
+                      (when (and (re-search-forward "\r?\n\r?\n" nil t)
+                                 (< (- (point-max) (point)) 16384))
+                        (let* ((reply (emacs-reader-opds--json)) (detail (alist-get 'detail reply)))
+                          (cond ((stringp detail) detail)
+                                ((consp (car-safe detail)) (alist-get 'msg (car detail)))))))))))
+    (if (and (stringp reason) (not (string-blank-p reason)))
+        (format "HTTP %d · %s" status
+                (truncate-string-to-width (string-clean-whitespace reason) 200))
+      (format "HTTP %d" status))))
+
 (defun emacs-reader-opds--get (url read-body done &optional binary)
   "Fetch URL and call READ-BODY at its body, passing the final URL.
 Call DONE with the result in the originating catalog buffer.  BINARY
@@ -380,7 +396,7 @@ preserves raw response bytes for acquisition."
                          (cond
                           ((and (integerp url-http-response-status)
                                 (not (<= 200 url-http-response-status 299)))
-                           (error "HTTP %d" url-http-response-status))
+                           (error "%s" (emacs-reader-opds--http-error url-http-response-status)))
                           ((plist-get status :error)
                            (error "网络请求失败 %S" (plist-get status :error)))
                           ((null url-http-response-status)
@@ -830,6 +846,12 @@ HOME receives the root catalog items for interactive browsing."
                               (error (finish (error-message-string err)))))))))
                     (json
                      (unless (string-search "{query}" url) (error "JSON catalog URL lacks {query}"))
+                     (when (and (< (length (string-trim keyword)) 3)
+                                (string-prefix-p "https://openlibrary.org/search.json?" url)
+                                (string-match (rx (any "?&") (group "q={query}")
+                                                  (or "&" string-end)) url))
+                       (setq url (replace-match "title={query}" t t url 1)
+                             keyword (string-trim keyword)))
                      (setq template (string-replace "{query}" (url-hexify-string keyword) url))
                      (fetch-page (string-replace "{page}" "1" template)))
                     ((equal (alist-get 'type source) "opds")
