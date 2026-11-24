@@ -47,7 +47,8 @@
     (should-not (cdr result))
     (should (= 5000 (length chapters)))
     (should (equal (car chapters) '(:title "第1回" :url "https://fixture.invalid/ch/1")))
-    (should (equal (car (last chapters)) '(:title "第5000回" :url "https://fixture.invalid/ch/5000")))))
+    (should (equal (car (last chapters))
+                   '(:title "第5000回" :url "https://fixture.invalid/ch/5000")))))
 
 (ert-deftest emacs-reader-legado-worker-large-content-and-error ()
   (let* ((text (make-string 120000 ?甲))
