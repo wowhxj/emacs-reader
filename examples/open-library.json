@@ -1,0 +1,33 @@
+{
+  "type": "json",
+  "name": "Open Library",
+  "url": "https://openlibrary.org/search.json?q={query}%20ebook_access%3Apublic&fields=ia,title,author_name&limit=20&page={page}",
+  "definition": {
+    "rows": "docs",
+    "label": "title",
+    "author": "author_name",
+    "total": "numFound",
+    "pageSize": 20,
+    "href": "https://archive.org/advancedsearch.php?q=mediatype%3Atexts%20AND%20NOT%20access-restricted-item%3Atrue%20AND%20identifier%3A%28%22{batch}%22%29&fl%5B%5D=identifier&rows=40&page={page}&output=json",
+    "next": {
+      "rows": "response.docs",
+      "label": "identifier",
+      "total": "response.numFound",
+      "pageSize": 40,
+      "href": "https://archive.org/metadata/{identifier}",
+      "next": {
+        "rows": "files",
+        "label": "name",
+        "skipIf": "private",
+        "excludeLabel": "_lcp\\.epub\\'",
+        "href": "https://archive.org/download/{root.metadata.identifier}/{name}"
+      }
+    },
+    "batch": {
+      "field": "ia",
+      "size": 40,
+      "pattern": "\\`[[:alnum:]_.-]+\\'",
+      "join": "\" OR \""
+    }
+  }
+}

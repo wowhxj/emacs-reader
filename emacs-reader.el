@@ -19,6 +19,7 @@
 (require 'shr)
 (require 'tab-bar)
 (require 'tabulated-list)
+(require 'transient)
 (require 'subr-x)
 (require 'url)
 (require 'url-http)
@@ -632,7 +633,23 @@ Create the tab if necessary; otherwise reuse it."
   (setq-local truncate-lines t)
   (setq-local line-spacing 0.2))
 
+(autoload 'emacs-reader-sources "emacs-reader-sources" nil t)
 
+(transient-define-prefix emacs-reader-shelf-menu ()
+  "Show commands available on the current bookshelf."
+  [["阅读"
+    ("RET" "打开当前书籍" emacs-reader-open-book)
+    ("s" "搜索书源" emacs-reader-search)
+    ("g" "刷新书架" emacs-reader-shelf-refresh)]
+   ["本地书库" :if (lambda () (eq emacs-reader-backend 'local))
+    ("i" "导入书籍" emacs-reader-import-file)
+    ("d" "删除当前书籍…" emacs-reader-shelf-delete)
+    ("o" "浏览 OPDS 目录" emacs-reader-browse-catalog)
+    ("S" "管理书源" emacs-reader-sources)]])
+
+(define-key emacs-reader-shelf-mode-map (kbd "?") #'emacs-reader-shelf-menu)
+(define-key emacs-reader-shelf-mode-map (kbd "S") #'emacs-reader-sources)
+(define-key emacs-reader-shelf-mode-map (kbd "d") #'emacs-reader-shelf-delete)
 (define-key emacs-reader-shelf-mode-map (kbd "q") #'emacs-reader-quit)
 
 (define-key emacs-reader-shelf-mode-map (kbd "g") #'emacs-reader-shelf-refresh)
@@ -687,8 +704,8 @@ Create the tab if necessary; otherwise reuse it."
   (let ((buffer (current-buffer)))
     (setq header-line-format
           (propertize (if (eq emacs-reader-backend 'local)
-                          "  本地书架   RET 阅读   i 导入书籍   s 搜索   o 浏览目录   g 刷新"
-                        "  Bookshelf   RET open   s search   g refresh   n/p move")
+                          "  本地书架   RET 阅读   s 搜索   S 书源管理   d 删除   ? 全部操作"
+                        "  Bookshelf   RET open   s search   g refresh   ? actions")
                       'face 'emacs-reader-shelf-meta)
           mode-line-process " Loading...")
     (if (eq emacs-reader-backend 'local)

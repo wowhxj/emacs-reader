@@ -30,7 +30,7 @@
 (autoload 'emacs-reader-legado-content "emacs-reader-legado")
 (autoload 'emacs-reader-opds-search "emacs-reader-opds")
 (autoload 'emacs-reader-opds-browse "emacs-reader-opds" nil t)
-(autoload 'emacs-reader-openlibrary-search "emacs-reader-opds" nil t)
+(autoload 'emacs-reader-json-catalog-search "emacs-reader-opds")
 (declare-function emacs-reader-shelf-refresh "emacs-reader")
 (declare-function emacs-reader--start-search "emacs-reader")
 
@@ -118,24 +118,83 @@
                 (totalChapterNum . ,(length chapters))))
         (message "已加入本地书架")))))
 
+(declare-function emacs-reader--selected-shelf-book "emacs-reader")
+
+(defun emacs-reader-local--delete-path (path)
+  "Check PATH is a regular file or missing under a real library subdirectory."
+  (when (or (file-remote-p path)
+            (file-symlink-p (directory-file-name (expand-file-name emacs-reader-directory)))
+            (file-symlink-p (directory-file-name (file-name-directory path)))
+            (file-symlink-p path)
+            (and (file-exists-p path) (not (file-regular-p path))))
+    (user-error "拒绝删除不安全的书架路径 %s" path))
+  path)
+
+(defun emacs-reader-local--shared-copy-p (copy record)
+  "Return non-nil if a shelf entry other than RECORD references COPY."
+  (cl-loop for path in (directory-files (file-name-directory record) t "\\.json\\'")
+           unless (equal path record)
+           thereis (let* ((other (emacs-reader-local--read (emacs-reader-local--delete-path path)))
+                          (url (alist-get 'bookUrl other)))
+                     (and (equal (alist-get 'readerType other) "file")
+                          (stringp url) (not (file-remote-p url))
+                          (file-equal-p (expand-file-name url emacs-reader-directory) copy)))))
+
+(defun emacs-reader-local--shelf-copy (record)
+  "Return (ACTION . PATH) for the existing copy owned by RECORD, or nil."
+  (let ((book (emacs-reader-local--read (emacs-reader-local--delete-path record))))
+    (unless (equal record (emacs-reader-local--shelf-path book))
+      (user-error "书架记录已变更，请刷新后重试"))
+    (when (equal (alist-get 'readerType book) "file")
+      (let ((url (alist-get 'bookUrl book)) (case-fold-search nil))
+        (unless (and (stringp url)
+                     (string-match-p "\\`books/[0-9a-f]\\{64\\}\\.\\(?:epub\\|txt\\)\\'" url))
+          (user-error "拒绝删除非受管书库路径 %s" url))
+        (let ((copy (emacs-reader-local--delete-path
+                     (expand-file-name url emacs-reader-directory))))
+          (when (file-exists-p copy)
+            (cons (if (emacs-reader-local--shared-copy-p copy record) 'keep 'delete) copy)))))))
+
+;;;###autoload
+(defun emacs-reader-shelf-delete ()
+  "Confirm deletion of the local shelf book at point and its unshared copy."
+  (interactive)
+  (unless (eq emacs-reader-backend 'local) (user-error "Reader3 书架不支持删除"))
+  (let* ((book (emacs-reader--selected-shelf-book))
+         (record (emacs-reader-local--shelf-path book))
+         (copy (emacs-reader-local--shelf-copy record))
+         (detail (pcase (car copy)
+                   ('delete (format "并删除书库副本 %s" (cdr copy)))
+                   ('keep "，保留其他书籍引用的共享副本")
+                   (_ ""))))
+    (when (yes-or-no-p (format "移除《%s》的书架记录%s? " (alist-get 'name book) detail))
+      (let ((current (emacs-reader-local--shelf-copy record)))
+        (when (eq (car current) 'delete)
+          (unless (equal current copy) (user-error "副本引用已变更，请重新确认删除"))
+          (delete-file (cdr current))))
+      ;; Keep the record if removing the copy fails.  A missing copy is safe to retry.
+      (delete-file record)
+      (emacs-reader-shelf-refresh))))
+
 (defun emacs-reader-local--source-path (type url)
   "Locate the record for a source of TYPE identified by URL."
   (emacs-reader-local--record "sources" (concat type "\0" url)))
 
 (defun emacs-reader-local--source-url (url)
   "Return URL if it identifies an HTTP or HTTPS source."
-  (unless (and (stringp url) (string-match-p "\\`https?://[^[:space:]/]+" url))
+  (unless (and (stringp url)
+               (string-match-p "\\`https?://[^/?#[:space:]]+" url)
+               (not (string-match-p "[[:space:][:cntrl:]]" url)))
     (user-error "书源需要 HTTP(S) 地址"))
   url)
+
+(autoload 'emacs-reader-sources-add-opds "emacs-reader-sources" nil t)
 
 ;;;###autoload
 (defun emacs-reader-add-opds (name url)
   "Register an OPDS catalog with NAME and URL."
   (interactive "s目录名称：\nsOPDS 地址：")
-  (emacs-reader-local--source-url url)
-  (emacs-reader-local--write (emacs-reader-local--source-path "opds" url)
-                             `((type . "opds") (name . ,name) (url . ,url)))
-  (message "已保存 OPDS 目录 %s" name))
+  (emacs-reader-sources-add-opds name url))
 
 (defun emacs-reader-local--legado-json (input)
   "Read the Legado JSON file or remote URL named by INPUT."
@@ -160,17 +219,22 @@
   (interactive (list (if current-prefix-arg (read-string "书源 JSON URL：")
                        (read-file-name "Legado 书源 JSON："))))
   (let* ((json (emacs-reader-local--legado-json input))
-         (sources (if (vectorp json) (append json nil) (list json))))
+         (sources (if (vectorp json) (append json nil) (list json)))
+         (records (emacs-reader-local--records "sources")))
     (dolist (source sources)
       (unless (and (consp source) (stringp (alist-get 'bookSourceName source)))
         (user-error "Legado 书源缺少名称"))
-      (emacs-reader-local--source-url (alist-get 'bookSourceUrl source)))
+      (let ((url (emacs-reader-local--source-url (alist-get 'bookSourceUrl source))))
+        (when-let* ((owner (emacs-reader-local--alias-source url records)))
+          (user-error "该地址已由书源「%s」作为旧地址保留" (alist-get 'name owner)))))
     (dolist (source sources)
-      (let ((url (alist-get 'bookSourceUrl source)))
-        (emacs-reader-local--write (emacs-reader-local--source-path "legado" url)
-                                   `((type . "legado") (url . ,url)
-                                     (name . ,(alist-get 'bookSourceName source))
-                                     (definition . ,source)))))
+      (let* ((url (alist-get 'bookSourceUrl source))
+             (path (emacs-reader-local--source-path "legado" url))
+             (record (when (file-exists-p path) (emacs-reader-local--read path))))
+        (setf (alist-get 'type record) "legado" (alist-get 'url record) url
+              (alist-get 'name record) (alist-get 'bookSourceName source)
+              (alist-get 'definition record) source)
+        (emacs-reader-local--write path record)))
     (message "已导入 %d 个 Legado 书源" (length sources))))
 
 (defun emacs-reader-local--plist (record)
@@ -180,35 +244,34 @@
 
 (defun emacs-reader-local--select (types)
   "Prompt for one of the registered sources matching TYPES."
-  (let* ((built-in '((type . "openlibrary") (name . "Open Library")
-                     (url . "https://openlibrary.org")))
-         (sources (cons built-in (emacs-reader-local--records "sources")))
+  (let* ((sources (emacs-reader-local--records "sources"))
          (choices (cl-loop for src in sources
                            for definition = (alist-get 'definition src)
                            when (and (member (alist-get 'type src) types)
+                                     (not (eq :false (alist-get 'enabled src)))
                                      (not (eq :false (alist-get 'enabled definition))))
                            collect (cons (format "%s [%s] <%s>" (alist-get 'name src)
                                                  (alist-get 'type src) (alist-get 'url src)) src))))
+    (unless choices (user-error "没有可用的匹配书源；请在书架按 S 管理书源"))
     (cdr (assoc (completing-read "选择书源：" choices nil t) choices))))
 
 ;;;###autoload
 (defun emacs-reader-browse-catalog ()
-  "Browse a registered OPDS catalog or search Open Library."
+  "Browse a registered OPDS catalog."
   (interactive)
-  (let ((src (emacs-reader-local--select '("opds" "openlibrary"))))
-    (if (equal "opds" (alist-get 'type src))
-        (emacs-reader-opds-browse (alist-get 'name src) (alist-get 'url src))
-      (call-interactively #'emacs-reader-openlibrary-search))))
+  (let ((src (emacs-reader-local--select '("opds"))))
+    (emacs-reader-opds-browse (alist-get 'name src) (alist-get 'url src))))
 
 (defun emacs-reader-local--search (keyword)
   "Select a local source and start searching for KEYWORD."
-  (let ((src (emacs-reader-local--select '("legado" "opds" "openlibrary"))))
+  (let ((src (emacs-reader-local--select '("legado" "opds" "json"))))
     (pcase (alist-get 'type src)
-      ("openlibrary" (emacs-reader-openlibrary-search keyword))
+      ("json" (emacs-reader-json-catalog-search src keyword))
       ("opds" (emacs-reader-opds-search (alist-get 'name src) (alist-get 'url src) keyword))
-      ("legado" (emacs-reader--start-search keyword (list :source (alist-get 'url src)
-                                                          :native (emacs-reader-local--plist
-                                                                   (alist-get 'definition src))))))))
+      ("legado"
+       (emacs-reader--start-search
+        keyword (list :source (alist-get 'url src)
+                      :native (emacs-reader-local--plist (alist-get 'definition src))))))))
 
 (defun emacs-reader-local--book (result)
   "Convert Legado search RESULT into a shelf book."
@@ -218,9 +281,20 @@
 
 (defun emacs-reader-local--source (book)
   "Return the current source definition for BOOK."
-  (let ((path (emacs-reader-local--source-path "legado" (alist-get 'origin book))))
-    (unless (file-readable-p path) (user-error "请重新导入该书的 Legado 书源"))
-    (emacs-reader-local--plist (alist-get 'definition (emacs-reader-local--read path)))))
+  (let* ((origin (alist-get 'origin book))
+         (path (emacs-reader-local--source-path "legado" origin))
+         (record (if (file-readable-p path) (emacs-reader-local--read path)
+                   (emacs-reader-local--alias-source
+                    origin (emacs-reader-local--records "sources")))))
+    (unless record (user-error "请重新导入该书的 Legado 书源"))
+    (emacs-reader-local--plist (alist-get 'definition record))))
+
+(defun emacs-reader-local--alias-source (url records)
+  "Find a Legado source in RECORDS previously registered under URL."
+  (cl-find-if (lambda (src)
+                (and (equal (alist-get 'type src) "legado")
+                     (seq-contains-p (alist-get 'aliases src) url #'equal)))
+              records))
 
 (defun emacs-reader-local--fetch (book chapter callback)
   "Fetch BOOK's catalog or CHAPTER, calling CALLBACK with value and error."

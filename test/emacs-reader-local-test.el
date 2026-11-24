@@ -100,5 +100,39 @@
         (when (buffer-live-p buffer) (kill-buffer buffer)))
       (delete-directory emacs-reader-directory t))))
 
+(ert-deftest emacs-reader-local-search-only-configured-sources ()
+  (let ((emacs-reader-directory (make-temp-file "reader-catalogs-" t)) selected)
+    (unwind-protect
+        (progn
+          (should-error (emacs-reader-local--search "小说") :type 'user-error)
+          (let* ((url "https://catalog.example/search?q={query}")
+                 (src `((name . "我的目录") (type . "json") (url . ,url))))
+            (emacs-reader-local--write (emacs-reader-local--source-path "json" url) src)
+            (cl-letf (((symbol-function 'completing-read)
+                       (lambda (_ choices &rest _args)
+                         (should (= (length choices) 1)) (caar choices)))
+                      ((symbol-function 'emacs-reader-json-catalog-search)
+                       (lambda (record query) (setq selected (list record query)))))
+              (emacs-reader-local--search "小说")
+              (should (equal selected (list src "小说"))))))
+      (delete-directory emacs-reader-directory t))))
+
+(ert-deftest emacs-reader-local-legado-retains-previous-address-on-import ()
+  (let* ((emacs-reader-directory (make-temp-file "reader-alias-" t))
+         (url "https://new.example") (old "https://old.example")
+         (src `((type . "legado") (name . "旧名") (url . ,url) (aliases . [,old])))
+         (file (expand-file-name "new.json" emacs-reader-directory)))
+    (unwind-protect
+        (progn
+          (emacs-reader-local--write (emacs-reader-local--source-path "legado" url) src)
+          (emacs-reader-local--write file `((bookSourceUrl . ,url) (bookSourceName . "新名")))
+          (emacs-reader-import-legado file)
+          (let ((definition (emacs-reader-local--source `((origin . ,old)))))
+            (should (equal (plist-get definition :bookSourceName) "新名"))
+            (should (equal (plist-get definition :bookSourceUrl) url)))
+          (emacs-reader-local--write file `((bookSourceUrl . ,old) (bookSourceName . "重复")))
+          (should-error (emacs-reader-import-legado file) :type 'user-error))
+      (delete-directory emacs-reader-directory t))))
+
 (provide 'emacs-reader-local-test)
 ;;; emacs-reader-local-test.el ends here

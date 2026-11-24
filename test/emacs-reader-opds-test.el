@@ -75,13 +75,51 @@
       (emacs-reader-opds--search description)
       (should (equal result '("https://a.invalid/catalog/results?q=%E7%BA%A2%20A" "红 A"))))))
 
-(ert-deftest emacs-reader-opds-public-archive-files ()
-  (let* ((item (emacs-reader-opds--item :url "archive-id" :title "Work"))
-         (files (emacs-reader-opds--files
-                 item '((files . (((name . "A B.epub")) ((name . "A_djvu.txt"))
-                                  ((name . "A_lcp.epub")) ((name . "A.pdf"))
-                                  ((name . "private.txt") (private . "true"))))))))
+(ert-deftest emacs-reader-json-catalog-direct-downloads-and-pagination ()
+  (let* ((source '((type . "json") (name . "Example")
+                   (url . "https://a.invalid/api/search?q={query}&page={page}")
+                   (definition . ((rows . "result.books") (label . "name")
+                                  (href . "{url}") (total . "count") (pageSize . 3)))))
+         (doc '((count . 4) (result . ((books . (((name . "A") (url . "../a.epub"))
+                                                 ((name . "B") (url . "https://b.invalid/b.txt"))
+                                                 ((name . "C") (url . "file:///tmp/c.txt"))))))))
+         requests)
+    (with-temp-buffer
+      (cl-letf (((symbol-function 'emacs-reader-opds--start) #'ignore)
+                ((symbol-function 'emacs-reader-opds--get)
+                 (lambda (url parse done)
+                   (push url requests)
+                   (cl-letf (((symbol-function 'emacs-reader-opds--json) (lambda () doc)))
+                     (funcall done (funcall parse url))))))
+        (emacs-reader-json-catalog-search source "红 &")
+        (let ((items (cdar emacs-reader-opds--history)))
+          (should (equal (mapcar #'emacs-reader-opds--item-kind items)
+                         '(download download json-page)))
+          (should (equal (mapcar #'emacs-reader-opds--item-url (seq-take items 2))
+                         '("https://a.invalid/a.epub" "https://b.invalid/b.txt")))
+          (emacs-reader-opds--activate (car (last items)))
+          (should (= 2 (length (cdar emacs-reader-opds--history))))
+          (should (equal requests '("https://a.invalid/api/search?q=%E7%BA%A2%20%26&page=2"
+                                    "https://a.invalid/api/search?q=%E7%BA%A2%20%26&page=1"))))))))
+
+(defconst emacs-reader-opds-test--source
+  (expand-file-name "../examples/open-library.json"
+                    (file-name-directory (or load-file-name buffer-file-name))))
+
+(ert-deftest emacs-reader-json-catalog-public-editions-and-files ()
+  (let* ((src (emacs-reader-local--read emacs-reader-opds-test--source))
+         (rule (alist-get 'definition src))
+         (editions (alist-get 'next rule))
+         (doc '((files . (((name . "A B.epub")) ((name . "A_djvu.txt")) ((name . "A_lcp.epub"))
+                          ((name . "A.pdf")) ((name . "private.txt") (private . "true"))))
+                (metadata . ((identifier . "archive-id")))))
+         (files (emacs-reader-json--items (alist-get 'next editions) doc "https://a.invalid/"
+                                          "Work" "Writer")))
+    (let ((data '((docs . (((title . "Work") (ia . ("first" "second" "first" "bad*"))))))))
+      (should (equal (mapcar (lambda (row) (alist-get 'batch row))
+                             (emacs-reader-json--rows rule data)) '("first\" OR \"second"))))
     (should (equal (mapcar #'emacs-reader-opds--item-label files) '("A B.epub" "A_djvu.txt")))
+    (should (equal (emacs-reader-opds--item-author (car files)) "Writer"))
     (should (equal (emacs-reader-opds--item-url (car files))
                    "https://archive.org/download/archive-id/A%20B.epub"))))
 

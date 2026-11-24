@@ -12,13 +12,29 @@ Emacs 原生阅读客户端。书架、已导入的文件和章节进度保存�
 
 运行 `M-x emacs-reader-shelf`，按 `i` 导入 TXT 或 EPUB，按 `RET` 阅读。EPUB 需要 Python 3 和带 libxml 的 Emacs。默认数据目录是 `user-emacs-directory` 下的 `emacs-reader/`，可通过 `emacs-reader-directory` 更改。备份或迁移时复制整个目录即可。本地书架与旧 NAS 书架分别保存；要访问旧书架，请将 `emacs-reader-backend` 设为 `reader3`，使用原有服务器配置运行 `M-x emacs-reader-login`。
 
-## 添加书源
+## 管理书源
 
-| 来源 | 添加与阅读 |
-|---|---|
-| Legado | `M-x emacs-reader-import-legado` 导入 JSON 文件，支持单个书源或书源数组。用 `C-u M-x emacs-reader-import-legado` 输入订阅 URL。相同书源地址再次导入会更新规则。书架按 `s` 输入关键词并选择书源，结果按 `RET` 试读、按 `a` 加入本地书架。 |
-| OPDS | `M-x emacs-reader-add-opds` 保存目录名称和 URL。书架按 `s` 选择该源搜索，按 `o` 浏览目录。支持 OPDS 1.x Atom 和 2.0 JSON。用 `TAB` 选择分类、搜索、下一页或下载链接，`RET` 打开，`b` 返回。直接获取的 EPUB、TXT 下载到本地书架。 |
-| Open Library | 书架按 `s` 选择内置的 Open Library，也可运行 `M-x emacs-reader-openlibrary-search`。在结果中选择公开版本和 EPUB / TXT 文件。需要借阅、登录或 DRM 的版本不提供本地下载。 |
+在书架按 `S`（`M-x emacs-reader-sources`）打开书源列表。`n` / `p` 选择一行，`a` 添加，`e` 编辑，`d` 删除，`g` 刷新，`?` 查看操作。编辑时在 JSON buffer 中修改名称、地址或规则，`C-c C-c` 保存，`C-c C-k` 取消。
+
+| 想添加的书源 | 在书源列表中操作 | 在书架中使用 |
+|---|---|---|
+| 文渊阁、Open Library | `a p` 选择示例配置。已添加的文渊阁可直接编辑。 | `s` 搜索。文渊阁也支持 `o` 浏览 OPDS 目录。Open Library 可逐级选择公开版本及可下载的 EPUB / TXT。 |
+| 自定义 OPDS 1.x / 2.0 | `a o` 输入名称和目录 URL。 | `s` 使用目录公布的搜索入口，`o` 浏览分类。用 `TAB` 选择链接，`RET` 打开，`b` 返回。 |
+| Legado | `a f` 从 JSON 文件导入，`a u` 从订阅 URL 导入。支持单源和数组。 | `s` 搜索，`RET` 试读，`a` 将选中的书加入本地书架。 |
+| 自定义 JSON 目录 | `a j` 导入完整目录配置。可参考仓库 `examples/` 中的 Open Library 示例。 | `s` 搜索，按配置逐级选择版本和下载文件。 |
+
+例如，一个接口返回 `{"books":[{"title":"书名","download":"/files/book.epub"}]}` 时，可以保存下面这份配置，再用 `a j` 导入。`{query}` 会替换为编码后的关键词，`{download}` 会相对于实际响应地址解析。随仓库分发的两份完整示例位于 `examples/`；从本地加载时请保留此目录。
+
+```json
+{
+  "type": "json",
+  "name": "我的书库",
+  "url": "https://books.example/search?q={query}",
+  "definition": {"rows": "books", "label": "title", "href": "{download}"}
+}
+```
+
+搜索只列出已注册且启用的书源。文渊阁和 Open Library 都是可选配置，删除后可通过 `a p` 再次添加。删除书源会保留书架和已下载的文件。尚需联网加载章节的 Legado 书籍，可以在重新添加对应书源后继续阅读。
 
 Legado 支持声明式 HTML/CSS 选择器、原生 tag/class/id 规则、基础 JSONPath、GET/POST、静态请求头，以及目录和正文分页。导入时标记为 `enabled: false` 的书源不会出现在搜索列表中。依赖 JavaScript、WebView、XPath 或复杂脚本的书源需要额外引擎。在线搜索与抓取 Legado 章节需要联网；已导入的 EPUB、TXT 可断网阅读。
 
@@ -31,7 +47,9 @@ Legado 支持声明式 HTML/CSS 选择器、原生 tag/class/id 规则、基础 
 | 界面 | 按键 | 操作 |
 |---|---|---|
 | 书架 | `n` / `p` | 下一本 / 上一本 |
-| 书架 | `g` | 刷新 |
+| 书架 | `g` / `?` | 刷新书架 / 显示操作菜单 |
+| 书架 | `S` | 管理书源 |
+| 书架 | `d` | 确认后删除光标所在的书籍，清理对应书库副本 |
 | 书架 | `s` | 搜索 Legado、OPDS 书源或 Open Library |
 | 搜索 | `n` / `p` | 下一条 / 上一条结果 |
 | 搜索 | `RET` | 试读，不加入书架 |
@@ -50,6 +68,8 @@ Legado 支持声明式 HTML/CSS 选择器、原生 tag/class/id 规则、基础 
 | 目录 | `n` / `p` | 下一项 / 上一项 |
 | 目录 | `RET` | 跳转选中章节 |
 | 全部 | `q` | 关闭当前 buffer |
+
+删除本地书籍会移除书架记录和章节进度。若为 EPUB 或 TXT，最后一条引用被移除时也会删除书库中的文件副本。导入前的原文件保留。Reader3 书架继续使用服务器端管理。
 
 ### 朗读配置
 
