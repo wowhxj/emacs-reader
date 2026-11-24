@@ -92,6 +92,44 @@
               (alist-get 'durChapterTime record) (floor (* 1000 (float-time))))
         (emacs-reader-local--write path record)))))
 
+(declare-function emacs-reader-open-book "emacs-reader")
+
+(defun emacs-reader-preview-file (path &optional title author origin temporary)
+  "Preview PATH with TITLE, AUTHOR and ORIGIN.  Own TEMPORARY files until close."
+  (setq path (expand-file-name path))
+  (unless (and (not (file-remote-p path)) (file-regular-p path)
+               (member (downcase (or (file-name-extension path) "")) '("epub" "txt")))
+    (user-error "请选择本地 EPUB 或 TXT 文件"))
+  (let* ((meta (emacs-reader-files-metadata path))
+         (book `((readerType . "file") (previewFile . t) (bookUrl . ,path) (origin . "file")
+                 (name . ,(or title (plist-get meta :title) (file-name-base path)))
+                 (author . ,(or author (plist-get meta :author) ""))
+                 (originName . ,(or origin "本地文件"))))
+         (buffer (emacs-reader-open-book book t)))
+    (when temporary
+      (with-current-buffer buffer
+        (let ((cleanup (lambda () (when (file-exists-p path) (delete-file path)))))
+          (add-hook 'kill-buffer-hook cleanup nil t)
+          (add-hook 'change-major-mode-hook cleanup nil t))))
+    buffer))
+
+;;;###autoload
+(defun emacs-reader-preview-epub (file)
+  "Preview local EPUB FILE without adding it to the shelf."
+  (interactive
+   (list
+    (let* ((dir (expand-file-name "~/Library/Application Support/com.yzfly.lightread/books/"))
+           (files (when (file-directory-p dir) (directory-files dir t "\\.epub\\'")))
+           (other "选择其他 EPUB 文件…")
+           (choices (cl-loop for path in files
+                             for meta = (ignore-errors (emacs-reader-files-metadata path))
+                             collect (cons (format "%s 〔%s〕" (or (plist-get meta :title) "EPUB")
+                                                   (file-name-nondirectory path)) path)))
+           (choice (when choices
+                     (completing-read "试读本地版本：" (append choices (list (list other))) nil t))))
+      (or (cdr (assoc choice choices)) (read-file-name "选择要试读的 EPUB：" nil nil t)))))
+  (emacs-reader-preview-file file))
+
 ;;;###autoload
 (defun emacs-reader-import-file (path &optional title author origin)
   "Copy an EPUB or TXT at PATH to the local shelf with TITLE, AUTHOR and ORIGIN."

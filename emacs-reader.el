@@ -35,6 +35,7 @@
   :group 'applications)
 
 (require 'emacs-reader-local)
+(require 'emacs-reader-wendian-recovery)
 (require 'emacs-reader-search-progress)
 
 (defcustom emacs-reader-server-url nil
@@ -167,6 +168,8 @@ For WSL without Linux audio, use e.g. (\"mpv.exe\" \"--no-video\")."
 
 (defvar-local emacs-reader--chapter-request-id 0
   "Monotonic identifier used to ignore stale chapter responses.")
+
+(put 'emacs-reader--chapter-request-id 'permanent-local t)
 
 (defvar-local emacs-reader--chapters nil
   "Vector of chapter records indexed by their zero-based chapter index.")
@@ -976,9 +979,13 @@ Create the tab if necessary; otherwise reuse it."
                                (emacs-reader--book-field book 'name)))
       (if (alist-get 'readerType book)
           (progn
-            (emacs-reader-local--add book)
+            (setq book (if (alist-get 'previewFile book)
+                           (emacs-reader-import-file
+                            (alist-get 'bookUrl book) (alist-get 'name book)
+                            (alist-get 'author book) (alist-get 'originName book))
+                         (emacs-reader-local--add book)))
             (when (derived-mode-p 'emacs-reader-reading-mode)
-              (setq emacs-reader--preview-p nil)
+              (setq emacs-reader--current-book book emacs-reader--preview-p nil)
               (when (integerp emacs-reader--current-chapter-index)
                 (emacs-reader--save-local-progress emacs-reader--current-chapter-index)))
             (message "已加入本地书架"))
@@ -1016,10 +1023,12 @@ Local shelf books resume and save their current chapter."
                     emacs-reader--preview-start-pending (or preview (alist-get 'readerType book))))
       (emacs-reader--display-buffer buffer)
       (unless (or preview (alist-get 'readerType book)) (emacs-reader--load-chapter chapter))
-      (emacs-reader--load-catalog))))
+      (emacs-reader--load-catalog)
+      buffer)))
 
 (define-derived-mode emacs-reader-reading-mode special-mode "Reader"
   "Major mode for reading book chapters."
+  (cl-incf emacs-reader--chapter-request-id)
   (setq-local truncate-lines nil)
   (setq-local word-wrap t)
   ;; Break between any CJK characters, honoring kinsoku punctuation rules.
@@ -1436,6 +1445,7 @@ Resume speech if SPEECH-GENERATION is still active.  With AT-END, show the end."
     (when (and (integerp total) (> total 0) (>= index total))
       (user-error "Chapter is outside this book's range"))
     (unless speech-generation (emacs-reader--tts-stop))
+    (emacs-reader--clear-recovery)
     (setq emacs-reader--chapter-request-id
           (1+ emacs-reader--chapter-request-id)
           emacs-reader--requested-chapter-index index
@@ -1446,12 +1456,18 @@ Resume speech if SPEECH-GENERATION is still active.  With AT-END, show the end."
               (emacs-reader-local--fetch
                book (alist-get 'native (aref emacs-reader--chapters index))
                (lambda (text err)
-                 (emacs-reader--display-chapter
-                  buffer request-id index text
-                  (and (equal (alist-get 'readerType book) "file")
-                       (equal (file-name-extension book-url) "epub") 'paragraphs)
-                  speech-generation at-end)
-                 (when err (message "正文加载失败：%s" err))))
+                 (when (emacs-reader--chapter-request-current-p buffer request-id)
+                   (with-current-buffer buffer
+                     (emacs-reader--display-chapter
+                      buffer request-id index text
+                      (and (equal (alist-get 'readerType book) "file")
+                           (equal (file-name-extension book-url) "epub") 'paragraphs)
+                      speech-generation at-end)
+                     (when err
+                       (emacs-reader--offer-recovery
+                        (plist-get (alist-get 'native (aref emacs-reader--chapters index)) :url)
+                        index)
+                       (message "正文加载失败：%s" err))))))
             (emacs-reader--reader3-request
              "getBookContent" "POST"
              `((url . ,book-url) (index . ,index))
@@ -1506,8 +1522,7 @@ Resume speech if SPEECH-GENERATION is still active.  With AT-END, show the end."
          (let ((chapters (cl-loop for item in items for i from 0
                                   collect `((index . ,i) (title . ,(plist-get item :title))
                                             (native . ,item)))))
-           (funcall callback `(:ok ((isSuccess . ,(null err)) (data . ,chapters))))
-           (when err (message "目录加载失败：%s" err)))))
+           (funcall callback `(:ok ((isSuccess . ,(null err)) (data . ,chapters)) :error ,err)))))
     (emacs-reader--reader3-request
      "getChapterList" "POST"
      `((url . ,(alist-get 'bookUrl book)) (refresh . 0)
@@ -1520,17 +1535,19 @@ Resume speech if SPEECH-GENERATION is still active.  With AT-END, show the end."
       (when show (emacs-reader--show-catalog (current-buffer)))
     (setq emacs-reader--catalog-show-pending (or show emacs-reader--catalog-show-pending))
     (unless emacs-reader--catalog-loading
-      (let ((buffer (current-buffer))
+      (let ((buffer (current-buffer)) (request (list 'catalog))
             (url (alist-get 'bookUrl emacs-reader--current-book)))
         (unless (and (stringp url) (not (string-empty-p url)))
           (user-error "No Reader book is open"))
-        (setq emacs-reader--catalog-loading t)
+        (emacs-reader--clear-recovery)
+        (setq emacs-reader--catalog-loading request)
         (emacs-reader--request-catalog
          emacs-reader--current-book
          (lambda (response)
            (when (buffer-live-p buffer)
              (with-current-buffer buffer
                (when (and (derived-mode-p 'emacs-reader-reading-mode)
+                          (eq request emacs-reader--catalog-loading)
                           (equal url (alist-get 'bookUrl emacs-reader--current-book)))
                  (setq emacs-reader--catalog-loading nil)
                  (let* ((json (plist-get response :ok))
@@ -1553,7 +1570,12 @@ Resume speech if SPEECH-GENERATION is still active.  With AT-END, show the end."
                                (min (1- (length chapters))
                                     (max 0 (or (alist-get 'durChapterIndex emacs-reader--current-book) 0))))))
                           (when show (emacs-reader--show-catalog buffer)))
-                     (message "Reader 目录加载失败，可按 c 重试"))))))))))))
+                     (emacs-reader--offer-recovery (or (alist-get 'tocUrl emacs-reader--current-book)
+                                                       url) nil show)
+                     (message "Reader 目录加载失败，可按 c 重试")
+                     (when-let* ((err (plist-get response :error))
+                                 ((alist-get 'readerType emacs-reader--current-book)))
+                       (message "目录加载失败：%s" err)))))))))))))
 
 (define-derived-mode emacs-reader-toc-mode tabulated-list-mode "Reader-TOC"
   "Table of contents: n/p select, RET reads a chapter, q kills the buffer."
@@ -1665,8 +1687,9 @@ Resume speech if SPEECH-GENERATION is still active.  With AT-END, show the end."
 (defun emacs-reader--chapter-request-current-p (buffer request-id)
   "Whether BUFFER still expects the chapter response for REQUEST-ID."
   (and (buffer-live-p buffer)
-       (= request-id
-          (buffer-local-value 'emacs-reader--chapter-request-id buffer))))
+       (with-current-buffer buffer
+         (and (derived-mode-p 'emacs-reader-reading-mode)
+              (= request-id emacs-reader--chapter-request-id)))))
 
 (defun emacs-reader--save-local-progress (index)
   "Record the successfully displayed chapter INDEX for a local shelf book."

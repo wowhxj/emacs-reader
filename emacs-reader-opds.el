@@ -19,6 +19,7 @@
 (require 'url-http)
 (require 'xml)
 
+(autoload 'emacs-reader-preview-file "emacs-reader")
 (autoload 'emacs-reader-import-file "emacs-reader-local")
 
 (cl-defstruct (emacs-reader-opds--item (:constructor emacs-reader-opds--item))
@@ -203,8 +204,10 @@ RESULTS limits feed-level actions on a search results page."
     (define-key map (kbd "b") #'emacs-reader-opds-back)
     map))
 
+(define-key emacs-reader-opds-mode-map (kbd "a") #'emacs-reader-opds-add)
+
 (define-derived-mode emacs-reader-opds-mode special-mode "Book Catalog"
-  "Browse book links with TAB and RET.  Go back with `b'."
+  "Follow links or preview books with RET.  Add with `a', go back with `b'."
   (add-hook 'kill-buffer-hook #'emacs-reader-opds--stop nil t)
   (add-hook 'change-major-mode-hook #'emacs-reader-opds--stop nil t)
   (add-hook 'quit-window-hook #'emacs-reader-opds--stop nil t))
@@ -232,7 +235,7 @@ RESULTS limits feed-level actions on a search results page."
     (insert-text-button (concat (when-let* ((status (emacs-reader-opds--availability item)))
                                   (format "【%s】 " status))
                                 (emacs-reader-opds--item-label item))
-                        'follow-link t
+                        'emacs-reader-item item 'follow-link t
                         'action (lambda (_) (emacs-reader-opds--activate item)))
     (insert "\n")))
 
@@ -241,7 +244,7 @@ RESULTS limits feed-level actions on a search results page."
   (pcase-let ((`(,heading . ,items) (car emacs-reader-opds--history))
               (inhibit-read-only t))
     (erase-buffer)
-    (insert (propertize heading 'face 'bold) "\n\n")
+    (insert (propertize heading 'face 'bold) "\nRET 试读 / 打开   a 加入书架\n\n")
     (when (cdr emacs-reader-opds--history)
       (insert-text-button "Back" 'action (lambda (_) (emacs-reader-opds-back)))
       (insert "\n\n"))
@@ -338,9 +341,12 @@ preserves raw response bytes for acquisition."
   "Search a catalog using URL with KEYWORD, prompting when omitted."
   (emacs-reader-opds--search-buffer nil (or keyword (read-string "Search catalog: ")) url))
 
-(defun emacs-reader-opds--download (item)
-  "Download ITEM and import its bytes into the local shelf."
-  (let ((ext (emacs-reader-opds--item-extension item)))
+(defun emacs-reader-opds--download (item &optional add)
+  "Download ITEM for preview, or import it when ADD is non-nil."
+  (let ((ext (emacs-reader-opds--item-extension item))
+        (title (emacs-reader-opds--item-title item))
+        (author (emacs-reader-opds--item-author item))
+        (origin emacs-reader-opds--name))
     (emacs-reader-opds--get
      (emacs-reader-opds--item-url item)
      (lambda (_base)
@@ -355,9 +361,10 @@ preserves raw response bytes for acquisition."
            (when path (delete-file path)))))
      (lambda (path)
        (unwind-protect
-           (emacs-reader-import-file path (emacs-reader-opds--item-title item)
-                                     (emacs-reader-opds--item-author item) emacs-reader-opds--name)
-         (delete-file path))) t)))
+           (if add (emacs-reader-import-file path title author origin)
+             (emacs-reader-preview-file path title author origin t)
+             (setq path nil))
+         (when (and path (file-exists-p path)) (delete-file path)))) t)))
 
 (defun emacs-reader-json--field (key object)
   "Read a dotted field KEY from JSON OBJECT."
@@ -479,8 +486,8 @@ Pass items to DONE when supplied.  URL overrides the numbered page URL."
    (lambda (data) (if done (funcall done (cdr data))
                     (emacs-reader-opds--show (car data) (cdr data))))))
 
-(defun emacs-reader-opds--activate (item)
-  "Follow catalog ITEM."
+(defun emacs-reader-opds--activate (item &optional add)
+  "Follow catalog ITEM, importing a download when ADD is non-nil."
   (unless (and (eq (emacs-reader-opds--item-kind item) 'record)
                (not (emacs-reader-opds--item-action item)))
     (emacs-reader-opds--stop))
@@ -490,7 +497,7 @@ Pass items to DONE when supplied.  URL overrides the numbered page URL."
       ('search (emacs-reader-opds--search url))
       ('record (if-let* ((action (emacs-reader-opds--item-action item)))
                    (funcall action) (browse-url url)))
-      ('download (emacs-reader-opds--download item))
+      ('download (emacs-reader-opds--download item add))
       ('json-page (funcall (emacs-reader-opds--item-action item))))))
 
 (defun emacs-reader-opds--start (name)
@@ -711,14 +718,28 @@ Call CALLBACK once with (ITEMS ERROR-STRING).  Return a cancellation function."
                                   (lambda (reason) (funcall callback items reason)) t)))
 
 ;;;###autoload
-(defun emacs-reader-catalog-open-item (source item)
-  "Open ITEM from SOURCE, using a catalog buffer when it has further actions."
-  (unless (and (eq (emacs-reader-opds--item-kind item) 'record)
-               (not (emacs-reader-opds--item-action item)))
-    (let ((name (alist-get 'name source)))
-      (emacs-reader-opds--start name)
-      (emacs-reader-opds--show name (list item))))
-  (emacs-reader-opds--activate item))
+(defun emacs-reader-catalog-open-item (source item &optional add)
+  "Open ITEM from SOURCE, or the current catalog if SOURCE is nil.
+When ADD is non-nil, confirm before importing a download."
+  (when (and add (not (eq (emacs-reader-opds--item-kind item) 'download)))
+    (user-error "请按 RET 打开目录，选择可下载的版本"))
+  (when (or (not add) (y-or-n-p (format "将《%s》加入书架? "
+                                        (or (emacs-reader-opds--item-title item)
+                                            (emacs-reader-opds--item-label item)))))
+    (when (and source (not (and (eq (emacs-reader-opds--item-kind item) 'record)
+                                (not (emacs-reader-opds--item-action item)))))
+      (let ((name (alist-get 'name source)))
+        (emacs-reader-opds--start name)
+        (emacs-reader-opds--show name (list item))))
+    (emacs-reader-opds--activate item add)))
+
+(defun emacs-reader-opds-add ()
+  "Add the downloadable book at point to the shelf after confirmation."
+  (interactive)
+  (let* ((button (button-at (point)))
+         (item (and button (button-get button 'emacs-reader-item))))
+    (unless item (user-error "请选择可下载的版本"))
+    (emacs-reader-catalog-open-item nil item t)))
 
 (provide 'emacs-reader-opds)
 ;;; emacs-reader-opds.el ends here

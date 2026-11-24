@@ -38,6 +38,28 @@
       (when-let* ((buf (get-buffer "*Reader Shelf*"))) (kill-buffer buf))
       (delete-directory emacs-reader-directory t))))
 
+(ert-deftest emacs-reader-local-file-preview-before-add ()
+  (let* ((emacs-reader-directory (make-temp-file "reader-preview-" t))
+         (path (expand-file-name "book.txt" emacs-reader-directory)) buf)
+    (unwind-protect
+        (save-window-excursion
+          (cl-letf (((symbol-function 'emacs-reader--display-buffer) #'switch-to-buffer))
+            (with-temp-file path (insert "第一章 开始\n第一段。\n第二章 结尾\n第二段。"))
+            (setq buf (emacs-reader-preview-file path "试读本" nil "目录" t))
+            (emacs-reader-next-chapter)
+            (should-not (emacs-reader-local--records "shelf"))
+            (cl-letf (((symbol-function 'yes-or-no-p) #'ignore)) (emacs-reader-add-to-shelf))
+            (should-not (emacs-reader-local--records "shelf"))
+            (cl-letf (((symbol-function 'yes-or-no-p) #'always)) (emacs-reader-add-to-shelf))
+            (let ((book (car (emacs-reader-local--records "shelf"))))
+              (kill-buffer buf)
+              (should-not (file-exists-p path))
+              (should (file-readable-p (expand-file-name (alist-get 'bookUrl book)
+                                                         emacs-reader-directory)))
+              (should (equal (alist-get 'durChapterIndex book) 1)))))
+      (when (buffer-live-p buf) (kill-buffer buf))
+      (delete-directory emacs-reader-directory t))))
+
 (ert-deftest emacs-reader-local-source-registry ()
   (let* ((emacs-reader-directory (make-temp-file "reader-sources-" t))
          (file (expand-file-name "import.json" emacs-reader-directory)))

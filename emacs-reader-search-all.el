@@ -42,7 +42,7 @@
         (pending (+ (length emacs-reader-all--queue) (length emacs-reader-all--running))))
     (setq tabulated-list-entries (append emacs-reader-all--rows errors)
           header-line-format
-          (format "  %s · %d 个书源 · %d 条结果 · 待返回 %d · 失败 %d    RET 打开   a 入架   m 更多   g 重试"
+          (format "  %s · %d 个书源 · %d 条结果 · 待返回 %d · 失败 %d    RET 试读 / 打开   a 加入书架   m 更多   g 重试"
                   emacs-reader-all--keyword (length emacs-reader-all--tasks)
                   (length emacs-reader-all--rows) pending (length errors)))
     (tabulated-list-print t)))
@@ -161,7 +161,7 @@
            (if add (emacs-reader-add-to-shelf (cdr row))
              (emacs-reader-open-book (cdr row) t)))
           ((or (not add) (eq (emacs-reader-opds--item-kind (cdr row)) 'download))
-           (emacs-reader-catalog-open-item (car row) (cdr row)))
+           (emacs-reader-catalog-open-item (car row) (cdr row) add))
           ((eq (emacs-reader-opds--item-kind (cdr row)) 'record)
            (user-error "此行是书目，按 RET 查看详情和可用版本"))
           (t (user-error "请按 RET 打开目录，选择可下载的版本")))))
