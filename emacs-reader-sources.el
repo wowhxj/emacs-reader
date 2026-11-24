@@ -134,6 +134,23 @@
                                (setq emacs-reader-sources--redraw-timer nil)
                                (emacs-reader-sources--render)))))))))
 
+(defun emacs-reader-sources--rule-reason (source reason)
+  "Describe the failing search stage in SOURCE when REASON identifies it."
+  (let* ((definition (alist-get 'definition source))
+         (url (alist-get 'searchUrl definition))
+         (header (alist-get 'header definition))
+         (list-rule (alist-get 'bookList (alist-get 'ruleSearch definition))))
+    (cond ((and (string-search "动态表达式" reason) (stringp url)
+                (string-match-p "java\\.md5Encode" url) (string-search "token" url))
+           "搜索 URL 依赖动态签名 token，当前不支持此请求模板")
+          ((and (string-search "请求头格式" reason) (stringp header)
+                (string-match-p "java\\.md5Encode" header) (string-search "sign" header))
+           "搜索请求头由脚本动态签名，当前不支持此请求头")
+          ((and (string-search "Java/Android" reason) (stringp list-rule)
+                (string-search "JavaImporter" list-rule) (string-search "javax.crypto" list-rule))
+           "搜索列表依赖 Java/Android 脚本解密响应，当前不支持")
+          (t reason))))
+
 (defun emacs-reader-sources--result (source keyword items reason)
   "Summarize the first page of ITEMS or REASON for SOURCE and KEYWORD."
   (let ((type (alist-get 'type source)))
@@ -143,7 +160,8 @@
                     ((string-match-p "HTTP [0-9]\\{3\\}" reason) "HTTP 错误")
                     ((string-match-p "不支持\\|Unsupported\\|缺少 searchUrl" reason) "规则不支持")
                     (t "请求失败"))
-              (replace-regexp-in-string "[\n\r\t]+" " " reason))
+              (replace-regexp-in-string "[\n\r\t]+" " "
+                                        (emacs-reader-sources--rule-reason source reason)))
       (let ((count (if (equal type "legado") (length items)
                      (cl-count-if (lambda (item)
                                     (and (not (emacs-reader-opds--item-pagination item))

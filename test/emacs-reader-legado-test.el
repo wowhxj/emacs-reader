@@ -10,6 +10,13 @@
 (require 'ert)
 (require 'emacs-reader-legado)
 
+(ert-deftest emacs-reader-legado-boolean-chapter-filter ()
+  (let ((doc (emacs-reader-legado--parse
+              (concat "{\"rows\":[{\"id\":0,\"v\":true},{\"id\":1,\"v\":false},"
+                      "{\"id\":2,\"v\":null},{\"id\":3},{\"id\":4,\"v\":\"false\"}]}"))))
+    (should (equal '("1") (emacs-reader-legado--values doc "rows[?(@.v == false)].id")))
+    (should (equal '("0") (emacs-reader-legado--values doc "rows[?(@.v==true)].id")))))
+
 (defun emacs-reader-legado-test--with-pages (pages body &optional check-request)
   "Serve PAGES in order while running BODY and optional CHECK-REQUEST."
   (let ((pending pages))
