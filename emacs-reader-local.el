@@ -25,6 +25,7 @@
 (autoload 'emacs-reader-files-chapters "emacs-reader-files")
 (autoload 'emacs-reader-files-content "emacs-reader-files")
 (autoload 'emacs-reader-files-metadata "emacs-reader-files")
+(autoload 'emacs-reader-wendian-import-page "emacs-reader-wendian-read")
 (autoload 'emacs-reader-legado-search "emacs-reader-legado")
 (autoload 'emacs-reader-legado-chapters "emacs-reader-legado")
 (autoload 'emacs-reader-legado-content "emacs-reader-legado")
@@ -342,6 +343,20 @@ C-SPC toggles a source or scope.  RET confirms the marked sources."
         (while (not (consp selection))
           (setq selection (emacs-reader-local--pick-scope choices selection)))
         selection))))
+
+;;;###autoload
+(defun emacs-reader-wendian-import-html (url file)
+  "Read the saved Wendian HTML FILE as the work or chapter at URL."
+  (interactive
+   (let* ((row (and (derived-mode-p 'tabulated-list-mode) (tabulated-list-get-id)))
+          (book (cond ((derived-mode-p 'emacs-reader-all-mode) (cdr-safe row))
+                      ((derived-mode-p 'emacs-reader-search-mode) row)
+                      ((boundp 'emacs-reader--current-book) emacs-reader--current-book)))
+          (url (and (listp book) (alist-get 'bookUrl book))))
+     (list (read-string "研辞问典原站页面 URL："
+                        (and (stringp url) (string-prefix-p "https://wendian.dicomp.net/" url) url))
+           (read-file-name "浏览器保存的 HTML：" nil nil t))))
+  (message "已载入研辞问典页面，共 %d 章" (emacs-reader-wendian-import-page url file)))
 
 ;;;###autoload
 (defun emacs-reader-browse-catalog ()

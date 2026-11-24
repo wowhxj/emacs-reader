@@ -54,6 +54,29 @@
             (should (equal (plist-get source :ruleSearch) '(:bookList "$.books")))))
       (delete-directory emacs-reader-directory t))))
 
+(ert-deftest emacs-reader-local-wendian-imported-page-opens-offline ()
+  (let* ((emacs-reader-directory (make-temp-file "reader-wendian-page-" t))
+         (url "https://wendian.dicomp.net/ancient/detail.php?id=1")
+         (file (expand-file-name "page.html" emacs-reader-directory))
+         (src (list :bookSourceUrl "https://wendian.dicomp.net"
+                    :searchUrl (concat "https://raw.githubusercontent.com/yzfly/LightRead/"
+                                       "main/src/data/wendian-index.json")))
+         chapters text)
+    (unwind-protect
+        (progn
+          (with-temp-file file
+            (insert "<main><h1>西游记</h1><article><section id='ch-1'>"
+                    "<h2>第一回</h2><p>灵根育孕源流出</p></section></article></main>"))
+          (emacs-reader-wendian-import-html url file)
+          (cl-letf (((symbol-function 'url-retrieve) (lambda (&rest _) (ert-fail "意外联网"))))
+            (emacs-reader-legado-chapters src (list :bookUrl url)
+                                          (lambda (rows err) (should-not err) (setq chapters rows)))
+            (should (equal "第一回" (plist-get (car chapters) :title)))
+            (emacs-reader-legado-content src (car chapters)
+                                         (lambda (body err) (should-not err) (setq text body)))
+            (should (equal text "灵根育孕源流出"))))
+      (delete-directory emacs-reader-directory t))))
+
 (ert-deftest emacs-reader-local-legado-search-preview-shelf ()
   (let* ((emacs-reader-directory (make-temp-file "reader-legado-flow-" t))
          (emacs-reader-backend 'local)

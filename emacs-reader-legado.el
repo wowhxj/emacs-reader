@@ -451,7 +451,25 @@ Pass SEARCH to `emacs-reader-legado--fetch' for search substitutions."
                   :origin (plist-get source :bookSourceUrl)
                   :originName (plist-get source :bookSourceName))))))
 
+(autoload 'emacs-reader-wendian-search "emacs-reader-wendian-index")
+(autoload 'emacs-reader-wendian-book-info "emacs-reader-wendian-read")
+(autoload 'emacs-reader-wendian-chapters "emacs-reader-wendian-read")
+(autoload 'emacs-reader-wendian-content "emacs-reader-wendian-read")
+
+(defun emacs-reader-legado--wendian-p (source)
+  "Identify the LightRead offline index paired with the Wendian site in SOURCE."
+  (and (member (plist-get source :bookSourceUrl)
+               '("https://wendian.dicomp.net" "https://wendian.dicomp.net/"))
+       (equal (plist-get source :searchUrl)
+              "https://raw.githubusercontent.com/yzfly/LightRead/main/src/data/wendian-index.json")))
+
 (defun emacs-reader-legado-search (source query callback &optional page)
+  "Search SOURCE for QUERY on one-based PAGE and call CALLBACK with books/error."
+  (if (emacs-reader-legado--wendian-p source)
+      (emacs-reader-wendian-search source query callback page)
+    (emacs-reader-legado--search-rules source query callback page)))
+
+(defun emacs-reader-legado--search-rules (source query callback &optional page)
   "Search SOURCE for QUERY on one-based PAGE and call CALLBACK with books/error."
   (let ((template (plist-get source :searchUrl)) (page (or page 1))
         (origin (plist-get source :bookSourceUrl)) (rules (plist-get source :ruleSearch)))
@@ -490,6 +508,12 @@ Pass SEARCH to `emacs-reader-legado--fetch' for search substitutions."
                    (emacs-reader-legado--url toc url) url))))
 
 (defun emacs-reader-legado-book-info (source book callback)
+  "Read details of BOOK from SOURCE; call CALLBACK with updated book/error."
+  (if (emacs-reader-legado--wendian-p source)
+      (emacs-reader-wendian-book-info source book callback)
+    (emacs-reader-legado--book-info-rules source book callback)))
+
+(defun emacs-reader-legado--book-info-rules (source book callback)
   "Read details of BOOK from SOURCE; call CALLBACK with updated book/error."
   (emacs-reader-legado--map-page
    source (plist-get book :bookUrl) (plist-get source :bookSourceUrl) callback
@@ -536,6 +560,12 @@ Start at TARGET with optional FIRST-DOC and call CALLBACK with the complete list
 
 (defun emacs-reader-legado-chapters (source book callback)
   "Read BOOK's catalog from SOURCE; call CALLBACK with chapters/error."
+  (if (emacs-reader-legado--wendian-p source)
+      (emacs-reader-wendian-chapters source book callback)
+    (emacs-reader-legado--chapters-rules source book callback)))
+
+(defun emacs-reader-legado--chapters-rules (source book callback)
+  "Read BOOK's catalog from SOURCE; call CALLBACK with chapters/error."
   (let ((toc (plist-get book :tocUrl))
         (next (plist-get (plist-get source :ruleToc) :nextTocUrl))
         (read-page (apply-partially #'emacs-reader-legado--catalog source)))
@@ -551,6 +581,12 @@ Start at TARGET with optional FIRST-DOC and call CALLBACK with the complete list
            (cons target (and (equal target url) doc))))))))
 
 (defun emacs-reader-legado-content (source chapter callback)
+  "Read CHAPTER from SOURCE; call CALLBACK with its text/error."
+  (if (emacs-reader-legado--wendian-p source)
+      (emacs-reader-wendian-content source chapter callback)
+    (emacs-reader-legado--content-rules source chapter callback)))
+
+(defun emacs-reader-legado--content-rules (source chapter callback)
   "Read CHAPTER from SOURCE; call CALLBACK with its text/error."
   (let ((rules (plist-get source :ruleContent)))
     (emacs-reader-legado--pages
