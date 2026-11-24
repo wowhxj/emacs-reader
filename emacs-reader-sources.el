@@ -6,6 +6,7 @@
 ;;; Code:
 
 (require 'emacs-reader-local)
+(require 'emacs-reader-opds)
 (require 'tabulated-list)
 (require 'js)
 (require 'transient)
@@ -84,12 +85,180 @@
           (delete-file old-path)
         (file-error
          (delete-file path)
-         (signal (car err) (cdr err)))))))
+         (signal (car err) (cdr err)))))
+    (when original (emacs-reader-sources--forget original))))
+
+(defcustom emacs-reader-sources-check-keyword "三体"
+  "Default keyword for source checks.  A prefix argument prompts for another."
+  :type 'string :group 'emacs-reader)
+
+(defcustom emacs-reader-sources-check-concurrency 3
+  "Maximum number of sources checked concurrently."
+  :type 'natnum :group 'emacs-reader)
+
+(defcustom emacs-reader-sources-check-timeout 30
+  "Maximum seconds to spend checking one source."
+  :type 'natnum :group 'emacs-reader)
+
+(cl-defstruct (emacs-reader-sources--check (:constructor emacs-reader-sources--make-check))
+  source keyword timer handle)
+
+(defvar-local emacs-reader-sources--states nil)
+(defvar-local emacs-reader-sources--queue nil)
+(defvar-local emacs-reader-sources--running nil)
+(defvar-local emacs-reader-sources--pumping nil)
+(defvar-local emacs-reader-sources--redraw-timer nil)
+
+(defun emacs-reader-sources--forget (source)
+  "Invalidate the last result for a deleted or edited SOURCE."
+  (when-let* ((buffer (get-buffer emacs-reader-sources--buffer)))
+    (with-current-buffer buffer
+      (when emacs-reader-sources--states (remhash source emacs-reader-sources--states)))))
+
+(defun emacs-reader-sources--redraw ()
+  "Coalesce async updates without displaying the source list."
+  (unless emacs-reader-sources--redraw-timer
+    (let ((buffer (current-buffer)))
+      (setq emacs-reader-sources--redraw-timer
+            (run-at-time 0.1 nil
+                         (lambda ()
+                           (when (buffer-live-p buffer)
+                             (with-current-buffer buffer
+                               (setq emacs-reader-sources--redraw-timer nil)
+                               (tabulated-list-print t)))))))))
+
+(defun emacs-reader-sources--result (source keyword items reason)
+  "Summarize the first page of ITEMS or REASON for SOURCE and KEYWORD."
+  (let ((type (alist-get 'type source)))
+    (if reason
+        (cons (cond ((and (equal type "opds") (equal reason "目录未声明可用的搜索入口")) "仅可浏览")
+                    ((string-match-p "超时\\|timed? ?out\\|timeout" reason) "超时")
+                    ((string-match-p "HTTP [0-9]\\{3\\}" reason) "HTTP 错误")
+                    ((string-match-p "不支持\\|Unsupported\\|缺少 searchUrl" reason) "规则不支持")
+                    (t "请求失败"))
+              (replace-regexp-in-string "[\n\r\t]+" " " reason))
+      (let ((count (if (equal type "legado") (length items)
+                     (cl-count-if (lambda (item)
+                                    (and (not (emacs-reader-opds--item-pagination item))
+                                         (memq (emacs-reader-opds--item-kind item)
+                                               '(record download json-page feed)))) items))))
+        (cons (cond ((zerop count) "成功 · 0 条")
+                    ((and (equal type "opds")
+                          (not (cl-some (lambda (item)
+                                          (memq (emacs-reader-opds--item-kind item)
+                                                '(record download))) items))) "有目录项")
+                    (t "搜到书"))
+              (format "「%s」首页 %d 条结果" keyword count))))))
+
+(defun emacs-reader-sources--abort (check)
+  "Release the outstanding request for CHECK."
+  (let ((handle (emacs-reader-sources--check-handle check)))
+    (cond ((functionp handle) (funcall handle))
+          ((and (bufferp handle) (buffer-live-p handle))
+           (when-let* ((process (get-buffer-process handle))) (delete-process process))
+           (when (buffer-live-p handle) (kill-buffer handle))))))
+
+(defun emacs-reader-sources--finish (buffer check items reason &optional timeout)
+  "Deliver ITEMS or REASON for the active CHECK in BUFFER, aborting on TIMEOUT."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (when (memq check emacs-reader-sources--running)
+        (setq emacs-reader-sources--running (delq check emacs-reader-sources--running))
+        (cancel-timer (emacs-reader-sources--check-timer check))
+        (when timeout (emacs-reader-sources--abort check))
+        (let ((source (emacs-reader-sources--check-source check)))
+          (when (gethash source emacs-reader-sources--states)
+            (puthash source (emacs-reader-sources--result
+                             source (emacs-reader-sources--check-keyword check) items reason)
+                     emacs-reader-sources--states)))
+        (emacs-reader-sources--redraw)
+        (emacs-reader-sources--pump)))))
+
+(defun emacs-reader-sources--start-check (check)
+  "Launch the first-page search for CHECK."
+  (let* ((buffer (current-buffer)) (source (emacs-reader-sources--check-source check))
+         (keyword (emacs-reader-sources--check-keyword check))
+         (done (apply-partially #'emacs-reader-sources--finish buffer check)))
+    (push check emacs-reader-sources--running)
+    (puthash source (cons "检测中" keyword) emacs-reader-sources--states)
+    (setf (emacs-reader-sources--check-timer check)
+          (run-at-time (max 1 emacs-reader-sources-check-timeout) nil done nil "检测请求超时" t))
+    (condition-case err
+        (setf (emacs-reader-sources--check-handle check)
+              (if (equal (alist-get 'type source) "legado")
+                  (emacs-reader-legado-search (emacs-reader-local--plist
+                                               (alist-get 'definition source)) keyword done)
+                (emacs-reader-catalog-results source keyword done)))
+      (error (funcall done nil (error-message-string err))))))
+
+(defun emacs-reader-sources--pump ()
+  "Start queued checks up to the concurrency limit."
+  (unless emacs-reader-sources--pumping
+    (let ((emacs-reader-sources--pumping t))
+      (while (and emacs-reader-sources--queue
+                  (< (length emacs-reader-sources--running)
+                     (max 1 emacs-reader-sources-check-concurrency)))
+        (let ((check (pop emacs-reader-sources--queue)))
+          (when (gethash (emacs-reader-sources--check-source check) emacs-reader-sources--states)
+            (emacs-reader-sources--start-check check)))))))
+
+(defun emacs-reader-sources--stop ()
+  "Cancel outstanding work and invalidate callbacks before releasing requests."
+  (let ((running emacs-reader-sources--running) (queued emacs-reader-sources--queue))
+    (setq emacs-reader-sources--running nil emacs-reader-sources--queue nil)
+    (when emacs-reader-sources--redraw-timer
+      (cancel-timer emacs-reader-sources--redraw-timer)
+      (setq emacs-reader-sources--redraw-timer nil))
+    (dolist (check (append running queued))
+      (let ((source (emacs-reader-sources--check-source check)))
+        (when (gethash source emacs-reader-sources--states)
+          (puthash source '("已取消" . "") emacs-reader-sources--states))))
+    (dolist (check running)
+      (cancel-timer (emacs-reader-sources--check-timer check))
+      (emacs-reader-sources--abort check))))
+
+(defun emacs-reader-sources-check-cancel ()
+  "Cancel all running and queued checks in this list."
+  (interactive)
+  (emacs-reader-sources--stop)
+  (tabulated-list-print t))
+
+(defun emacs-reader-sources--begin (sources keyword)
+  "Replace pending work with first-page checks of SOURCES using KEYWORD."
+  (when (string-blank-p keyword) (user-error "检测关键词不能为空"))
+  (emacs-reader-sources--stop)
+  (setq emacs-reader-sources--queue
+        (mapcar (lambda (source)
+                  (puthash source (cons "排队" keyword) emacs-reader-sources--states)
+                  (emacs-reader-sources--make-check :source source :keyword keyword)) sources))
+  (emacs-reader-sources--pump)
+  (tabulated-list-print t))
+
+(defun emacs-reader-sources--keyword ()
+  "Read a keyword with a prefix argument, or use the configured default."
+  (if current-prefix-arg (read-string "检测关键词：" nil nil emacs-reader-sources-check-keyword)
+    emacs-reader-sources-check-keyword))
+
+(defun emacs-reader-sources-check (keyword)
+  "Check the selected source using KEYWORD.  With a prefix, prompt for it."
+  (interactive (list (emacs-reader-sources--keyword)))
+  (let ((source (emacs-reader-sources--selected)))
+    (emacs-reader-sources--check-current source)
+    (emacs-reader-sources--begin (list source) keyword)))
+
+(defun emacs-reader-sources-check-all (keyword)
+  "Check every registered source using KEYWORD.  With a prefix, prompt for it."
+  (interactive (list (emacs-reader-sources--keyword)))
+  (emacs-reader-sources--begin (emacs-reader-local--records "sources") keyword))
 
 (defun emacs-reader-sources--entries ()
   "Build tabulated list entries from registered records."
   (mapcar (lambda (src)
-            (list src (vector (alist-get 'name src) (alist-get 'type src) (alist-get 'url src))))
+            (let ((state (and emacs-reader-sources--states
+                              (gethash src emacs-reader-sources--states))))
+              (list src (vector (alist-get 'name src) (alist-get 'type src)
+                                (or (car state) "未检测") (or (cdr state) "")
+                                (alist-get 'url src)))))
           (emacs-reader-local--records "sources")))
 
 (defun emacs-reader-sources--refresh ()
@@ -207,6 +376,7 @@
     (when (yes-or-no-p (format "删除书源「%s」并保留本地书籍副本? " (alist-get 'name src)))
       (emacs-reader-sources--check-current src)
       (delete-file (emacs-reader-sources--path src))
+      (emacs-reader-sources--forget src)
       (emacs-reader-sources--refresh))))
 
 (transient-define-prefix emacs-reader-sources-menu ()
@@ -216,6 +386,10 @@
     ("e" "编辑" emacs-reader-sources-edit)
     ("d" "删除" emacs-reader-sources-delete)
     ("g" "刷新" revert-buffer)]
+   ["有效性检测（C-u 指定关键词）"
+    ("t" "检测当前书源" emacs-reader-sources-check)
+    ("T" "检测全部书源" emacs-reader-sources-check-all)
+    ("x" "取消检测" emacs-reader-sources-check-cancel)]
    ["浏览"
     ("n" "下一项" next-line :transient t)
     ("p" "上一项" previous-line :transient t)
@@ -223,16 +397,21 @@
 
 (define-derived-mode emacs-reader-sources-mode tabulated-list-mode "Reader-Sources"
   "Manage local sources using the registry at `emacs-reader-directory'."
-  (setq tabulated-list-format [("名称" 28 t) ("类型" 10 t) ("URL" 0 t)]
+  (setq emacs-reader-sources--states (make-hash-table :test #'equal))
+  (add-hook 'kill-buffer-hook #'emacs-reader-sources--stop nil t)
+  (setq tabulated-list-format [("名称" 24 t) ("类型" 8 t) ("状态" 12 t) ("原因" 44 t) ("URL" 0 t)]
         tabulated-list-sort-key '("名称" . nil)
         tabulated-list-entries #'emacs-reader-sources--entries)
-  (setq-local mode-line-process "  a 添加  e 编辑  d 删除  ? 帮助")
+  (setq-local mode-line-process "  t 检测  T 全检  x 取消  d 删除  ? 帮助")
   (tabulated-list-init-header))
 
 (define-key emacs-reader-sources-mode-map (kbd "RET") #'emacs-reader-sources-edit)
 (define-key emacs-reader-sources-mode-map (kbd "a") #'emacs-reader-sources-add)
 (define-key emacs-reader-sources-mode-map (kbd "e") #'emacs-reader-sources-edit)
 (define-key emacs-reader-sources-mode-map (kbd "d") #'emacs-reader-sources-delete)
+(define-key emacs-reader-sources-mode-map (kbd "t") #'emacs-reader-sources-check)
+(define-key emacs-reader-sources-mode-map (kbd "T") #'emacs-reader-sources-check-all)
+(define-key emacs-reader-sources-mode-map (kbd "x") #'emacs-reader-sources-check-cancel)
 (define-key emacs-reader-sources-mode-map (kbd "?") #'emacs-reader-sources-menu)
 
 ;;;###autoload
