@@ -339,11 +339,11 @@
   (emacs-reader-sources--refresh))
 
 (defun emacs-reader-sources-import-json (file)
-  "Register the JSON catalog configuration in FILE."
-  (interactive "fJSON 目录配置：")
+  "Register the OPDS or JSON catalog configuration in FILE."
+  (interactive "fOPDS / JSON 目录配置：")
   (let ((record (emacs-reader-local--read file)))
-    (unless (and (consp record) (equal (alist-get 'type record) "json"))
-      (user-error "请选择 type 为 json 的完整目录配置"))
+    (unless (and (consp record) (member (alist-get 'type record) '("opds" "json")))
+      (user-error "请选择 type 为 opds 或 json 的完整目录配置"))
     (emacs-reader-sources--save record))
   (emacs-reader-sources--refresh))
 
@@ -366,7 +366,7 @@
     ("f" "Legado 本地文件" emacs-reader-sources-import-legado-file)
     ("u" "Legado URL" emacs-reader-sources-import-legado-url)
     ("p" "预置书源" emacs-reader-sources-add-preset)
-    ("j" "JSON 目录配置" emacs-reader-sources-import-json)]])
+    ("j" "OPDS / JSON 配置文件" emacs-reader-sources-import-json)]])
 
 (define-derived-mode emacs-reader-sources-edit-mode js-json-mode "Reader-Source-JSON"
   "Edit a source configuration as JSON."
@@ -495,11 +495,14 @@
    (or (emacs-reader-sources--visible emacs-reader-sources--marked)
        (list (emacs-reader-sources--selected)))))
 
+(autoload 'emacs-reader-sources-export "emacs-reader-sources-export" nil t)
+
 (transient-define-prefix emacs-reader-sources-menu ()
   "Show source management commands."
   [["书源管理"
     ("a" "添加" emacs-reader-sources-add)
     ("e" "编辑" emacs-reader-sources-edit)
+    ("E" "按类型导出 ZIP" emacs-reader-sources-export)
     ("/" "筛选" emacs-reader-filter-edit)
     ("C-c C-l" "清除筛选" emacs-reader-filter-clear)
     ("g" "刷新" revert-buffer)]
@@ -541,6 +544,7 @@
 (define-key emacs-reader-sources-mode-map (kbd "M") #'emacs-reader-sources-mark-visible)
 (define-key emacs-reader-sources-mode-map (kbd "RET") #'emacs-reader-sources-edit)
 (define-key emacs-reader-sources-mode-map (kbd "a") #'emacs-reader-sources-add)
+(define-key emacs-reader-sources-mode-map (kbd "E") #'emacs-reader-sources-export)
 (define-key emacs-reader-sources-mode-map (kbd "e") #'emacs-reader-sources-edit)
 (define-key emacs-reader-sources-mode-map (kbd "d") #'emacs-reader-sources-flag)
 (define-key emacs-reader-sources-mode-map (kbd "m") #'emacs-reader-sources-mark)
