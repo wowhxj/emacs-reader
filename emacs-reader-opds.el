@@ -711,6 +711,28 @@ match whenEquals."
                                    base))))
         (unless optional (error "目录未声明可用的搜索入口")))))
 
+(defvar emacs-reader-gutenberg-cache-directory
+  (locate-user-emacs-file "cache/emacs-reader/gutenberg/")
+  "Directory for the local Project Gutenberg catalog indexes.")
+
+(defconst emacs-reader-gutenberg--script
+  (expand-file-name "etc/gutenberg-search.py"
+                    (file-name-directory (or load-file-name buffer-file-name))))
+
+(defun emacs-reader-gutenberg--start (output url keyword callback)
+  "Search the official CSV at URL for KEYWORD in a background process.
+Write all matching rows to OUTPUT and call CALLBACK with the exit status."
+  (let ((cache (expand-file-name (concat (secure-hash 'sha256 url) ".sqlite3")
+                                 emacs-reader-gutenberg-cache-directory)))
+    (make-process
+     :name "gutenberg-search" :buffer output :connection-type 'pipe :noquery t
+     :coding 'utf-8-unix
+     :command (list (or (executable-find "python3") (error "Gutenberg search requires Python 3"))
+                    "-I" emacs-reader-gutenberg--script cache url keyword)
+     :sentinel (lambda (proc _event)
+                 (when (memq (process-status proc) '(exit signal))
+                   (funcall callback (process-exit-status proc)))))))
+
 (defconst emacs-reader-catalog--page-delay 1.1
   "Seconds to wait after receiving a page before requesting the next one.")
 
@@ -789,6 +811,23 @@ HOME receives the root catalog items for interactive browsing."
             (let ((url (alist-get 'url source)))
               (when (string-empty-p (string-trim keyword)) (error "Enter a search term"))
               (cond (link (follow-link link))
+                    ((and json (equal (alist-get 'catalog rule) "gutenberg-official"))
+                     (let ((feed (car (split-string url "#"))))
+                       (unless (string-match-p "\\`https?://[^/[:space:]]" feed)
+                         (error "Expected an HTTP(S) Gutenberg catalog"))
+                       (setq response (generate-new-buffer " *Gutenberg catalog*")
+                             timer (run-at-time 65 nil #'finish "Gutenberg 目录搜索超时"))
+                       (emacs-reader-gutenberg--start
+                        response feed keyword
+                        (lambda (status)
+                          (when (buffer-live-p worker)
+                            (condition-case err
+                                (with-current-buffer response
+                                  (goto-char (point-min))
+                                  (unless (zerop status) (error "%s" (string-trim (buffer-string))))
+                                  (receive-page (emacs-reader-json--items
+                                                 rule (emacs-reader-opds--json) feed nil nil)))
+                              (error (finish (error-message-string err)))))))))
                     (json
                      (unless (string-search "{query}" url) (error "JSON catalog URL lacks {query}"))
                      (setq template (string-replace "{query}" (url-hexify-string keyword) url))

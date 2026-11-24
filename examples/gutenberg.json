@@ -1,0 +1,12 @@
+{
+  "type": "json",
+  "name": "Project Gutenberg",
+  "url": "https://gutenberg.pglaf.org/cache/epub/feeds/pg_catalog.csv.gz#q={query}",
+  "definition": {
+    "catalog": "gutenberg-official",
+    "rows": "books",
+    "label": "title",
+    "author": "author",
+    "href": "https://gutenberg.pglaf.org/cache/epub/{id}/pg{id}-images-3.epub"
+  }
+}
