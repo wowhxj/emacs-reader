@@ -67,8 +67,8 @@
           '(:bookSourceUrl "https://ts.txs12.com/"
                            :ruleBookInfo (:author "$.data.author@put:{bid:$.data.id}"
                                                   :tocUrl "/list/{{$.data.key}}?view=chapters")
-                           :ruleToc (:chapterList "$..chapters[*]" :chapterName "$.tit"
-                                                  :chapterUrl "https://res.txs12.com/@get:{bid}/{{$.num}}")
+                           :ruleToc (:chapterUrl "https://res.txs12.com/@get:{bid}/{{$.num}}"
+                                                 :chapterList "$..chapters[*]" :chapterName "$.tit")
                            :ruleContent (:content "$..body##\\:|\\;|\\s\\u3002")))
          (book '(:bookUrl "https://ts.txs12.com/info/1")) chapter)
     (emacs-reader-legado-test--with-pages
