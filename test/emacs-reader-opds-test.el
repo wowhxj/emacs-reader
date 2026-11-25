@@ -283,7 +283,8 @@
   (let ((emacs-reader-backend 'local)
         (url "https://catalog.invalid/opds/") result)
     (with-temp-buffer
-      (cl-letf (((symbol-function 'emacs-reader-local--records)
+      (cl-letf (((symbol-function 'emacs-reader-local--write) #'ignore)
+                ((symbol-function 'emacs-reader-local--records)
                  (lambda (_) `(((type . "opds") (name . "文渊阁") (url . ,url)))))
                 ((symbol-function 'completing-read)
                  (lambda (_ choices &rest _args)

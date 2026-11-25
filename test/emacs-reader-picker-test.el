@@ -20,6 +20,12 @@
   (ert-simulate-keys keys
     (emacs-reader-local--select '("legado" "opds" "json") (not single))))
 
+(defmacro emacs-reader-picker-test--isolated (&rest body)
+  "Run BODY with a fresh per-library source selection."
+  (declare (indent 0))
+  `(let ((emacs-reader-directory (make-temp-file "reader-picker-" t)))
+     (unwind-protect (progn ,@body) (delete-directory emacs-reader-directory t))))
+
 (defun emacs-reader-picker-test--exercise ()
   "Exercise narrowing, widening and ordinary text through the active frontend."
   (cl-letf (((symbol-function 'emacs-reader-local--records)
@@ -36,7 +42,8 @@
                      `((type . "all") (sources ,opds))))
       (should (equal (emacs-reader-picker-test--read (kbd "s RET"))
                      `((type . "all") (sources ,json))))
-      (should (equal (emacs-reader-picker-test--read (kbd "l DEL RET")) all))
+      (should (equal (emacs-reader-picker-test--read (kbd "l DEL RET"))
+                     `((type . "all") (sources ,json))))
       (let ((saw-mark nil)
             (saw-cleared nil))
         (let ((pre-command-hook
@@ -55,11 +62,13 @@
                          `((type . "all") (sources ,opds ,json))))
           (should saw-mark)
           (should saw-cleared)))
-      (should (equal (emacs-reader-picker-test--read (kbd "s C-SPC C-SPC DEL RET")) all))
+      (should (equal (emacs-reader-picker-test--read (kbd "s C-SPC C-SPC DEL RET"))
+                     `((type . "all") (sources ,opds ,json))))
       (should (equal (emacs-reader-picker-test--read (kbd "o C-SPC DEL x RET"))
                      `((type . "all") (sources ,opds))))
       ;; Native completion needs TAB to expand a unique source before RET.
       (should (equal (emacs-reader-picker-test--read (kbd "S o l o TAB RET")) legado))
+      (should (equal (emacs-reader-picker-test--read (kbd "RET")) legado))
       (let ((completion-ignore-case t))
         (should (equal (emacs-reader-picker-test--read (kbd "C-q l i b TAB RET")) opds))
         (should (equal (emacs-reader-picker-test--read (kbd "C-q o p e n TAB RET")) json))
@@ -67,7 +76,7 @@
 
 (ert-deftest emacs-reader-picker-native-keys ()
   (let ((completing-read-function #'completing-read-default))
-    (emacs-reader-picker-test--exercise)))
+    (emacs-reader-picker-test--isolated (emacs-reader-picker-test--exercise))))
 
 (declare-function vertico-mode "ext:vertico")
 (ert-deftest emacs-reader-picker-vertico-keys ()
@@ -78,7 +87,7 @@
                                               (setq used-vertico t)))
                                  pre-command-hook)))
     (unwind-protect
-        (progn
+        (emacs-reader-picker-test--isolated
           (vertico-mode 1)
           (emacs-reader-picker-test--exercise)
           (should used-vertico)
@@ -89,6 +98,25 @@
                               (kbd "A l <down> <up> <down> C-SPC C-SPC C-SPC RET"))
                              `((type . "all") (sources ,(cadr sources))))))))
       (unless active (vertico-mode -1)))))
+
+(ert-deftest emacs-reader-picker-last-selection-follows-registry ()
+  (emacs-reader-picker-test--isolated
+   (let* ((old (copy-tree emacs-reader-picker-test--records))
+          (rows old)
+          (completing-read-function #'completing-read-default))
+     (cl-letf (((symbol-function 'emacs-reader-local--records) (lambda (_) rows)))
+       (emacs-reader-picker-test--read (kbd "S o l o TAB RET"))
+       (setq rows (copy-tree old))
+       (setf (alist-get 'name (car rows)) "改名"
+             (alist-get 'aliases (car rows)) ["one"]
+             (alist-get 'url (car rows)) "changed")
+       (should (equal (emacs-reader-picker-test--read (kbd "RET")) (car rows)))
+       (setf (alist-get 'enabled (car rows)) :false)
+       (should-error (emacs-reader-picker-test--read (kbd "RET")) :type 'user-error)
+       (emacs-reader-picker-test--read (kbd "o RET"))
+       (push '((type . "opds") (name . "New") (url . "four")) rows)
+       (let ((selected (emacs-reader-picker-test--read (kbd "RET"))))
+         (should (= 2 (length (alist-get 'sources selected)))))))))
 
 (ert-deftest emacs-reader-picker-no-empty-all ()
   (cl-letf (((symbol-function 'emacs-reader-local--records) #'ignore))

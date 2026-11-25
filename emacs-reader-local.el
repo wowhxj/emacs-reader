@@ -421,21 +421,49 @@ Once the worker starts, it owns TEMPORARY input until completion."
                                              command))))))
     (use-local-map (make-composed-keymap map (current-local-map)))))
 
+(defun emacs-reader-local--last-sources (saved sources)
+  "Resolve SAVED scope against the currently enabled SOURCES."
+  (let ((kind (alist-get 'kind saved)))
+    (if (or (null saved) (equal kind "scope"))
+        (let ((scope (alist-get 'scope saved)))
+          (if scope (seq-filter (lambda (s) (equal scope (alist-get 'type s))) sources) sources))
+      (delq nil
+            (mapcar (lambda (ref)
+                      (cl-find-if
+                       (lambda (src)
+                         (and (equal (alist-get 'type src) (alist-get 'type ref))
+                              (or (equal (alist-get 'url src) (alist-get 'url ref))
+                                  (and (equal (alist-get 'type src) "legado")
+                                       (seq-contains-p (alist-get 'aliases src)
+                                                       (alist-get 'url ref) #'equal)))))
+                       sources))
+                    (append (alist-get 'sources saved) nil))))))
+
+(defun emacs-reader-local--picker-refs (sources)
+  "Return a JSON array of stable references to SOURCES."
+  (vconcat (mapcar (lambda (s) (list (assq 'type s) (assq 'url s))) sources)))
+
 (defun emacs-reader-local--pick-scope (choices scope)
   "Read from CHOICES within SCOPE, decorating marked source names."
   (let* ((visible (if scope
                       (cl-remove-if-not (lambda (pair) (equal (alist-get 'type (cdr pair)) scope))
                                         choices)
                     choices))
-         (default (and visible "【全部】"))
+         (file (expand-file-name "last-search-sources.json" emacs-reader-directory))
+         (saved (and (not scope) (file-readable-p file) (emacs-reader-local--read file)))
+         (all (mapcar #'cdr visible))
+         (prior (unless scope (emacs-reader-local--last-sources saved all)))
+         (last-label "【按照上次选的源】")
+         (default (and visible (if scope "【全部】" last-label)))
          (table (when visible
-                  (cons (list default '(type . "all") (cons 'sources (mapcar #'cdr visible)))
-                        visible)))
+                  (append (unless scope
+                            (list (list last-label '(type . "all") (cons 'sources prior))))
+                          (list (list "【全部】" '(type . "all") (cons 'sources all))) visible)))
          (completion-extra-properties
           (list :affixation-function
                 (lambda (names)
                   (cl-loop for name in names for src = (cdr (assoc name table))
-                           collect (list name (cond ((equal name default) "    ")
+                           collect (list name (cond ((equal (alist-get 'type src) "all") "    ")
                                                     ((memq src emacs-reader-local--marked) "[✓] ")
                                                     (t "[ ] ")) "")))))
          (prompt (format "选择书源 [%s，C-SPC 勾选/取消，RET 确认]："
@@ -443,14 +471,31 @@ Once the worker starts, it owns TEMPORARY input until completion."
     (catch 'reader-picker-scope
       (let ((choice (minibuffer-with-setup-hook (lambda () (emacs-reader-local--picker-map scope))
                       (completing-read prompt table nil t nil nil default))))
-        (cond (emacs-reader-local--marked
-               (list '(type . "all") (cons 'sources (reverse emacs-reader-local--marked))))
-              ((cdr (assoc choice table)))
-              (t (user-error "当前范围没有可选书源")))))))
+        (let* ((selected (cdr (assoc choice table)))
+               (marked (reverse emacs-reader-local--marked))
+               (group (lambda (items) (list '(type . "all") (cons 'sources items)))))
+          (cond (marked
+                 (emacs-reader-local--write file `((kind . "multi")
+                                                   (sources . ,(emacs-reader-local--picker-refs
+                                                                marked))))
+                 (funcall group marked))
+                ((null selected) (user-error "当前范围没有可选书源"))
+                ((equal choice last-label)
+                 (unless prior (user-error "上次选的书源已删除或停用，请重新选择"))
+                 (if (equal (alist-get 'kind saved) "single") (car prior) (funcall group prior)))
+                ((equal choice "【全部】")
+                 (emacs-reader-local--write file (if scope `((kind . "scope") (scope . ,scope))
+                                                   '((kind . "scope"))))
+                 selected)
+                (t
+                 (emacs-reader-local--write file `((kind . "single")
+                                                   (sources . ,(emacs-reader-local--picker-refs
+                                                                (list selected)))))
+                 selected)))))))
 
 (defun emacs-reader-local--select (types &optional allow-all)
   "Read an enabled source matching TYPES.
-With ALLOW-ALL, offer all sources in the current scope as the default.
+With ALLOW-ALL, default to the last confirmed search selection.
 From empty input, l/o/s narrow to Legado/OPDS/JSON and DEL widens.
 C-SPC toggles a source or scope.  RET confirms the marked sources."
   (let* ((sources (emacs-reader-local--records "sources"))
