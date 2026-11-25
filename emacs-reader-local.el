@@ -21,14 +21,29 @@
 (defcustom emacs-reader-books-directory nil
   "Book storage directory, absolute or relative to `emacs-reader-directory'.
 Nil means the books subdirectory of `emacs-reader-directory'.
-Shared-book entries resolve against the current setting, so move their files
-when changing it; legacy books/ entries always use the original directory."
+Shared-book entries resolve against the current setting.  Legacy books/ entries
+can also be recovered from this directory after their files are moved."
   :type '(choice (const :tag "Default" nil) directory) :group 'emacs-reader-local)
 
 (defun emacs-reader-local--books-directory (&optional directory)
   "Return the configured books directory under library DIRECTORY."
   (expand-file-name (or emacs-reader-books-directory "books")
                     (or directory emacs-reader-directory)))
+
+(defvar emacs-reader-local--relocations (make-hash-table :test 'equal)
+  "Verified relocated files, keyed by library, books directory and URL.")
+
+(defun emacs-reader-local--relocation-key (url)
+  "Return the cache key for URL in the current configuration."
+  (list (expand-file-name emacs-reader-directory)
+        (emacs-reader-local--books-directory) url))
+
+(defun emacs-reader-local--relocated-file (url)
+  "Return a previously verified relocated URL if it is unchanged."
+  (let* ((entry (gethash (emacs-reader-local--relocation-key url)
+                         emacs-reader-local--relocations))
+         (path (car-safe entry)))
+    (and path (equal (cdr entry) (emacs-reader-local--digest-signature path)) path)))
 
 (defun emacs-reader-local--resolve-file (url)
   "Resolve local book URL against its original or configured storage root."
@@ -38,7 +53,11 @@ when changing it; legacy books/ entries always use the original directory."
                   (member ".." (split-string relative "/" t)))
           (error "不安全的书籍路径：%s" url))
         (expand-file-name relative (emacs-reader-local--books-directory)))
-    (expand-file-name url emacs-reader-directory)))
+    (let ((original (expand-file-name url emacs-reader-directory)))
+      (or (and (file-regular-p original) original)
+          (and (string-prefix-p "books/" url)
+               (emacs-reader-local--relocated-file url))
+          original))))
 
 (defcustom emacs-reader-backend 'local
   "Bookshelf and search backend used by Reader commands."
@@ -262,10 +281,16 @@ Cache entries are independent per path and may be discarded at any time."
            when (and (equal (alist-get 'readerType book) "file") (stringp url)
                      (not (file-remote-p url))
                      (let ((path (emacs-reader-local--resolve-file url)))
-                       (and (file-regular-p path)
-                            (condition-case nil
-                                (equal digest (emacs-reader-local--cached-digest path))
-                              (file-error nil)))))
+                       (if (file-regular-p path)
+                           (condition-case nil
+                               (equal digest (emacs-reader-local--cached-digest path))
+                             (file-error nil))
+                         (and (string-match-p
+                               (concat "\\(?:\\`\\|--\\)" (regexp-quote digest) "\\.[^.]+\\'")
+                               (file-name-nondirectory url))
+                              (plist-get (emacs-reader-local--relocation-scan
+                                          (list url) emacs-reader-directory
+                                          emacs-reader-books-directory) :matches)))))
            return book))
 
 (defun emacs-reader-local--scan-directory (directory)
@@ -289,6 +314,91 @@ Return a plist with :files, :duplicates and :errors."
                 (file-error (push (format "%s: %s" path (error-message-string failure)) errors))))
           (file-error (push (format "%s: %s" dir (error-message-string err)) errors)))))
     (list :files (nreverse files) :duplicates duplicates :errors (nreverse errors))))
+
+(defun emacs-reader-local--relocation-digest (path)
+  "Hash PATH in constant memory when an external SHA-256 tool is available."
+  (let ((program (or (executable-find "sha256sum")
+                     (and (file-executable-p "/sbin/sha256sum") "/sbin/sha256sum")
+                     (executable-find "shasum"))))
+    (if (not program) (emacs-reader-local--digest path)
+      (with-temp-buffer
+        (let ((status (apply #'process-file program nil t nil
+                             (append (when (string= (file-name-nondirectory program) "shasum")
+                                       '("-a" "256"))
+                                     (list path)))))
+          (goto-char (point-min))
+          (unless (and (eq status 0) (looking-at "[0-9a-f]\\{64\\}"))
+            (error "SHA-256 计算失败：%s" path))
+          (match-string 0))))))
+
+(defun emacs-reader-local--relocation-cached-digest (path)
+  "Use the digest cache for PATH with a streaming hash on cache misses."
+  (let ((original (symbol-function 'emacs-reader-local--digest)))
+    (cl-letf (((symbol-function 'emacs-reader-local--digest)
+               (lambda (file)
+                 (if (or (executable-find "sha256sum")
+                         (and (file-executable-p "/sbin/sha256sum") "/sbin/sha256sum")
+                         (executable-find "shasum"))
+                     (emacs-reader-local--relocation-digest file)
+                   (funcall original file)))))
+      (emacs-reader-local--cached-digest path))))
+
+(defun emacs-reader-local--relocation-scan (urls directory books-directory)
+  "Find relocated URLS in BOOKS-DIRECTORY for library DIRECTORY in a worker."
+  (let* ((emacs-reader-directory directory)
+         (emacs-reader-books-directory books-directory)
+         (root (emacs-reader-local--books-directory))
+         (scan (and (file-directory-p root) (emacs-reader-local--scan-directory root)))
+         (files (plist-get scan :files)) results (missing 0) (ambiguous 0) (unverified 0))
+    (dolist (url urls)
+      (when (and (stringp url) (string-prefix-p "books/" url)
+                 (not (member ".." (split-string url "/" t)))
+                 (not (file-regular-p (expand-file-name url directory))))
+        (let* ((relative (substring url 6))
+               (exact (expand-file-name relative root))
+               (base (file-name-nondirectory relative))
+               (digest (and (string-match "\\(?:\\`\\|--\\)\\([0-9a-f]\\{64\\}\\)\\.[^.]+\\'" base)
+                            (match-string 1 base)))
+               (candidates (if (member exact files) (list exact)
+                             (when digest
+                               (cl-remove-if-not
+                                (lambda (path) (equal (file-name-nondirectory path) base)) files))))
+               (matches (if digest
+                            (cl-remove-if-not
+                             (lambda (path)
+                               (condition-case nil
+                                   (let ((before (emacs-reader-local--digest-signature path)))
+                                     (and before
+                                          (equal digest
+                                                 (emacs-reader-local--relocation-cached-digest
+                                                  path))
+                                          (equal before
+                                                 (emacs-reader-local--digest-signature path))))
+                                 (file-error nil))) candidates)
+                          candidates)))
+          (cond ((= (length matches) 1)
+                 (let* ((path (car matches))
+                        (signature (emacs-reader-local--digest-signature path)))
+                   (when signature
+                     (unless digest (cl-incf unverified))
+                     (push (list url path signature) results))))
+                ((> (length matches) 1) (cl-incf ambiguous))
+                (t (cl-incf missing))))))
+    (list :matches (nreverse results) :missing missing :ambiguous ambiguous
+          :unverified unverified :errors (length (plist-get scan :errors)))))
+
+(defun emacs-reader-local--recover-async (urls callback)
+  "Find relocated URLS asynchronously and invoke CALLBACK after indexing."
+  (let ((directory (expand-file-name emacs-reader-directory))
+        (books-directory (emacs-reader-local--books-directory)))
+    (emacs-reader-file-worker-start
+     'relocate (list urls directory books-directory)
+     (lambda (result failure)
+       (unless failure
+         (dolist (entry (plist-get result :matches))
+           (puthash (list directory books-directory (nth 0 entry))
+                    (cons (nth 1 entry) (nth 2 entry)) emacs-reader-local--relocations)))
+       (funcall callback result failure)))))
 
 (defun emacs-reader-local--prepare-import
     (path title author origin directory &optional books-directory)
@@ -839,6 +949,26 @@ C-SPC toggles a source or scope.  RET confirms the marked sources."
 
 (defun emacs-reader-local--fetch-file (book chapter callback)
   "Fetch BOOK's file CHAPTER or catalog, delivering its value to CALLBACK."
+  (let* ((url (alist-get 'bookUrl book))
+         (path (emacs-reader-local--resolve-file url)))
+    (if (and (string-prefix-p "books/" url) (not (file-regular-p path)))
+        (let ((buffer (current-buffer)))
+          (message "正在后台查找并验证迁移的书籍：%s" (alist-get 'name book))
+          (condition-case err
+              (emacs-reader-local--recover-async
+               (list url)
+               (lambda (_result failure)
+                 (when (buffer-live-p buffer)
+                   (with-current-buffer buffer
+                     (if (and (not failure)
+                              (file-regular-p (emacs-reader-local--resolve-file url)))
+                         (emacs-reader-local--fetch-file-ready book chapter callback)
+                       (funcall callback nil (or failure "未找到可确认的迁移书籍，或存在重名歧义")))))))
+            (error (funcall callback nil (error-message-string err)))))
+      (emacs-reader-local--fetch-file-ready book chapter callback))))
+
+(defun emacs-reader-local--fetch-file-ready (book chapter callback)
+  "Fetch BOOK CHAPTER from an already resolved file, using CALLBACK."
   (let* ((path (emacs-reader-local--resolve-file (alist-get 'bookUrl book)))
          (buffer (current-buffer))
          (inspect (and (not chapter) (or (alist-get 'readFileTitle book)

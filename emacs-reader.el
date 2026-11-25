@@ -706,6 +706,9 @@ Create the tab if necessary; otherwise reuse it."
     (emacs-reader--display-buffer buffer)
     (emacs-reader-shelf-refresh)))
 
+(defvar emacs-reader--relocation-generation 0
+  "Generation of the latest shelf relocation scan.")
+
 (defun emacs-reader-shelf-refresh ()
   "Refresh the current Reader shelf buffer."
   (interactive)
@@ -719,8 +722,39 @@ Create the tab if necessary; otherwise reuse it."
                       'face 'emacs-reader-shelf-meta)
           mode-line-process " Loading...")
     (if (eq emacs-reader-backend 'local)
-        (emacs-reader--handle-bookshelf-response
-         buffer `(:ok ((isSuccess . t) (data . ,(emacs-reader-local--records "shelf")))))
+        (let* ((books (emacs-reader-local--records "shelf"))
+               (urls (delq nil
+                           (mapcar (lambda (book)
+                                     (let ((url (alist-get 'bookUrl book)))
+                                       (and (equal (alist-get 'readerType book) "file")
+                                            (stringp url) (string-prefix-p "books/" url)
+                                            (not (file-regular-p
+                                                  (emacs-reader-local--resolve-file url)))
+                                            url))) books)))
+               (config (list (expand-file-name emacs-reader-directory)
+                             (emacs-reader-local--books-directory)))
+               (generation (cl-incf emacs-reader--relocation-generation)))
+          (emacs-reader--handle-bookshelf-response
+           buffer `(:ok ((isSuccess . t) (data . ,books))))
+          (when urls
+            (message "正在后台检查 %d 本迁移书籍…" (length urls))
+            (condition-case err
+                (emacs-reader-local--recover-async
+                 urls
+                 (lambda (result failure)
+                   (when (and (= generation emacs-reader--relocation-generation)
+                              (equal config (list (expand-file-name emacs-reader-directory)
+                                                  (emacs-reader-local--books-directory))))
+                     (if failure (message "迁移书籍检查失败：%s" failure)
+                       (when (and (buffer-live-p buffer) (eq emacs-reader-backend 'local))
+                         (emacs-reader--handle-bookshelf-response
+                          buffer `(:ok ((isSuccess . t)
+                                        (data . ,(emacs-reader-local--records "shelf"))))))
+                       (message "迁移书籍检查完成：恢复 %d（其中 %d 未经哈希验证），未找到 %d，重名歧义 %d，扫描错误 %d"
+                                (length (plist-get result :matches)) (plist-get result :unverified)
+                                (plist-get result :missing) (plist-get result :ambiguous)
+                                (plist-get result :errors))))))
+              (error (message "无法启动迁移书籍检查：%s" (error-message-string err))))))
       (emacs-reader--reader3-request
        "getBookshelf" "GET" nil
        (lambda (response)
@@ -1050,6 +1084,19 @@ Local shelf books resume and save their current chapter."
     (unless (and (stringp book-url) (not (string-empty-p book-url)))
       (user-error "This shelf item has no readable book URL"))
     (if (and (equal (alist-get 'readerType book) "file")
+             (eq (alist-get 'readerImagePdf book) t)
+             (string-prefix-p "books/" book-url)
+             (not (file-regular-p (emacs-reader-local--resolve-file book-url))))
+        (progn
+          (message "正在后台查找并验证迁移的 PDF：%s" name)
+          (emacs-reader-local--recover-async
+           (list book-url)
+           (lambda (_result failure)
+             (if (and (not failure)
+                      (file-regular-p (emacs-reader-local--resolve-file book-url)))
+                 (emacs-reader-open-book book preview)
+               (message "无法恢复 PDF：%s" (or failure "未找到或存在重名歧义"))))))
+      (if (and (equal (alist-get 'readerType book) "file")
              (eq (alist-get 'readerImagePdf book) t))
         (let ((path (emacs-reader-local--resolve-file book-url)))
           (unless (file-regular-p path) (user-error "找不到 PDF 文件：%s" path))
@@ -1082,7 +1129,7 @@ Local shelf books resume and save their current chapter."
       (with-current-buffer buffer
         (unless (or preview (alist-get 'readerType book)) (emacs-reader--load-chapter chapter))
         (emacs-reader--load-catalog))
-      buffer))))
+      buffer)))))
 
 (define-derived-mode emacs-reader-reading-mode special-mode "Reader"
   "Major mode for reading book chapters."

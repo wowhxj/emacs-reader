@@ -8,6 +8,7 @@
 (require 'emacs-reader-files)
 
 (declare-function emacs-reader-local--prepare-import "emacs-reader-local")
+(declare-function emacs-reader-local--relocation-scan "emacs-reader-local")
 
 (defun emacs-reader-file-worker--main ()
   "Read one request from the command line and print its result."
@@ -29,6 +30,8 @@
                    ('content (apply #'emacs-reader-files-content args))
                    ('import (require 'emacs-reader-local)
                             (apply #'emacs-reader-local--prepare-import args))
+                   ('relocate (require 'emacs-reader-local)
+                              (apply #'emacs-reader-local--relocation-scan args))
                    (_ (error "Unknown book operation"))) nil))
        (error (list nil (error-message-string err)))))))
 
