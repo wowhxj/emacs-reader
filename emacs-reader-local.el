@@ -18,6 +18,28 @@
 (defcustom emacs-reader-directory (locate-user-emacs-file "emacs-reader/")
   "Directory for the local bookshelf, books and source definitions."
   :type 'directory :group 'emacs-reader-local)
+(defcustom emacs-reader-books-directory nil
+  "Book storage directory, absolute or relative to `emacs-reader-directory'.
+Nil means the books subdirectory of `emacs-reader-directory'.
+Shared-book entries resolve against the current setting, so move their files
+when changing it; legacy books/ entries always use the original directory."
+  :type '(choice (const :tag "Default" nil) directory) :group 'emacs-reader-local)
+
+(defun emacs-reader-local--books-directory (&optional directory)
+  "Return the configured books directory under library DIRECTORY."
+  (expand-file-name (or emacs-reader-books-directory "books")
+                    (or directory emacs-reader-directory)))
+
+(defun emacs-reader-local--resolve-file (url)
+  "Resolve local book URL against its original or configured storage root."
+  (if (string-prefix-p "shared-books/" url)
+      (let ((relative (substring url (length "shared-books/"))))
+        (when (or (file-name-absolute-p relative)
+                  (member ".." (split-string relative "/" t)))
+          (error "不安全的书籍路径：%s" url))
+        (expand-file-name relative (emacs-reader-local--books-directory)))
+    (expand-file-name url emacs-reader-directory)))
+
 (defcustom emacs-reader-backend 'local
   "Bookshelf and search backend used by Reader commands."
   :type '(choice (const local) (const reader3)) :group 'emacs-reader-local)
@@ -27,6 +49,7 @@
 (autoload 'emacs-reader-files-chapters "emacs-reader-files")
 (autoload 'emacs-reader-files-content "emacs-reader-files")
 (autoload 'emacs-reader-files-metadata "emacs-reader-files")
+(autoload 'emacs-reader-files-supported-p "emacs-reader-files")
 (autoload 'emacs-reader-wendian-import-page "emacs-reader-wendian-read")
 (autoload 'emacs-reader-legado-search "emacs-reader-legado")
 (autoload 'emacs-reader-legado-chapters "emacs-reader-legado")
@@ -74,11 +97,12 @@
   (emacs-reader-local--record "shelf" (concat (alist-get 'origin book) "\0"
                                               (alist-get 'bookUrl book))))
 
-(defun emacs-reader-local--add (book)
-  "Add BOOK to the local shelf, preserving saved progress on reimport."
+(defun emacs-reader-local--add (book &optional no-refresh)
+  "Add BOOK to the local shelf, preserving saved progress on reimport.
+With NO-REFRESH, leave any shelf buffer untouched."
   (let ((path (emacs-reader-local--shelf-path book)))
     (unless (file-exists-p path) (emacs-reader-local--write path book)))
-  (when-let* ((shelf (get-buffer "*Reader Shelf*")))
+  (when-let* ((shelf (and (not no-refresh) (get-buffer "*Reader Shelf*"))))
     (when (eq emacs-reader-backend 'local)
       (with-current-buffer shelf (emacs-reader-shelf-refresh))))
   book)
@@ -126,8 +150,8 @@ TITLE, AUTHOR and ORIGIN override book metadata.  A returned preview owns
 TEMPORARY input until close.  The caller owns it if opening signals."
   (setq path (expand-file-name path))
   (unless (and (not (file-remote-p path)) (file-regular-p path)
-               (member (downcase (or (file-name-extension path) "")) '("epub" "txt")))
-    (user-error "请选择本地 EPUB 或 TXT 文件"))
+               (emacs-reader-files-supported-p path))
+    (user-error "请选择支持的本地书籍文件"))
   (let* ((book `((readerType . "file") (previewFile . t) (bookUrl . ,path) (origin . "file")
                  (name . ,(or title (file-name-base path))) (author . ,(or author ""))
                  (originName . ,(or origin "本地文件"))
@@ -176,45 +200,167 @@ TEMPORARY input until close.  The caller owns it if opening signals."
 (defun emacs-reader-import-file (path &optional title author origin background)
   "Import PATH with TITLE, AUTHOR and ORIGIN.  With BACKGROUND, return a worker.
 Interactive imports run in the background.  Lisp callers normally receive a book."
-  (interactive (list (read-file-name "导入 EPUB 或 TXT：" nil nil t) nil nil nil t))
+  (interactive (list (read-file-name "导入 EPUB、TXT、PDF、MOBI、Markdown 或 Org：" nil nil t)
+                     nil nil nil t))
   (if background
       (emacs-reader-import-file-async path title author origin)
     (prog1 (emacs-reader-local--add
-            (emacs-reader-local--prepare-import path title author origin emacs-reader-directory))
+            (emacs-reader-local--prepare-import path title author origin emacs-reader-directory
+                                                emacs-reader-books-directory))
       (message "已加入本地书架"))))
 
-(defun emacs-reader-local--prepare-import (path title author origin directory)
-  "Copy PATH into DIRECTORY and return a shelf record with TITLE, AUTHOR and ORIGIN."
-  (let ((ext (downcase (or (file-name-extension path) ""))))
-    (unless (member ext '("epub" "txt")) (user-error "支持 EPUB 和 TXT 文件"))
-    (let* ((inspection (emacs-reader-files--inspect path))
-           (metadata (car inspection))
-           (chapters (cadr inspection))
-           (digest (with-temp-buffer
-                     (set-buffer-multibyte nil)
-                     (insert-file-contents-literally path)
-                     (secure-hash 'sha256 (current-buffer))))
-           (relative (concat "books/" digest "." ext))
-           (target (expand-file-name relative directory)))
-      (unless chapters (user-error "文件中没有可读章节"))
-      (make-directory (file-name-directory target) t)
-      (unless (file-exists-p target)
-        (let ((temp (make-temp-file (expand-file-name ".book-" (file-name-directory target)))))
-          (unwind-protect (progn (copy-file path temp t) (rename-file temp target t))
-            (when (file-exists-p temp) (delete-file temp)))))
-      `((readerType . "file") (bookUrl . ,relative) (origin . "file")
-        (originName . ,(or origin "本地文件"))
-        (name . ,(or title (plist-get metadata :title) (file-name-base path)))
-        (author . ,(or author (plist-get metadata :author) ""))
-        (totalChapterNum . ,(length chapters))))))
+(defun emacs-reader-local--digest (path)
+  "Return the SHA-256 digest of PATH."
+  (with-temp-buffer
+    (set-buffer-multibyte nil)
+    (insert-file-contents-literally path)
+    (secure-hash 'sha256 (current-buffer))))
+
+(defun emacs-reader-local--digest-signature (path)
+  "Return a reliable signature for PATH, or nil if unavailable."
+  (condition-case nil
+      (let* ((attrs (file-attributes path 'integer))
+             (device (file-attribute-device-number attrs))
+             (inode (file-attribute-inode-number attrs))
+             (size (file-attribute-size attrs))
+             (mtime (file-attribute-modification-time attrs))
+             (ctime (file-attribute-status-change-time attrs)))
+        (when (and attrs (integerp device) (integerp inode) (integerp size)
+                   mtime ctime (null (file-attribute-type attrs)))
+          (prin1-to-string (list device inode size mtime ctime))))
+    (file-error nil)))
+
+(defun emacs-reader-local--cached-digest (path)
+  "Return SHA-256 of PATH, caching it when its file signature is stable.
+Cache entries are independent per path and may be discarded at any time."
+  (setq path (expand-file-name path))
+  (let* ((signature (and (not (file-remote-p path))
+                         (emacs-reader-local--digest-signature path)))
+         (index (emacs-reader-local--record "digest-index" path))
+         (entry (and signature (not (file-symlink-p index))
+                     (condition-case nil
+                         (let ((value (emacs-reader-local--read index)))
+                           (and (listp value)
+                                (cl-every #'consp value) value))
+                       (error nil))))
+         (cached (alist-get 'digest entry)))
+    (if (and (equal signature (alist-get 'signature entry))
+             (stringp cached) (string-match-p "\\`[0-9a-f]\\{64\\}\\'" cached))
+        cached
+      (let ((digest (emacs-reader-local--digest path)))
+        (when (and signature (equal signature (emacs-reader-local--digest-signature path)))
+          ;; A failed or competing cache write must never prevent an import.
+          (condition-case nil
+              (emacs-reader-local--write index `((signature . ,signature) (digest . ,digest)))
+            (error nil)))
+        digest))))
+
+(defun emacs-reader-local--find-digest (digest)
+  "Find a shelf book whose file has DIGEST, preserving its record."
+  (cl-loop for book in (emacs-reader-local--records "shelf")
+           for url = (alist-get 'bookUrl book)
+           when (and (equal (alist-get 'readerType book) "file") (stringp url)
+                     (not (file-remote-p url))
+                     (let ((path (emacs-reader-local--resolve-file url)))
+                       (and (file-regular-p path)
+                            (condition-case nil
+                                (equal digest (emacs-reader-local--cached-digest path))
+                              (file-error nil)))))
+           return book))
+
+(defun emacs-reader-local--scan-directory (directory)
+  "Find supported regular files under DIRECTORY without following symbolic links.
+Return a plist with :files, :duplicates and :errors."
+  (let ((pending (list directory)) (seen (make-hash-table :test 'equal))
+        files errors (duplicates 0))
+    (while pending
+      (let ((dir (pop pending)))
+        (condition-case err
+            (dolist (path (directory-files dir t directory-files-no-dot-files-regexp t))
+              (condition-case failure
+                  (unless (file-symlink-p path)
+                    (cond ((file-directory-p path) (push path pending))
+                          ((and (file-regular-p path) (emacs-reader-files-supported-p path))
+                           (let* ((attrs (file-attributes path 'integer))
+                                  (identity (cons (file-attribute-device-number attrs)
+                                                  (file-attribute-inode-number attrs))))
+                             (if (gethash identity seen) (cl-incf duplicates)
+                               (puthash identity t seen) (push path files))))))
+                (file-error (push (format "%s: %s" path (error-message-string failure)) errors))))
+          (file-error (push (format "%s: %s" dir (error-message-string err)) errors)))))
+    (list :files (nreverse files) :duplicates duplicates :errors (nreverse errors))))
+
+(defun emacs-reader-local--prepare-import
+    (path title author origin directory &optional books-directory)
+  "Import PATH into DIRECTORY with TITLE, AUTHOR, ORIGIN and BOOKS-DIRECTORY."
+  (let ((emacs-reader-books-directory books-directory))
+    (if (eq title :scan-directory)
+        (emacs-reader-local--scan-directory path)
+      (unless (emacs-reader-files-supported-p path) (user-error "不支持的书籍格式：%s" path))
+      (let* ((ext (downcase (or (file-name-extension path) "")))
+             (emacs-reader-directory directory)
+             (digest (emacs-reader-local--cached-digest path))
+             (existing (emacs-reader-local--find-digest digest))
+             (inspection (unless existing (emacs-reader-files--inspect path)))
+             (metadata (car inspection))
+             (chapters (cadr inspection))
+             (name (or title (plist-get metadata :title) (file-name-base path)))
+             (safe-name (replace-regexp-in-string "[[:cntrl:]/\\:*?\"<>|]+" "_" name))
+             (safe-name (string-trim safe-name "[. ]+" "[. ]+"))
+             (safe-name (if (string-empty-p safe-name) "book"
+                          (truncate-string-to-width safe-name 80)))
+             (books (emacs-reader-local--books-directory directory))
+             (inside (and (file-directory-p books)
+                          (file-in-directory-p (file-truename path) (file-truename books))))
+             (old-copy (and (not inside) (file-directory-p books)
+                            (cl-find-if
+                             (lambda (candidate)
+                               (and (file-regular-p candidate)
+                                    (not (file-symlink-p candidate))
+                                    (equal digest (emacs-reader-local--cached-digest candidate))))
+                             (directory-files books t
+                                              (concat "\\(?:^\\|--\\)" digest "\\.[^.]+\\'")))))
+             (relative (concat (if (equal (directory-file-name (expand-file-name books))
+                                          (directory-file-name
+                                           (expand-file-name "books" directory)))
+                                   "books/" "shared-books/")
+                               (cond (inside (file-relative-name (file-truename path)
+                                                                 (file-truename books)))
+                                     (old-copy (file-relative-name old-copy books))
+                                     (t (concat safe-name "--" digest "." ext)))))
+             (target (expand-file-name (substring relative (1+ (string-match "/" relative)))
+                                       books)))
+        (unless (or existing chapters) (user-error "文件中没有可读章节"))
+        (or existing
+            (progn
+              (unless inside
+                (make-directory (file-name-directory target) t)
+                (unless (file-exists-p target)
+                  (let ((temp (make-temp-file
+                               (expand-file-name ".book-" (file-name-directory target)))))
+                    (unwind-protect
+                        (progn (copy-file path temp t)
+                               (condition-case nil (rename-file temp target nil)
+                                 (file-already-exists nil)))
+                      (when (file-exists-p temp) (delete-file temp)))))
+                (unless (equal digest (emacs-reader-local--cached-digest target))
+                  (error "书库目标文件冲突：%s" target)))
+              `((readerType . "file") (bookUrl . ,relative) (origin . "file")
+                (readerOwned . ,(if inside :false t))
+                ,@(when (plist-get metadata :image-pdf) '((readerImagePdf . t)))
+                (originName . ,(or origin "本地文件"))
+                (name . ,(or title (plist-get metadata :title) (file-name-base path)))
+                (author . ,(or author (plist-get metadata :author) ""))
+                (totalChapterNum . ,(length chapters)))))))))
 
 (defun emacs-reader-import-file-async (path &optional title author origin callback temporary)
   "Import PATH with TITLE, AUTHOR and ORIGIN, then call CALLBACK with (BOOK ERROR).
 Once the worker starts, it owns TEMPORARY input until completion."
   (let ((directory (expand-file-name emacs-reader-directory))
+        (books-directory emacs-reader-books-directory)
         (path (expand-file-name path)))
     (emacs-reader-file-worker-start
-     'import (list path title author origin directory)
+     'import (list path title author origin directory books-directory)
      (lambda (book failure)
        (unwind-protect
            (unless failure
@@ -227,6 +373,111 @@ Once the worker starts, it owns TEMPORARY input until completion."
              (file-error (message "临时书籍清理失败：%s" (error-message-string err))))))
        (if callback (funcall callback book failure)
          (if failure (message "导入失败：%s" failure) (message "已加入本地书架")))))))
+
+(defvar emacs-reader-local--directory-imports (make-hash-table :test 'equal)
+  "Active directory imports keyed by their library directory.")
+
+;;;###autoload
+(defun emacs-reader-cancel-directory-import ()
+  "Cancel the directory import for the current library."
+  (interactive)
+  (let* ((library (file-name-as-directory (expand-file-name emacs-reader-directory)))
+         (task (gethash library emacs-reader-local--directory-imports)))
+    (unless task (user-error "当前书库没有正在进行的目录导入"))
+    (funcall task)))
+
+;;;###autoload
+(defun emacs-reader-import-directory (directory &optional callback)
+  "Import supported files recursively from DIRECTORY in the background.
+CALLBACK, when non-nil, receives a plist with counts and errors."
+  (interactive (list (read-directory-name "选择要递归导入的目录：" nil nil t)))
+  (when (or (file-remote-p directory) (not (file-directory-p directory)))
+    (user-error "请选择本地目录"))
+  (let* ((library (file-name-as-directory (expand-file-name emacs-reader-directory)))
+         (books-directory emacs-reader-books-directory)
+         (root (expand-file-name directory))
+         (added 0) (duplicates 0) (done 0) (total 0) errors files
+         (phase 'scanning) process cancelled finished cancel)
+    (when (gethash library emacs-reader-local--directory-imports)
+      (user-error "当前书库已有目录导入任务"))
+    (cl-labels
+        ((finish ()
+           (unless finished
+             (setq finished t)
+             (when (eq (gethash library emacs-reader-local--directory-imports) cancel)
+               (remhash library emacs-reader-local--directory-imports))
+             (let ((result (list :cancelled cancelled :done done :added added
+                                 :duplicates duplicates :errors (nreverse errors)
+                                 :total (unless (eq phase 'scanning) total))))
+               (when errors
+                 (with-current-buffer (get-buffer-create "*Reader Import Errors*")
+                   (let ((inhibit-read-only t))
+                     (erase-buffer)
+                     (insert (mapconcat #'identity (plist-get result :errors) "\n"))
+                     (special-mode))))
+               (when-let* ((shelf (get-buffer "*Reader Shelf*")))
+                 (when (and (eq emacs-reader-backend 'local)
+                            (equal (file-name-as-directory
+                                    (expand-file-name emacs-reader-directory)) library))
+                   (with-current-buffer shelf (emacs-reader-shelf-refresh))))
+               (message "目录导入%s：已处理 %d/%s，未处理 %s，新增 %d，重复 %d，错误 %d%s"
+                        (if cancelled "已取消" "完成") done
+                        (if (eq phase 'scanning) "总数未知" (number-to-string total))
+                        (if (eq phase 'scanning) "未知" (number-to-string (- total done)))
+                        added duplicates (length errors)
+                        (if errors "（见 *Reader Import Errors*）" ""))
+               (when callback (funcall callback result)))))
+         (next ()
+           (if (or finished cancelled (null files)) (finish)
+             (let ((path (pop files)) called)
+               (setq phase 'importing process nil)
+               (message "目录检查 %d/%d：%s（已跳过重复 %d，新增 %d）"
+                        (1+ done) total (file-name-nondirectory path) duplicates added)
+               (condition-case err
+                   (emacs-reader-file-worker-start
+                    'import (list path nil nil nil library books-directory)
+                    (lambda (book failure)
+                      (unless (or called finished)
+                        (setq called t)
+                        (let ((emacs-reader-directory library))
+                          (condition-case problem
+                              (if failure (push (format "%s: %s" path failure) errors)
+                                (if (file-exists-p (emacs-reader-local--shelf-path book))
+                                    (cl-incf duplicates)
+                                  (emacs-reader-local--add book t)
+                                  (cl-incf added)))
+                            (error (push (format "%s: %s" path (error-message-string problem))
+                                         errors))))
+                        (cl-incf done)
+                        (next))))
+                 (error (push (format "%s: %s" path (error-message-string err)) errors)
+                        (cl-incf done) (run-at-time 0 nil #'next)))))))
+      (setq cancel (lambda ()
+                     (unless cancelled
+                       (setq cancelled t)
+                       (if (eq phase 'scanning)
+                           (progn (when (processp process) (delete-process process))
+                                  (finish))
+                         (message "正在取消目录导入：已完成 %d/%d 本，当前书完成后停止（剩余至少 %d 本）"
+                                  done total (max 0 (1- (- total done))))))))
+      (puthash library cancel emacs-reader-local--directory-imports)
+      (message "正在后台扫描目录：%s" root)
+      (condition-case err
+          (setq process (emacs-reader-file-worker-start
+                         'import (list root :scan-directory nil nil library books-directory)
+                         (lambda (result failure)
+                           (unless finished
+                             (if cancelled (finish)
+                               (if failure
+                                   (progn (push (format "%s: %s" root failure) errors) (finish))
+                                 (setq files (plist-get result :files)
+                                       duplicates (plist-get result :duplicates)
+                                       errors (nreverse (plist-get result :errors))
+                                       total (length files) phase 'importing)
+                                 (next)))))))
+        (error (when (eq (gethash library emacs-reader-local--directory-imports) cancel)
+                 (remhash library emacs-reader-local--directory-imports))
+               (signal (car err) (cdr err)))))))
 
 (declare-function emacs-reader--selected-shelf-book "emacs-reader")
 
@@ -248,17 +499,23 @@ Once the worker starts, it owns TEMPORARY input until completion."
                           (url (alist-get 'bookUrl other)))
                      (and (equal (alist-get 'readerType other) "file")
                           (stringp url) (not (file-remote-p url))
-                          (file-equal-p (expand-file-name url emacs-reader-directory) copy)))))
+                          (file-equal-p (emacs-reader-local--resolve-file url) copy)))))
 
 (defun emacs-reader-local--shelf-copy (record)
   "Return (ACTION . PATH) for the existing copy owned by RECORD, or nil."
   (let ((book (emacs-reader-local--read (emacs-reader-local--delete-path record))))
     (unless (equal record (emacs-reader-local--shelf-path book))
       (user-error "书架记录已变更，请刷新后重试"))
-    (when (equal (alist-get 'readerType book) "file")
+    (when (and (equal (alist-get 'readerType book) "file")
+               (not (eq (alist-get 'readerOwned book) :false))
+               (not (and (stringp (alist-get 'bookUrl book))
+                         (string-prefix-p "shared-books/" (alist-get 'bookUrl book)))))
       (let ((url (alist-get 'bookUrl book)) (case-fold-search nil))
         (unless (and (stringp url)
-                     (string-match-p "\\`books/[0-9a-f]\\{64\\}\\.\\(?:epub\\|txt\\)\\'" url))
+                     (string-match-p (concat "\\`books/\\(?:[^/]+--\\)?[0-9a-f]\\{64\\}\\."
+                                             "\\(?:epub\\|txt\\|pdf\\|mobi\\|md\\|"
+                                             "markdown\\|org\\)\\'")
+                                     url))
           (user-error "拒绝删除非受管书库路径 %s" url))
         (let ((copy (emacs-reader-local--delete-path
                      (expand-file-name url emacs-reader-directory))))
@@ -475,7 +732,7 @@ Once the worker starts, it owns TEMPORARY input until completion."
                            collect (list name (cond ((equal (alist-get 'type src) "all") "    ")
                                                     ((memq src emacs-reader-local--marked) "[✓] ")
                                                     (t "[ ] "))
-                                          (if (equal name last-label) last-summary ""))))))
+                                         (if (equal name last-label) last-summary ""))))))
          (prompt (format "选择书源 [%s，C-SPC 勾选/取消，RET 确认]："
                          (if scope (format "%s，DEL 返回" scope) "l Legado，o OPDS，s JSON"))))
     (catch 'reader-picker-scope
@@ -582,7 +839,7 @@ C-SPC toggles a source or scope.  RET confirms the marked sources."
 
 (defun emacs-reader-local--fetch-file (book chapter callback)
   "Fetch BOOK's file CHAPTER or catalog, delivering its value to CALLBACK."
-  (let* ((path (expand-file-name (alist-get 'bookUrl book) emacs-reader-directory))
+  (let* ((path (emacs-reader-local--resolve-file (alist-get 'bookUrl book)))
          (buffer (current-buffer))
          (inspect (and (not chapter) (or (alist-get 'readFileTitle book)
                                          (alist-get 'readFileAuthor book))))

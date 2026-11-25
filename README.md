@@ -10,7 +10,7 @@ Emacs 原生阅读客户端。书架、已导入的文件和章节进度保存�
 (global-set-key (kbd "C-c r") #'emacs-reader-shelf)
 ```
 
-运行 `M-x emacs-reader-shelf`，按 `i` 导入 TXT 或 EPUB，按 `RET` 阅读。EPUB 需要 Python 3 和带 libxml 的 Emacs。默认数据目录是 `user-emacs-directory` 下的 `emacs-reader/`，可通过 `emacs-reader-directory` 更改。备份或迁移时复制整个目录即可。本地书架与旧 NAS 书架分别保存；要访问旧书架，请将 `emacs-reader-backend` 设为 `reader3`，使用原有服务器配置运行 `M-x emacs-reader-login`。
+运行 `M-x emacs-reader-shelf`，按 `i` 导入单个文件，按 `I` 选择目录并递归导入，按 `RET` 阅读。目录导入期间可在书架按 `C-c C-k`（或运行 `M-x emacs-reader-cancel-directory-import`）取消；扫描阶段立即停止，正在处理的单本书完成后不再导入后续文件，已导入的书保留。导入按文件内容的 SHA-256 去重；文件未变化时复用书库内的摘要索引，首次检查或文件变化后仍需计算。索引可删除，之后会自动重建。支持 EPUB、TXT、PDF、MOBI、Markdown（`.md` / `.markdown`）和 Org（`.org`）。EPUB 需要 Python 3 和带 libxml 的 Emacs；PDF 需要 `pdftotext` 或 `mutool`；MOBI 需要 Calibre 的 `ebook-convert`。带文字层的 PDF 按页提取正文；没有文字层的扫描 PDF 可入架并调用 EmuReader 显示原页面，文字朗读和翻译仍需 OCR。默认数据目录是 `user-emacs-directory` 下的 `emacs-reader/`，可通过 `emacs-reader-directory` 更改。备份或迁移时复制整个目录即可。书籍文件目录可以通过 `emacs-reader-books-directory` 单独设置，例如 `(setq emacs-reader-books-directory "~/Books/Shared/")`；`nil` 表示书库目录下的 `books/`。设置独立目录不会自动移动旧书：原 `books/` 中已登记的书继续从原书库读取，新导入的书写入新目录。之后如果再次更换共享目录，需要先把原共享目录内容复制到新目录；这些书的记录会跟随当前共享目录解析。将已有文件放进共享目录后，可按 `I` 选择该目录登记，源文件无需复制。本地书架与旧 NAS 书架分别保存；要访问旧书架，请将 `emacs-reader-backend` 设为 `reader3`，使用原有服务器配置运行 `M-x emacs-reader-login`。
 
 ## 管理书源
 
@@ -104,7 +104,7 @@ Legado 支持 HTML/CSS 选择器、tag/class/id 元素链、索引与排除、�
 | 目录 | `RET` | 跳转选中章节 |
 | 全部 | `q` | 关闭当前 buffer |
 
-删除本地书籍会移除书架记录和章节进度。若为 EPUB 或 TXT，最后一条引用被移除时也会删除书库中的文件副本。导入前的原文件保留。Reader3 书架继续使用服务器端管理。
+删除本地书籍会移除书架记录和章节进度。对于由阅读器复制管理的本地文件，最后一条引用被移除时也会删除书库中的副本；导入前的原文件保留。已在书籍目录内的手动放置文件会直接登记，无需复制，删除书架记录时保留该文件。设置独立共享目录后，删除书架记录也会保留共享目录中的文件。Reader3 书架继续使用服务器端管理。
 
 ### 双语阅读与译稿
 
@@ -144,7 +144,7 @@ Legado 支持 HTML/CSS 选择器、tag/class/id 元素链、索引与排除、�
       emacs-reader-tts-format 'mp3)
 ```
 
-`emacs-reader-tts-rate` 调节语速，默认 `1.0`。如服务需要 Bearer token，设置 `emacs-reader-tts-api-key-env` 为 Emacs 进程可读的环境变量名（不是密钥本身）；仅 HTTPS 或本机回环 HTTP 可以发送 token。在线合成会把正文发送给该服务，上面的 HTTP 地址不加密；敏感内容请使用本地服务。
+`emacs-reader-tts-rate` 设置默认语速，默认 `1.0`。阅读页按 `>` 加快、`<` 减慢，每次 0.1 倍，范围 0.5～2.0；朗读中调整会从当前段重新朗读并重新生成预取音频。页面顶部在朗读时显示当前语速，调整只作用于当前阅读缓冲区。如服务需要 Bearer token，设置 `emacs-reader-tts-api-key-env` 为 Emacs 进程可读的环境变量名（不是密钥本身）；仅 HTTPS 或本机回环 HTTP 可以发送 token。在线合成会把正文发送给该服务，上面的 HTTP 地址不加密；敏感内容请使用本地服务。
 
 端点返回的音频需本机有 `afplay`（macOS 自带）、`mpv` 或 `ffplay`。`r` 从光标所在段落开始朗读，播放时高亮并预取下一段。本章读完后自动加载下一章，从首段继续，直到全书读完；下一章加载失败时会停止。等待自动翻章时也可按 `r` 停止朗读；手动切章或关闭缓冲区会停止并清理预取。朗读不同步服务器进度。
 

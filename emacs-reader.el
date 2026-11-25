@@ -114,6 +114,8 @@ For WSL without Linux audio, use e.g. (\"mpv.exe\" \"--no-video\")."
   "Face of the paragraph currently being read aloud."
   :group 'emacs-reader)
 
+(make-variable-buffer-local 'emacs-reader-tts-rate)
+
 (defvar-local emacs-reader--tts-active nil)
 (defvar-local emacs-reader--tts-generation 0)
 (defvar-local emacs-reader--tts-process nil)
@@ -649,6 +651,8 @@ Create the tab if necessary; otherwise reuse it."
     ("g" "刷新书架" emacs-reader-shelf-refresh)]
    ["本地书库" :if (lambda () (eq emacs-reader-backend 'local))
     ("i" "导入书籍" emacs-reader-import-file)
+    ("I" "递归导入目录" emacs-reader-import-directory)
+    ("C-c C-k" "取消目录导入" emacs-reader-cancel-directory-import)
     ("d" "删除当前书籍…" emacs-reader-shelf-delete)
     ("o" "浏览 OPDS 目录" emacs-reader-browse-catalog)
     ("S" "管理书源" emacs-reader-sources)]])
@@ -804,6 +808,8 @@ Create the tab if necessary; otherwise reuse it."
   (hl-line-mode 1))
 
 (define-key emacs-reader-shelf-mode-map (kbd "i") #'emacs-reader-import-file)
+(define-key emacs-reader-shelf-mode-map (kbd "I") #'emacs-reader-import-directory)
+(define-key emacs-reader-shelf-mode-map (kbd "C-c C-k") #'emacs-reader-cancel-directory-import)
 (define-key emacs-reader-shelf-mode-map (kbd "o") #'emacs-reader-browse-catalog)
 (define-key emacs-reader-shelf-mode-map (kbd "s") #'emacs-reader-search)
 (define-key emacs-reader-search-mode-map (kbd "/") #'emacs-reader-filter-edit)
@@ -1027,6 +1033,10 @@ Create the tab if necessary; otherwise reuse it."
                      (with-current-buffer shelf (emacs-reader-shelf-refresh)))))
              (message "加入书架失败；可重试，未确认保存成功"))))))))
 
+(declare-function emureader-open-doc "emureader" (document))
+(declare-function emureader-ensure-module "emureader" ())
+(declare-function emureader--saveplace-find-file "emureader-saveplace" ())
+
 (defvar emacs-reader--background-preview nil
   "Open a completed download without changing the selected window when non-nil.")
 
@@ -1039,7 +1049,25 @@ Local shelf books resume and save their current chapter."
         (name (emacs-reader--book-field book 'name)))
     (unless (and (stringp book-url) (not (string-empty-p book-url)))
       (user-error "This shelf item has no readable book URL"))
-    (let* ((buffer (generate-new-buffer
+    (if (and (equal (alist-get 'readerType book) "file")
+             (eq (alist-get 'readerImagePdf book) t))
+        (let ((path (emacs-reader-local--resolve-file book-url)))
+          (unless (file-regular-p path) (user-error "找不到 PDF 文件：%s" path))
+          (unless (or (fboundp 'emureader-open-doc) (require 'emureader nil t))
+            (user-error "扫描 PDF 需要安装 emureader，请安装并配置其动态模块"))
+          (unless (fboundp 'emureader-ensure-module)
+            (user-error "emureader 不完整，请重新安装 emureader"))
+          (emureader-ensure-module)
+          (unless (fboundp 'emureader-dyn--load-doc)
+            (user-error "emureader 动态模块尚未就绪；请完成编译后重试"))
+          (emureader-open-doc path)
+          (unless (derived-mode-p 'emureader-mode)
+            (user-error "emureader 无法打开 PDF：%s" path))
+          (when (and (bound-and-true-p save-place-mode)
+                     (require 'emureader-saveplace nil t))
+            (emureader--saveplace-find-file))
+          (current-buffer))
+      (let* ((buffer (generate-new-buffer
                     (format "*Reader: %s*"
                             (if (string-empty-p name) "Book" name))))
            (chapter (max 0 (or (and (integerp (alist-get 'durChapterIndex book))
@@ -1054,7 +1082,7 @@ Local shelf books resume and save their current chapter."
       (with-current-buffer buffer
         (unless (or preview (alist-get 'readerType book)) (emacs-reader--load-chapter chapter))
         (emacs-reader--load-catalog))
-      buffer)))
+      buffer))))
 
 (define-derived-mode emacs-reader-reading-mode special-mode "Reader"
   "Major mode for reading book chapters."
@@ -1156,6 +1184,13 @@ full-width U+3000 indents, are normalized."
 (define-key emacs-reader-reading-mode-map (kbd "t") #'emacs-reader-translation-mode)
 (define-key emacs-reader-reading-mode-map (kbd "T") #'emacs-reader-translation-select-direction)
 (define-key emacs-reader-reading-mode-map (kbd "r") #'emacs-reader-toggle-read-aloud)
+;; Clear obsolete bindings when this file is reloaded in an existing session.
+(dolist (key '("+" "=" "-"))
+  (when (memq (lookup-key emacs-reader-reading-mode-map (kbd key))
+              '(emacs-reader-tts-faster emacs-reader-tts-slower))
+    (define-key emacs-reader-reading-mode-map (kbd key) nil)))
+(define-key emacs-reader-reading-mode-map (kbd ">") #'emacs-reader-tts-faster)
+(define-key emacs-reader-reading-mode-map (kbd "<") #'emacs-reader-tts-slower)
 (define-key emacs-reader-reading-mode-map (kbd "a") #'emacs-reader-add-to-shelf)
 
 (defun emacs-reader--tts-follow-window (window)
@@ -1199,6 +1234,7 @@ full-width U+3000 indents, are normalized."
         (set-window-point window (point))))
     (delete-overlay emacs-reader--tts-overlay))
   (setq emacs-reader--tts-overlay nil)
+  (emacs-reader--update-reading-header)
   (force-mode-line-update))
 
 (defun emacs-reader--tts-current-p (buffer generation)
@@ -1285,7 +1321,38 @@ full-width U+3000 indents, are normalized."
             emacs-reader--tts-native-command native
             emacs-reader--tts-position nil
             emacs-reader--tts-follow-pending nil)
+      (emacs-reader--update-reading-header)
       (emacs-reader--tts-read-paragraph (point)))))
+
+(defun emacs-reader--tts-adjust-rate (delta)
+  "Adjust this reading buffer's speech rate by DELTA and resume its paragraph."
+  (let* ((rate (/ (round (* 10 (max 0.5 (min 2.0 (+ emacs-reader-tts-rate delta))))) 10.0))
+         (active emacs-reader--tts-active)
+         (waiting (and emacs-reader--requested-chapter-index
+                       (not (equal emacs-reader--current-chapter-index
+                                   emacs-reader--requested-chapter-index))))
+         (position (or emacs-reader--tts-position (point))))
+    (when (and active waiting) (user-error "正在切换章节，请稍后调整语速"))
+    (unless (= rate emacs-reader-tts-rate)
+      (let ((native (and active emacs-reader--tts-native-command)))
+        (setq-local emacs-reader-tts-rate rate)
+        (when active
+          (emacs-reader--tts-stop)
+          (setq emacs-reader--tts-active t
+                emacs-reader--tts-native-command (and native (emacs-reader--tts-native-command)))
+          (emacs-reader--update-reading-header)
+          (emacs-reader--tts-read-paragraph position))))
+    (message "朗读语速 %.1f×%s" rate (if active "（从当前段重新朗读）" ""))))
+
+(defun emacs-reader-tts-faster ()
+  "Increase speech speed by 0.1, restarting the current paragraph if speaking."
+  (interactive)
+  (emacs-reader--tts-adjust-rate 0.1))
+
+(defun emacs-reader-tts-slower ()
+  "Decrease speech speed by 0.1, restarting the current paragraph if speaking."
+  (interactive)
+  (emacs-reader--tts-adjust-rate -0.1))
 
 (defun emacs-reader--tts-paragraph (position)
   "Return (START END TEXT) for POSITION's paragraph, or nil at chapter end."
@@ -1499,7 +1566,9 @@ Resume speech if SPEECH-GENERATION is still active.  With AT-END, show the end."
                      (emacs-reader--display-chapter
                       buffer request-id index text
                       (and (equal (alist-get 'readerType book) "file")
-                           (equal (file-name-extension book-url) "epub") 'paragraphs)
+                           (member (downcase (or (file-name-extension book-url) ""))
+                                    '("epub" "mobi" "pdf" "md" "markdown" "org"))
+                            'paragraphs)
                       speech-generation at-end)
                      (when err
                        (emacs-reader--offer-recovery
@@ -1549,6 +1618,8 @@ Resume speech if SPEECH-GENERATION is still active.  With AT-END, show the end."
           (string-replace "%" "%%"
                           (concat (emacs-reader--chapter-heading
                                     emacs-reader--current-book emacs-reader--current-chapter-index)
+                                   (when emacs-reader--tts-active
+                                     (format " · 朗读 %.1f×" emacs-reader-tts-rate))
                                    (when (and emacs-reader-translation-mode
                                               (bound-and-true-p emacs-reader-translate--status))
                                      (concat " · " emacs-reader-translate--status)))))

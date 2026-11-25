@@ -32,10 +32,32 @@
                    (_ (error "Unknown book operation"))) nil))
        (error (list nil (error-message-string err)))))))
 
+(defun emacs-reader-file-worker--read-response ()
+  "Read and validate one complete worker response from the current buffer."
+  (condition-case err
+      (let ((response (read (current-buffer))))
+        (skip-chars-forward " \t\r\n")
+        (unless (and (eobp) (proper-list-p response) (= (length response) 2)
+                     (or (null (cadr response)) (stringp (cadr response))))
+          (error "Invalid worker response"))
+        response)
+    (error (list nil (format "Book worker response error: %s"
+                             (error-message-string err))))))
+
+(defun emacs-reader-file-worker--library ()
+  "Return the worker library, preferring newer source over bytecode."
+  (let* ((library (locate-library "emacs-reader-file-worker"))
+         (source (and library (string-suffix-p ".elc" library)
+                      (concat (file-name-sans-extension library) ".el"))))
+    (if (and source (file-exists-p source)
+             (file-newer-than-file-p source library))
+        source
+      library)))
+
 (defun emacs-reader-file-worker-start (op args callback)
   "Run OP with ARGS and deliver (RESULT ERROR) to CALLBACK exactly once."
   (let* ((default-directory temporary-file-directory)
-         (library (locate-library "emacs-reader-file-worker"))
+         (library (emacs-reader-file-worker--library))
          (program (expand-file-name invocation-name invocation-directory))
          (print-length nil) (print-level nil)
          (command (list program "-Q" "--batch" "--eval" "(setq load-prefer-newer t)"
@@ -59,7 +81,7 @@
                                 (error "Book worker %s: %s" (string-trim event)
                                        (with-current-buffer errors (string-trim (buffer-string)))))
                               (goto-char (point-min))
-                              (read (current-buffer)))
+                              (emacs-reader-file-worker--read-response))
                           (error (list nil (error-message-string failure))))
                       (kill-buffer output)
                       (kill-buffer errors))))

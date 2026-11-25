@@ -11,7 +11,11 @@
 (ert-deftest emacs-reader-translate-fetch-local-matches-reading-buffer ()
   (dolist (fixture '(("file" "book.txt" "one\nline!\ntwo。")
                      ("legado" "https://example.org" "one\nline!\ntwo。")
-                     ("file" "book.epub" "one\nline!\n\ntwo。")))
+                     ("file" "book.epub" "one\nline!\n\ntwo。")
+                     ("file" "book.mobi" "one\nline!\n\ntwo。")
+                     ("file" "book.pdf" "one\nline!\n\ntwo。")
+                     ("file" "book.md" "one\nline!\n\ntwo。")
+                     ("file" "book.org" "one\nline!\n\ntwo。")))
     (pcase-let ((`(,type ,url ,body) fixture))
       (with-temp-buffer
         (emacs-reader-reading-mode)
@@ -38,8 +42,8 @@
             (should-not emacs-reader--requested-chapter-index)
             (emacs-reader--display-chapter
              reader emacs-reader--chapter-request-id 1 body
-             (and (equal url "book.epub") 'paragraphs))
-            (should (= (length paragraphs) (if (equal url "book.epub") 3 2)))
+             (and (equal type "file") (not (equal url "book.txt")) 'paragraphs))
+            (should (= (length paragraphs) (if (and (equal type "file") (not (equal url "book.txt"))) 3 2)))
             (should (equal paragraphs (emacs-reader-translate-view-paragraphs)))))))))
 
 (ert-deftest emacs-reader-translate-fetch-reader3-catalog-and-asset ()

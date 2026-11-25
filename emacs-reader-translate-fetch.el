@@ -70,9 +70,10 @@ function discards late responses and skips subsequent catalog/content handoffs."
              (let* ((text (unless err (emacs-reader--chapter-display-text content kind)))
                     (reason (or err (emacs-reader-translate-fetch-content-error text)))
                     (window (and (buffer-live-p reader-buffer)
-                                  (with-current-buffer reader-buffer
-                                    (emacs-reader-translate-view-layout-window))))
-                     (paragraphs (unless reason (emacs-reader-translate-view-split text width window))))
+                                 (with-current-buffer reader-buffer
+                                   (emacs-reader-translate-view-layout-window))))
+                    (paragraphs (unless reason
+                                  (emacs-reader-translate-view-split text width window))))
                (finish paragraphs (or reason (unless paragraphs "本章没有正文"))))))
          (remote-response (response)
            (unless finished
@@ -109,7 +110,9 @@ function discards late responses and skips subsequent catalog/content handoffs."
                        book native
                        (lambda (text err)
                          (render text (and (equal type "file")
-                                           (equal (file-name-extension url) "epub") 'paragraphs)
+                                           (member (downcase (or (file-name-extension url) ""))
+                                                   '("epub" "mobi" "pdf" "md" "markdown" "org"))
+                                           'paragraphs)
                                  err))))))))
       (condition-case err
           (with-current-buffer reader-buffer

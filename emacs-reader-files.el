@@ -1,8 +1,9 @@
-;;; emacs-reader-files.el --- Read TXT and EPUB -*- lexical-binding: t; indent-tabs-mode: nil; fill-column: 100; -*-
+;;; emacs-reader-files.el --- Parse local books -*- lexical-binding: t; indent-tabs-mode: nil; fill-column: 100; -*-
 
 ;;; Commentary:
 ;; The chapter URL is an opaque local identifier, suitable for persisting.
-;; EPUB reading uses libxml and Python 3's standard ZIP reader.
+;; EPUB uses libxml and Python 3.  MOBI uses Calibre's ebook-convert.
+;; PDF uses Poppler's pdftotext or MuPDF's mutool.
 
 ;;; Code:
 
@@ -11,14 +12,26 @@
 (require 'subr-x)
 (require 'url-util)
 
+(require 'org-element)
+
+(defconst emacs-reader-files--extensions
+  '("txt" "epub" "pdf" "mobi" "md" "markdown" "org")
+  "Local book extensions supported by the parser.")
+
+(defun emacs-reader-files-supported-p (path)
+  "Return non-nil if PATH has a supported book extension."
+  (and (member (downcase (or (file-name-extension path) ""))
+               emacs-reader-files--extensions)
+       t))
+
 (defun emacs-reader-files--format (path)
-  "Return the supported file extension of local book PATH."
+  "Return the supported format of local book PATH."
   (when (file-remote-p path) (user-error "A local book file is required"))
   (unless (file-regular-p path) (user-error "Missing book file: %s" path))
   (let ((ext (downcase (or (file-name-extension path) ""))))
-    (unless (member ext '("txt" "epub"))
+    (unless (emacs-reader-files-supported-p path)
       (user-error "Unsupported book format: %s" ext))
-    ext))
+    (if (equal ext "markdown") "md" ext)))
 
 (defconst emacs-reader-files--heading
   (concat "^[ \t　]*\\(?:第[0-9０-９一二三四五六七八九十百千万零〇两]+[章节卷回部篇]"
@@ -46,6 +59,114 @@
           (setq start next title heading)))
       (nreverse (cons (emacs-reader-files--txt-chapter title start (point-max))
                       chapters)))))
+
+(defun emacs-reader-files--markdown-headings ()
+  "Return (START LEVEL TITLE END) entries for Markdown headings in this buffer."
+  (save-excursion
+    (goto-char (point-min))
+    ;; YAML front matter uses the same delimiter as a Setext heading.
+    (when (looking-at-p "---[ \t]*$")
+      (forward-line 1)
+      (if (re-search-forward "^\\(?:---\\|\\.\\.\\.\\)[ \t]*$" nil t)
+          (forward-line 1)
+        (goto-char (point-min))))
+    (let (headings fence previous)
+      (while (not (eobp))
+        (cond
+         ((looking-at " \\{0,3\\}\\(`\\{3,\\}\\|~\\{3,\\}\\)\\(.*\\)$")
+          (let ((run (match-string-no-properties 1)) (rest (match-string-no-properties 2)))
+            (cond (fence
+                   (when (and (string-prefix-p fence run) (string-blank-p rest))
+                     (setq fence nil)))
+                  ((or (eq (aref run 0) ?~) (not (string-match-p "`" rest)))
+                   (setq fence run))))
+          (setq previous nil))
+         (fence)
+         ((looking-at " \\{0,3\\}\\(#\\{1,6\\}\\)[ \t]+\\(.*\\)$")
+          (let* ((level (length (match-string 1)))
+                 (end (match-end 0))
+                 (title (string-trim (replace-regexp-in-string
+                                      "\\(?:\\`\\|[ \t]+\\)#+[ \t]*\\'" "" (match-string 2)))))
+            (unless (string-empty-p title)
+              (push (list (point) level title end) headings)))
+          (setq previous nil))
+         ((and previous (looking-at " \\{0,3\\}\\(=+\\|-+\\)[ \t]*$"))
+          (push (list (car previous) (if (eq (char-after (match-beginning 1)) ?=) 1 2)
+                      (cdr previous) (line-end-position)) headings)
+          (setq previous nil))
+         ((looking-at-p (concat "\\(?:[ \t]*$\\|    \\|\t\\| \\{0,3\\}"
+                                "\\(?:>\\|[-+*][ \t]+\\|[0-9]+[.)][ \t]+\\|---+[ \t]*$\\)\\)"))
+          (setq previous nil))
+         (t (setq previous (cons (point) (string-trim
+                                          (buffer-substring-no-properties
+                                           (point) (line-end-position)))))))
+        (forward-line 1))
+      (nreverse headings))))
+
+(defun emacs-reader-files--org-headings ()
+  "Return (START LEVEL TITLE END) entries for Org headlines in this buffer."
+  (require 'org)
+  (delay-mode-hooks (org-mode))
+  (org-element-map (org-element-parse-buffer) 'headline
+    (lambda (headline)
+      (let ((start (org-element-property :begin headline)))
+        (save-excursion
+          (goto-char start)
+          (list start (org-element-property :level headline)
+                (org-element-property :raw-value headline) (line-end-position)))))))
+
+(defun emacs-reader-files--headings (format)
+  "Return outline entries in this buffer for FORMAT."
+  (if (equal format "org") (emacs-reader-files--org-headings)
+    (emacs-reader-files--markdown-headings)))
+
+(defun emacs-reader-files--outline-preface-p (start end format)
+  "Return non-nil if START to END includes preface text for FORMAT."
+  (let ((text (buffer-substring-no-properties start end)))
+    (when (equal format "org")
+      (setq text (replace-regexp-in-string "^[ \t]*#\\+[^\n]*\n?" "" text)))
+    (not (string-blank-p text))))
+
+(defun emacs-reader-files--outline-chapters (path format)
+  "Divide outline file PATH of FORMAT at its shallowest headings."
+  (with-temp-buffer
+    (insert-file-contents path)
+    (let* ((headings (emacs-reader-files--headings format))
+           (level (and headings (apply #'min (mapcar #'cadr headings))))
+           (start (point-min))
+           (title (file-name-base path)) chapters)
+      (dolist (heading headings)
+        (pcase-let ((`(,next ,depth ,label ,_) heading))
+          (when (= depth level)
+            (when (and (< start next)
+                       (or chapters (> start (point-min))
+                           (emacs-reader-files--outline-preface-p start next format)))
+              (push (list :title title :url (format "%s:%d:%d" format start next)) chapters))
+            (setq start next title label))))
+      (nreverse (cons (list :title title :url (format "%s:%d:%d" format start (point-max)))
+                      chapters)))))
+
+(defun emacs-reader-files--range-content (path format url)
+  "Read the buffer range identified by URL from PATH of FORMAT."
+  (unless (string-match (concat "\\`" format ":\\([0-9]+\\):\\([0-9]+\\)\\'") url)
+    (user-error "Invalid %s chapter" (upcase format)))
+  (let ((start (string-to-number (match-string 1 url)))
+        (end (string-to-number (match-string 2 url))))
+    (with-temp-buffer
+      (insert-file-contents path)
+      (unless (<= (point-min) start end (point-max))
+        (user-error "%s chapter no longer matches the file" (upcase format)))
+      (narrow-to-region start end)
+      (unless (equal format "txt")
+        ;; Process backwards to keep source positions valid during edits.
+        (dolist (heading (reverse (emacs-reader-files--headings format)))
+          (pcase-let ((`(,begin ,_ ,title ,finish) heading))
+            (goto-char begin)
+            (if (equal format "org")
+                (when (looking-at "\\*+[ \t]+") (replace-match "" t t))
+              (delete-region begin finish)
+              (insert title)))))
+      (buffer-substring-no-properties (point-min) (point-max)))))
 
 (defconst emacs-reader-files--zip-reader
   "import sys, zipfile
@@ -114,9 +235,10 @@ with zipfile.ZipFile(sys.argv[1]) as book:
 
 (defun emacs-reader-files-metadata (path)
   "Return a plist with :title and optional :author for local book PATH."
-  (if (equal (emacs-reader-files--format path) "txt")
-      (list :title (file-name-base path))
-    (emacs-reader-files--epub-metadata path (cdr (emacs-reader-files--package path)))))
+  (pcase (emacs-reader-files--format path)
+    ("epub" (emacs-reader-files--epub-metadata path (cdr (emacs-reader-files--package path))))
+    ("mobi" (emacs-reader-files--with-mobi-epub path #'emacs-reader-files-metadata))
+    (_ (list :title (file-name-base path)))))
 
 (defun emacs-reader-files--epub-metadata (path doc)
   "Read metadata for PATH from package document DOC."
@@ -154,19 +276,99 @@ with zipfile.ZipFile(sys.argv[1]) as book:
               (puthash key label labels))))))
     labels))
 
+(defun emacs-reader-files--with-mobi-epub (path function &rest args)
+  "Convert MOBI PATH temporarily and call FUNCTION with the EPUB and ARGS."
+  (let ((converter (or (executable-find "ebook-convert")
+                       (user-error "Reading MOBI requires Calibre's ebook-convert")))
+        (directory (make-temp-file "reader-mobi-" t)))
+    (unwind-protect
+        (let ((epub (expand-file-name "book.epub" directory)))
+          (with-temp-buffer
+            (unless (equal 0 (call-process converter nil (list t t) nil
+                                           (expand-file-name path) epub))
+              (user-error "Cannot convert MOBI: %s" (string-trim (buffer-string)))))
+          (apply function epub args))
+      (delete-directory directory t))))
+
+(defun emacs-reader-files--mobi-chapters (epub)
+  "Return chapters of converted MOBI EPUB that contain readable text."
+  (let ((chapters (cl-remove-if
+                   (lambda (chapter)
+                     (string-blank-p (emacs-reader-files-content epub chapter)))
+                   (emacs-reader-files-chapters epub))))
+    (or chapters (user-error "MOBI has no readable chapters"))))
+
+(defun emacs-reader-files--mobi-inspect (epub)
+  "Return metadata and readable chapters of converted MOBI EPUB."
+  (list (emacs-reader-files-metadata epub) (emacs-reader-files--mobi-chapters epub)))
+
+(defun emacs-reader-files--pdf-text (path &optional page)
+  "Extract PDF PATH to text, or extract PAGE when given."
+  (let* ((poppler (executable-find "pdftotext"))
+         (mupdf (and (not poppler) (executable-find "mutool")))
+         (program (or poppler mupdf
+                      (user-error "Reading PDF requires pdftotext or mutool")))
+         (args (if poppler
+                   (append (when page (list "-f" (number-to-string page)
+                                            "-l" (number-to-string page)))
+                           (list "-enc" "UTF-8" (expand-file-name path) "-"))
+                 (append (list "draw" "-q" "-F" "txt" (expand-file-name path))
+                         (when page (list (number-to-string page)))))))
+    (with-temp-buffer
+      (let ((coding-system-for-read 'utf-8-unix))
+        (unless (equal 0 (apply #'call-process program nil '(t nil) nil args))
+          (user-error "Cannot extract PDF text: %s" (file-name-nondirectory path))))
+      (buffer-string))))
+
+(defun emacs-reader-files--pdf-chapters (path &optional allow-image)
+  "Return chapters in PDF PATH; ALLOW-IMAGE accepts pages without text."
+  (let* ((text (emacs-reader-files--pdf-text path))
+         ;; Both Poppler and MuPDF terminate each page with a form feed.
+         (pages (split-string text "\f"))
+         (count (if (string-match-p "\f[ \t\r\n]*\\'" text)
+                    (1- (length pages)) (length pages))))
+    (when (< count 1) (user-error "PDF has no readable pages"))
+    (if (string-blank-p (replace-regexp-in-string "\f" "" text))
+        (if (and allow-image (string-match-p "\f" text))
+            (cl-loop for page from 1 to count
+                     collect (list :title (format "Page %d" page) :url (format "image-pdf:%d" page)))
+          (user-error "PDF contains no extractable text; scanned pages require OCR"))
+      (cl-loop for page from 1 to count
+               collect (list :title (format "Page %d" page) :url (format "pdf:%d" page))))))
+
+(defun emacs-reader-files--pdf-content (path url)
+  "Return PDF PATH page identified by URL."
+  (unless (and (string-match "\\`pdf:\\([1-9][0-9]*\\)\\'" url)
+               (<= (length (match-string 1 url)) 8))
+    (user-error "Invalid PDF chapter"))
+  (let ((page (string-to-number (match-string 1 url))))
+    ;; MuPDF clamps out-of-range pages to the last page, so check first.
+    (when (and (not (executable-find "pdftotext"))
+               (> page (length (emacs-reader-files--pdf-chapters path))))
+      (user-error "PDF page is out of range"))
+    (replace-regexp-in-string "\f[ \t\r\n]*\\'" ""
+                              (emacs-reader-files--pdf-text path page))))
+
 (defun emacs-reader-files-chapters (path)
   "Return the chapters of local book PATH as plists with :title and :url."
-  (if (equal (emacs-reader-files--format path) "txt")
-      (emacs-reader-files--txt-chapters path)
-    (emacs-reader-files--epub-chapters path (emacs-reader-files--package path))))
+  (pcase (emacs-reader-files--format path)
+    ("txt" (emacs-reader-files--txt-chapters path))
+    ((or "md" "org") (emacs-reader-files--outline-chapters path (emacs-reader-files--format path)))
+    ("pdf" (emacs-reader-files--pdf-chapters path))
+    ("mobi" (emacs-reader-files--with-mobi-epub path #'emacs-reader-files--mobi-chapters))
+    (_ (emacs-reader-files--epub-chapters path (emacs-reader-files--package path)))))
 
 (defun emacs-reader-files--inspect (path)
-  "Return (METADATA CHAPTERS) for PATH after reading its package once."
-  (if (equal (emacs-reader-files--format path) "txt")
-      (list (list :title (file-name-base path)) (emacs-reader-files--txt-chapters path))
-    (let ((package (emacs-reader-files--package path)))
-      (list (emacs-reader-files--epub-metadata path (cdr package))
-            (emacs-reader-files--epub-chapters path package)))))
+  "Return (METADATA CHAPTERS) for local book PATH."
+  (pcase (emacs-reader-files--format path)
+    ("mobi" (emacs-reader-files--with-mobi-epub path #'emacs-reader-files--mobi-inspect))
+    ("pdf" (let* ((chapters (emacs-reader-files--pdf-chapters path t))
+                  (image (string-prefix-p "image-pdf:" (plist-get (car chapters) :url))))
+             (list (list :title (file-name-base path) :image-pdf image) chapters)))
+    ("epub" (let ((package (emacs-reader-files--package path)))
+              (list (emacs-reader-files--epub-metadata path (cdr package))
+                    (emacs-reader-files--epub-chapters path package))))
+    (_ (list (emacs-reader-files-metadata path) (emacs-reader-files-chapters path)))))
 
 (defun emacs-reader-files--epub-chapters (path package-document)
   "Return chapters of PATH using PACKAGE-DOCUMENT."
@@ -202,27 +404,23 @@ with zipfile.ZipFile(sys.argv[1]) as book:
 CHAPTER may be a chapter plist or its :url string."
   (let ((url (if (stringp chapter) chapter (plist-get chapter :url))))
     (unless (stringp url) (user-error "Missing chapter identifier"))
-    (if (equal (emacs-reader-files--format path) "txt")
-        (with-temp-buffer
-          (insert-file-contents path)
-          (unless (string-match "\\`txt:\\([0-9]+\\):\\([0-9]+\\)\\'" url)
-            (user-error "Invalid TXT chapter"))
-          (let ((start (string-to-number (match-string 1 url)))
-                (end (string-to-number (match-string 2 url))))
-            (unless (<= (point-min) start end (point-max))
-              (user-error "TXT chapter no longer matches the file"))
-            (buffer-substring-no-properties start end)))
-      ;; A stored identifier is already decoded.  Validate it without
-      ;; interpreting percent escapes a second time.
-      (when (or (string-match-p "[[:cntrl:]:\\\\]" url)
-                (cl-intersection (split-string url "/") '("" "." "..") :test #'equal))
-        (user-error "Invalid EPUB chapter identifier"))
-      (let ((doc (emacs-reader-files--dom path url t)))
-        (with-temp-buffer
-          (emacs-reader-files--render (car (dom-by-tag doc 'body)))
-          (let* ((text (replace-regexp-in-string " +" " " (buffer-string)))
-                 (lines (replace-regexp-in-string " *\n *" "\n" text)))
-            (string-trim (replace-regexp-in-string "\n\\{3,\\}" "\n\n" lines))))))))
+    (pcase (emacs-reader-files--format path)
+      ((or "txt" "md" "org")
+       (emacs-reader-files--range-content path (emacs-reader-files--format path) url))
+      ("pdf" (emacs-reader-files--pdf-content path url))
+      ("mobi" (emacs-reader-files--with-mobi-epub path #'emacs-reader-files-content url))
+      (_
+       ;; A stored identifier is already decoded.  Validate it without
+       ;; interpreting percent escapes a second time.
+       (when (or (string-match-p "[[:cntrl:]:\\\\]" url)
+                 (cl-intersection (split-string url "/") '("" "." "..") :test #'equal))
+         (user-error "Invalid EPUB chapter identifier"))
+       (let ((doc (emacs-reader-files--dom path url t)))
+         (with-temp-buffer
+           (emacs-reader-files--render (car (dom-by-tag doc 'body)))
+           (let* ((text (replace-regexp-in-string " +" " " (buffer-string)))
+                  (lines (replace-regexp-in-string " *\n *" "\n" text)))
+             (string-trim (replace-regexp-in-string "\n\\{3,\\}" "\n\n" lines)))))))))
 
 (provide 'emacs-reader-files)
 ;;; emacs-reader-files.el ends here
