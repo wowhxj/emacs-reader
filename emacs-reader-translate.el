@@ -8,6 +8,7 @@
 (require 'cl-lib)
 (autoload 'emacs-reader-translate-view-paragraphs "emacs-reader-translate-view")
 (autoload 'emacs-reader-translate-view-clear "emacs-reader-translate-view")
+(autoload 'emacs-reader-translate-view-append "emacs-reader-translate-view")
 (autoload 'emacs-reader-translate-view-show "emacs-reader-translate-view")
 (autoload 'emacs-reader-translate-fetch "emacs-reader-translate-fetch")
 (autoload 'emacs-reader-translate-fetch-content-error "emacs-reader-translate-fetch")
@@ -86,9 +87,19 @@
   "Translate PARAGRAPHS of INDEX, optionally DISPLAY them, then continue to END."
   (emacs-reader-translate--task
    (lambda (cb)
-     (emacs-reader-translation-request emacs-reader--current-book
-                                       (aref emacs-reader--chapters index)
-                                       emacs-reader-translation-direction paragraphs cb))
+     (let ((reader (current-buffer)) (token emacs-reader-translate--token)
+           (total (length paragraphs)))
+       (emacs-reader-translation-request
+        emacs-reader--current-book (aref emacs-reader--chapters index)
+        emacs-reader-translation-direction paragraphs cb
+        (when display
+          (lambda (start lines)
+            (when (buffer-live-p reader)
+              (with-current-buffer reader
+                (when (eq token emacs-reader-translate--token)
+                  (emacs-reader-translate-view-append start lines)
+                  (emacs-reader-translate--status
+                   (format "已译 %d/%d 行" (+ start (length lines)) total))))))))))
    (lambda (translations err)
      (if err
          (progn (emacs-reader-translate--status (if display "翻译失败" "预译失败"))

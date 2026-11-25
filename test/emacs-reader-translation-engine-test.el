@@ -140,6 +140,29 @@
      (emacs-reader-translation-test--reply nil)
      (should (equal '((nil "gptel: mock server")) emacs-reader-translation-test--results)))))
 
+(ert-deftest emacs-reader-translation-engine-delivers-first-batch-before-completion ()
+  (emacs-reader-translation-test--with-mock
+   (let ((lines '("a" "b" "c" "d" "e")) received replay result)
+     (emacs-reader-translation-request
+      emacs-reader-translation-test--book emacs-reader-translation-test--chapter 'en-zh lines
+      (lambda (texts err) (should-not err) (setq result texts))
+      (lambda (start texts) (push (cons start texts) received)))
+     (emacs-reader-translation-test--wait emacs-reader-translation-test--requests)
+     (let ((prompt (caar emacs-reader-translation-test--requests)))
+       (should (= 4 (length (json-parse-string prompt))))
+       (emacs-reader-translation-test--reply prompt))
+     (should (equal received '((0 "a" "b" "c" "d"))))
+     (should-not result)
+     (emacs-reader-translation-request
+      emacs-reader-translation-test--book emacs-reader-translation-test--chapter 'en-zh lines
+      #'ignore (lambda (start texts) (push (cons start texts) replay)))
+     (should (equal replay received))
+     (emacs-reader-translation-test--wait (= 2 (length emacs-reader-translation-test--requests)))
+     (emacs-reader-translation-test--reply (caar emacs-reader-translation-test--requests))
+     (emacs-reader-translation-test--wait result)
+     (should (equal (car received) '(4 "e")))
+     (should (equal result lines)))))
+
 (ert-deftest emacs-reader-translation-engine-preserves-invalid-asset ()
   (emacs-reader-translation-test--with-mock
    (let ((path (emacs-reader-translation-asset-path

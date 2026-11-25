@@ -79,12 +79,29 @@
               (or (gethash (car entry) texts) (error "Missing translation ID %s" (car entry))))
             batch)))
 
+(defun emacs-reader-translation--completed (job)
+  "Return the number of complete source lines in JOB."
+  (or (nth 1 (caar (emacs-reader-translation--job-batches job)))
+      (length (emacs-reader-translation--job-results job))))
+
+(defun emacs-reader-translation--notify (job start end progress)
+  "Deliver complete lines from START up to END of JOB to PROGRESS."
+  (when (and progress (< start end))
+    (let ((join (if (eq (emacs-reader-translation--job-direction job) 'zh-en) " " ""))
+          (results (emacs-reader-translation--job-results job)))
+      (with-demoted-errors "Reader translation progress: %S"
+        (funcall progress start (cl-loop for i from start below end
+                                         collect (string-join (reverse (aref results i)) join)))))))
+
 (defun emacs-reader-translation--record (job batch texts)
   "Accumulate validated TEXTS from BATCH into JOB in source order."
   (cl-mapc (lambda (entry text)
              (push text (aref (emacs-reader-translation--job-results job) (nth 1 entry))))
            batch texts)
-  (pop (emacs-reader-translation--job-batches job)))
+  (pop (emacs-reader-translation--job-batches job))
+  (dolist (sub (emacs-reader-translation--job-subscribers job))
+    (emacs-reader-translation--notify job (nth 1 (car batch))
+                                      (emacs-reader-translation--completed job) (cadr sub))))
 
 (defun emacs-reader-translation--finish (job result failure)
   "Remove JOB and notify remaining subscribers of RESULT or FAILURE."
@@ -170,22 +187,32 @@
                      (cached (and (file-readable-p path)
                                   (ignore-errors (emacs-reader-translation--ordered
                                                   (emacs-reader-local--read path) batch)))))
-                (push path (emacs-reader-translation--job-checkpoints job))
-                (if cached (emacs-reader-translation--record job batch cached)
-                  (emacs-reader-translation--send
-                   job batch (apply-partially #'emacs-reader-translation--received job batch path))
-                  (throw 'pending nil))))
+                (cond (cached
+                        (push path (emacs-reader-translation--job-checkpoints job))
+                        (emacs-reader-translation--record job batch cached))
+                       ((> (length batch) 4)
+                        ;; Honor the old larger checkpoint before splitting missing work.
+                        (setf (emacs-reader-translation--job-batches job)
+                              (append (seq-partition batch 4)
+                                      (cdr (emacs-reader-translation--job-batches job)))))
+                       (t
+                        (push path (emacs-reader-translation--job-checkpoints job))
+                        (emacs-reader-translation--send
+                         job batch (apply-partially #'emacs-reader-translation--received
+                                                    job batch path))
+                        (throw 'pending nil)))))
             (emacs-reader-translation--finish
              job (when (emacs-reader-translation--job-paragraphs job)
                    (emacs-reader-translation--save job)) nil))
         (error (emacs-reader-translation--finish job nil (error-message-string err)))))))
 
 ;;;###autoload
-(defun emacs-reader-translation-request (book chapter direction paragraphs callback)
+(defun emacs-reader-translation-request (book chapter direction paragraphs callback &optional progress)
   "Translate PARAGRAPHS of BOOK and CHAPTER in DIRECTION, `en-zh' or `zh-en'.
 Call CALLBACK asynchronously with (TRANSLATIONS ERROR).  Success yields a
 list of strings in paragraph order and nil error.  Failure yields nil and
-an error message.  Return a zero-argument function to cancel this subscription."
+an error message.  PROGRESS receives a zero-based line index and completed lines.
+Return a zero-argument function to cancel this subscription."
   (unless (memq direction '(en-zh zh-en)) (error "Unsupported translation direction: %S" direction))
   (unless (and (proper-list-p paragraphs) (cl-every #'stringp paragraphs))
     (error "Invalid paragraphs"))
@@ -194,7 +221,7 @@ an error message.  Return a zero-argument function to cancel this subscription."
                (concat "translation-progress/" (emacs-reader-translation--hash asset))
                emacs-reader-directory))
          (job (gethash dir emacs-reader-translation--jobs))
-         (subscription (list callback)))
+         (subscription (list callback progress)))
     (unless job
       (setq job (emacs-reader-translation--make
                  :asset asset :book book :chapter chapter :paragraphs paragraphs
@@ -205,6 +232,7 @@ an error message.  Return a zero-argument function to cancel this subscription."
       (puthash dir job emacs-reader-translation--jobs)
       (run-at-time 0 nil #'emacs-reader-translation--advance job))
     (push subscription (emacs-reader-translation--job-subscribers job))
+    (emacs-reader-translation--notify job 0 (emacs-reader-translation--completed job) progress)
     (lambda ()
       (setcar subscription nil)
       (setf (emacs-reader-translation--job-subscribers job)
