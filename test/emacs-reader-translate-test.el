@@ -96,6 +96,20 @@
         (funcall progress 4 '("过期"))
         (should (= 4 (length emacs-reader-translate-view--overlays)))))))
 
+(ert-deftest emacs-reader-translate-reflow-only-after-horizontal-layout-changes ()
+  (with-temp-buffer
+    (let ((emacs-reader-translation-mode t) (emacs-reader-translate--geometry '(720 9 t nil))
+          (size '(720 9 t nil)) reflow)
+      (cl-letf (((symbol-function 'emacs-reader-translate--geometry) (lambda () size))
+                ((symbol-function 'emacs-reader-translate-chapter) (lambda () (setq reflow size))))
+        (emacs-reader-translate--resized)
+        (should-not emacs-reader-translate--resize-timer)
+        (setq size '(480 9 t nil))
+        (emacs-reader-translate--resized)
+        (emacs-reader-translate-test--await reflow)
+        (should (equal reflow size))
+        (should-not emacs-reader-translate--resize-timer)))))
+
 (ert-deftest emacs-reader-translate-stale-replies-after-navigation-and-stop ()
   (with-temp-buffer
     (emacs-reader-reading-mode)
@@ -104,7 +118,8 @@
           (emacs-reader--chapters [((index . 0)) ((index . 1))])
           (emacs-reader--current-book '((name . "Book"))) (inhibit-read-only t) callbacks)
       (cl-letf (((symbol-function 'emacs-reader-translation-request)
-                 (lambda (_book _ch _dir _parts cb &optional _progress) (push cb callbacks) #'ignore)))
+                 (lambda (_book _ch _dir _parts cb &optional _progress)
+                   (push cb callbacks) #'ignore)))
         (insert "first")
         (emacs-reader-translate-chapter)
         (erase-buffer)

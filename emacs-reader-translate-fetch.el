@@ -69,7 +69,10 @@ function discards late responses and skips subsequent catalog/content handoffs."
            (unless finished
              (let* ((text (unless err (emacs-reader--chapter-display-text content kind)))
                     (reason (or err (emacs-reader-translate-fetch-content-error text)))
-                    (paragraphs (unless reason (emacs-reader-translate-view-split text width))))
+                    (window (and (buffer-live-p reader-buffer)
+                                  (with-current-buffer reader-buffer
+                                    (emacs-reader-translate-view-layout-window))))
+                     (paragraphs (unless reason (emacs-reader-translate-view-split text width window))))
                (finish paragraphs (or reason (unless paragraphs "本章没有正文"))))))
          (remote-response (response)
            (unless finished

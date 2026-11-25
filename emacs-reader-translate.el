@@ -42,9 +42,42 @@
   (emacs-reader--update-reading-header)
   (force-mode-line-update))
 
+(autoload 'emacs-reader-translate-view-layout-window "emacs-reader-translate-view")
+(defvar-local emacs-reader-translate--geometry nil)
+(defvar-local emacs-reader-translate--resize-timer nil)
+
+(defun emacs-reader-translate--geometry ()
+  "Return the effective reading window's horizontal layout signature."
+  (when-let* ((w (emacs-reader-translate-view-layout-window)))
+    (list (window-body-width w t) (window-font-width w) word-wrap
+          (bound-and-true-p text-scale-mode-amount))))
+
+(defun emacs-reader-translate--resized (&optional _window)
+  "Reflow translations after the reading window's horizontal geometry settles."
+  (let ((geometry (emacs-reader-translate--geometry)))
+    (when (and emacs-reader-translation-mode geometry
+               (not (equal geometry emacs-reader-translate--geometry)))
+      (when (timerp emacs-reader-translate--resize-timer)
+        (cancel-timer emacs-reader-translate--resize-timer))
+      (setq emacs-reader-translate--resize-timer
+            (run-at-time
+             0.4 nil
+             (lambda (reader)
+               (when (buffer-live-p reader)
+                 (with-current-buffer reader
+                   (setq emacs-reader-translate--resize-timer nil)
+                   (when-let* ((size (emacs-reader-translate--geometry))
+                               ((bound-and-true-p emacs-reader-translation-mode))
+                               ((not (equal size emacs-reader-translate--geometry))))
+                     (emacs-reader-translate-chapter)))))
+             (current-buffer))))))
+
 (defun emacs-reader-translate--stop ()
   "Invalidate this reader's pending work and remove its translations."
   (setq emacs-reader-translate--token nil)
+  (when (timerp emacs-reader-translate--resize-timer)
+    (cancel-timer emacs-reader-translate--resize-timer)
+    (setq emacs-reader-translate--resize-timer nil))
   (when emacs-reader-translate--cancel
     (funcall (prog1 emacs-reader-translate--cancel (setq emacs-reader-translate--cancel nil))))
   (emacs-reader-translate-view-clear)
@@ -111,7 +144,8 @@
   "Translate the current chapter if bilingual reading is enabled."
   (when emacs-reader-translation-mode
     (let ((old emacs-reader-translate--cancel) (index emacs-reader--current-chapter-index))
-      (setq emacs-reader-translate--token nil emacs-reader-translate--cancel nil)
+      (setq emacs-reader-translate--token nil emacs-reader-translate--cancel nil
+            emacs-reader-translate--geometry (emacs-reader-translate--geometry))
       (emacs-reader-translate-view-clear)
       ;; Subscribe to the visible chapter before releasing an in-flight prefetch of it.
       (unwind-protect
@@ -208,10 +242,14 @@
           (setq emacs-reader-translation-mode nil) (user-error "请在阅读页开启翻译"))
         (setq emacs-reader-translate--restored t)
         (emacs-reader-translate--save-preferences)
+        (add-hook 'window-size-change-functions #'emacs-reader-translate--resized nil t)
+        (add-hook 'text-scale-mode-hook #'emacs-reader-translate--resized nil t)
         (add-hook 'kill-buffer-hook #'emacs-reader-translate--stop nil t)
         (add-hook 'change-major-mode-hook #'emacs-reader-translate--stop nil t)
         (emacs-reader-translate-chapter))
     (emacs-reader-translate--save-preferences)
+    (remove-hook 'window-size-change-functions #'emacs-reader-translate--resized t)
+    (remove-hook 'text-scale-mode-hook #'emacs-reader-translate--resized t)
     (remove-hook 'kill-buffer-hook #'emacs-reader-translate--stop t)
     (remove-hook 'change-major-mode-hook #'emacs-reader-translate--stop t)
     (emacs-reader-translate--stop)))

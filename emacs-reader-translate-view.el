@@ -6,6 +6,7 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'subr-x)
 
 (defface emacs-reader-translate-view-face
   '((t :inherit shadow))
@@ -20,15 +21,19 @@
 (defvar-local emacs-reader-translate-view--line-overlays nil
   "Vector of translation overlays indexed by reading line.")
 (defvar-local emacs-reader-translate-view--ranges-key nil
-  "Character modification tick and wrapping width used for cached bounds.")
+  "Character modification tick of the sampled chapter.")
 
 (defcustom emacs-reader-translation-line-width 60
-  "Maximum display columns per bilingual source line before word wrapping.
-Fixed source boundaries let prefetched and saved translations match on any frame."
+  "Fallback source line width when no reader window can be measured."
   :type 'natnum :group 'emacs-reader)
 
-(defun emacs-reader-translate-view--ranges ()
-  "Return bounds of nonblank reading lines, preserving the source buffer."
+(defun emacs-reader-translate-view-layout-window ()
+  "Return a visible window showing the current reader, preferring the selected one."
+  (when (derived-mode-p 'emacs-reader-reading-mode)
+    (get-buffer-window (current-buffer) 'visible)))
+
+(defun emacs-reader-translate-view--fallback-ranges ()
+  "Return bounds of nonblank source lines using the fallback column width."
   (save-excursion
     (goto-char (point-min))
     (let ((width (max 1 emacs-reader-translation-line-width))
@@ -50,33 +55,65 @@ Fixed source boundaries let prefetched and saved translations match on any frame
               (when (and (< (point) end) boundary
                          (not (memq (char-after) '(?\s ?\t))))
                 (goto-char boundary))
-              (let ((next (point)))
-                (skip-chars-backward spaces start)
-                (push (cons start (point)) ranges)
-                (goto-char next))
-              (skip-chars-forward spaces end))))
+              (skip-chars-forward spaces end)
+              (push (cons start (point)) ranges))))
         (forward-line 1))
       (nreverse ranges))))
 
+(defun emacs-reader-translate-view--ranges (&optional window)
+  "Sample nonblank visual lines in WINDOW, retaining their exact source ends."
+  (if (not window) (emacs-reader-translate-view--fallback-ranges)
+    (save-excursion
+      (goto-char (point-min))
+      (let (ranges)
+        (while (< (point) (point-max))
+          (let ((start (point)))
+            (vertical-motion 1 window)
+            ;; At EOB, or for glyphs spanning rows, motion can stall.
+            (when (<= (point) start) (forward-line 1))
+            (let ((end (if (eq (char-before) ?\n) (1- (point)) (point))))
+              (when (save-excursion
+                      (goto-char start)
+                      (re-search-forward "[^ \t\r　 \n]" end t))
+                (push (cons start end) ranges)))))
+        (nreverse ranges)))))
+
 (defun emacs-reader-translate-view--texts (ranges)
-  "Return plain source strings for RANGES in the current buffer."
+  "Return trimmed source strings for RANGES, keeping display bounds intact."
   (mapcar (lambda (bounds)
-            (buffer-substring-no-properties (car bounds) (cdr bounds)))
+            (string-trim (buffer-substring-no-properties (car bounds) (cdr bounds))
+                         "[ \t\r　 ]+" "[ \t\r　 ]+"))
           ranges))
 
-(defun emacs-reader-translate-view-split (text &optional width)
-  "Return source lines from formatted chapter TEXT using optional display WIDTH."
-  (with-temp-buffer
-    (insert text)
-    (let ((emacs-reader-translation-line-width (or width emacs-reader-translation-line-width)))
-      (emacs-reader-translate-view--texts (emacs-reader-translate-view--ranges)))))
+(defun emacs-reader-translate-view-split (text &optional width window)
+  "Return source lines for formatted chapter TEXT measured in reader WINDOW.
+Use WIDTH or `emacs-reader-translation-line-width' when WINDOW is absent."
+  (let ((reader (and window (window-live-p window) (window-buffer window)))
+        (fallback (or width emacs-reader-translation-line-width)))
+    (with-temp-buffer
+      (insert text)
+      (when reader
+        (dolist (var
+                 '(word-wrap word-wrap-by-category truncate-lines truncate-partial-width-windows
+                             face-remapping-alist tab-width nobreak-char-display
+                             buffer-display-table display-line-numbers line-prefix wrap-prefix
+                             bidi-display-reordering bidi-paragraph-direction))
+          (when (boundp var)
+            (set (make-local-variable var) (buffer-local-value var reader))))
+        (set-category-table (with-current-buffer reader (category-table)))
+        (set-syntax-table (with-current-buffer reader (syntax-table))))
+      (let ((emacs-reader-translation-line-width fallback))
+        (emacs-reader-translate-view--texts
+         (emacs-reader-translate-view--ranges (and reader window)))))))
 
 (defun emacs-reader-translate-view--cached-ranges ()
   "Return cached source bounds for the widened reading buffer."
-  (let ((key (cons (buffer-chars-modified-tick) emacs-reader-translation-line-width)))
+  (let ((key (buffer-chars-modified-tick)))
     (unless (equal key emacs-reader-translate-view--ranges-key)
       (emacs-reader-translate-view-clear)
-      (setq emacs-reader-translate-view--line-ranges (vconcat (emacs-reader-translate-view--ranges))
+      (setq emacs-reader-translate-view--line-ranges
+            (vconcat (emacs-reader-translate-view--ranges
+                      (emacs-reader-translate-view-layout-window)))
             emacs-reader-translate-view--line-overlays
             (make-vector (length emacs-reader-translate-view--line-ranges) nil)
             emacs-reader-translate-view--ranges-key key))
@@ -113,7 +150,6 @@ batches update the existing overlay for each translated line."
              (when (and (< start (length ranges)) (stringp text)
                         (string-match-p "[^ \t\r\n　 ]" text))
                (goto-char (cdr (aref ranges start)))
-               (skip-chars-forward " \t\r　 ")
                (let ((overlay (aref emacs-reader-translate-view--line-overlays start))
                      (wrap (and (char-after) (/= (char-after) ?\n))))
                  (unless overlay
@@ -134,7 +170,10 @@ batches update the existing overlay for each translated line."
 Accept a list or vector.  Nil and blank entries leave their paragraph bare.
 Missing or excess entries are ignored."
   (when (derived-mode-p 'emacs-reader-reading-mode)
-    (emacs-reader-translate-view-clear)
+    (mapc #'delete-overlay emacs-reader-translate-view--overlays)
+    (setq emacs-reader-translate-view--overlays nil)
+    (when emacs-reader-translate-view--line-overlays
+      (fillarray emacs-reader-translate-view--line-overlays nil))
     (emacs-reader-translate-view-append 0 translations)))
 
 (provide 'emacs-reader-translate-view)
