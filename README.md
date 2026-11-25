@@ -124,7 +124,7 @@ Legado 支持 HTML/CSS 选择器、tag/class/id 元素链、索引与排除、�
 
 默认 `emacs-reader-tts-url` 为 `nil`，按 `r` 调用 macOS 的 `say` 或本机安装的 `espeak-ng` / `espeak`。可用 `emacs-reader-tts-native-voice` 指定本机已安装的音色，例如 macOS 的 `Tingting`。
 
-如已配置 OpenAI 兼容 TTS 端点，`r` 会继续使用该端点。以下为两种配置示例。
+如已配置 OpenAI 兼容 TTS 端点，`r` 会继续使用该端点。`emacs-reader-tts-url` 可填写完整的 `/v1/audio/speech` 地址，也可填写以 `/v1` 结尾的 API 基础地址，客户端会自动补全。以下为两种配置示例。
 
 **本地 mac-tts**（按其 README 启动服务）：
 
@@ -134,6 +134,19 @@ Legado 支持 HTML/CSS 选择器、tag/class/id 元素链、索引与排除、�
       emacs-reader-tts-voice "zf_001"
       emacs-reader-tts-format 'wav)
 ```
+
+**本机 Magpie Gateway**（Matcha）：
+
+```elisp
+(setq emacs-reader-tts-url "http://127.0.0.1:3425/v1"
+      emacs-reader-tts-model "localtts/matcha-icefall-zh-en"
+      emacs-reader-tts-voice "matcha"
+      emacs-reader-tts-format 'wav
+      emacs-reader-tts-rate 1.0
+      emacs-reader-tts-api-key-env "MAGPIE_API_KEY")
+```
+
+Magpie 模型 ID 使用网关 `/v1/models` 返回的完整值。
 
 **在线 zb-tts**（晓晓）：
 

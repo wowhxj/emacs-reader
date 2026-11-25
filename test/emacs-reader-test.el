@@ -940,6 +940,19 @@
           (should-error (emacs-reader-scroll-backward) :type 'user-error)
           (should (equal indices '(0))))))))
 
+(ert-deftest emacs-reader-tts-accepts-base-and-explicit-endpoint-urls ()
+  (dolist (case '(("http://127.0.0.1:8095/v1" . "http://127.0.0.1:8095/v1/audio/speech")
+                  ("http://127.0.0.1:8095/v1/" . "http://127.0.0.1:8095/v1/audio/speech")
+                  ("https://example.test/v1/audio/speech" . "https://example.test/v1/audio/speech")
+                  ("https://example.test/tts" . "https://example.test/tts")))
+    (let ((emacs-reader-tts-url (car case))
+          (emacs-reader-tts-api-key-env nil)
+          request)
+      (cl-letf (((symbol-function 'emacs-reader--url-transport)
+                 (lambda (req _callback) (setq request req))))
+        (emacs-reader--tts-fetch "测试" #'ignore)
+        (should (equal (plist-get request :url) (cdr case)))))))
+
 (ert-deftest emacs-reader-tts-toggle-requests-current-paragraph-and-cancels-stale-audio ()
   (with-temp-buffer
     (emacs-reader-reading-mode)
@@ -1076,9 +1089,14 @@
           (url-http-response-status 200))
       (should (eq (plist-get (emacs-reader--http-response nil nil 'wav) :error)
                   'unexpected-content-type))
-      (let ((url-http-response-status 401))
-        (should (eq (plist-get (emacs-reader--http-response nil nil 'wav) :error)
-                    'authentication))))))
+      (dolist (case '((401 . authentication) (429 . rate-limit) (404 . http) (500 . server)))
+        (let* ((url-http-response-status (car case))
+               (result (emacs-reader--http-response '(:error (error http 404)) nil 'wav)))
+          (should (eq (plist-get result :error) (cdr case)))
+          (should (= (plist-get result :status) (car case)))))
+      (should (eq (plist-get (emacs-reader--http-response '(:error (error network)) nil 'wav)
+                             :error)
+                  'transport)))))
 
 (ert-deftest emacs-reader-tts-playback-highlights-and-advances-paragraphs ()
   (with-temp-buffer

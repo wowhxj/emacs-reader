@@ -73,7 +73,8 @@ A CJK character occupies two columns."
   :safe #'integerp)
 
 (defcustom emacs-reader-tts-url nil
-  "Full HTTP(S) URL of an OpenAI-compatible speech endpoint, or nil.
+  "HTTP(S) speech endpoint URL or OpenAI-compatible /v1 base URL, or nil.
+A /v1 base URL is expanded to /v1/audio/speech.
 With a URL, send paragraph text directly to the endpoint.
 With nil or an empty string, use macOS say, espeak-ng, or espeak."
   :type '(choice (const :tag "Use native speech" nil) string) :group 'emacs-reader)
@@ -289,7 +290,8 @@ HTML-P selects decoded HTML; AUDIO-FORMAT selects binary speech."
             (and (consp error-data)
                  (eq (cadr error-data) 'http-redirect-limit))))
       (list :error 'redirect :status response-status))
-     ((plist-get status :error)
+     ((and (plist-get status :error)
+           (not (and (integerp response-status) (>= response-status 300))))
       (list :error 'transport))
      ((not (and (integerp response-status)
                 (<= 200 response-status)
@@ -1464,7 +1466,10 @@ full-width U+3000 indents, are normalized."
       (push (cons "Authorization" (encode-coding-string (concat "Bearer " key) 'us-ascii))
             headers))
     (emacs-reader--url-transport
-     (list :url emacs-reader-tts-url :method "POST" :headers headers
+     (list :url (if (string-match-p "/v1/?\\'" emacs-reader-tts-url)
+                    (concat (string-remove-suffix "/" emacs-reader-tts-url) "/audio/speech")
+                  emacs-reader-tts-url)
+           :method "POST" :headers headers
            :audio-format format
            :data (encode-coding-string
                   (json-serialize `((model . ,emacs-reader-tts-model)
