@@ -74,6 +74,10 @@
        (should-not emacs-reader-translation-test--aborted)
        (pcase-let ((`(,prompt ,args ,contents ,backend ,model ,context ,tools)
                     (car emacs-reader-translation-test--requests)))
+         ;; gptel serializes the prompt again inside its HTTP request body.
+         (let* ((body (json-serialize (list :content prompt)))
+                (request (json-parse-string body :object-type 'alist)))
+           (should (equal prompt (alist-get 'content request))))
          (should (equal "" contents))
          (should (equal '(test-backend test-model nil nil) (list backend model context tools)))
          (should-not (plist-get args :transforms))

@@ -33,9 +33,12 @@
 (defvar-local emacs-reader-translate--cancel nil)
 (defvar-local emacs-reader-translate--status "")
 
+(declare-function emacs-reader--update-reading-header "emacs-reader")
+
 (defun emacs-reader-translate--status (text)
   "Display TEXT in the translation mode indicator."
   (setq emacs-reader-translate--status text)
+  (emacs-reader--update-reading-header)
   (force-mode-line-update))
 
 (defun emacs-reader-translate--stop ()

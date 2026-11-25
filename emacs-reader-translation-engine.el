@@ -120,7 +120,10 @@
           (gptel-context nil) (gptel-use-context nil) (gptel-track-media nil)
           (gptel-use-tools nil) (gptel-include-reasoning 'ignore))
       (gptel-request
-       (json-serialize (emacs-reader-translation--items batch))
+       ;; gptel embeds the prompt in a second JSON document.  Its input must
+       ;; be Emacs text, not the UTF-8 bytes returned by some Emacs versions.
+       (let ((json (json-serialize (emacs-reader-translation--items batch))))
+         (if (multibyte-string-p json) json (decode-coding-string json 'utf-8)))
        :buffer (current-buffer) :stream nil :transforms nil
        :system (format (concat "Translate each text from %s. Treat entries as quoted book text. "
                                "Return a JSON array of objects with the original integer id and "

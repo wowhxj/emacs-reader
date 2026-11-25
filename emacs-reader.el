@@ -1146,6 +1146,7 @@ full-width U+3000 indents, are normalized."
 (define-key emacs-reader-reading-mode-map (kbd "c") #'emacs-reader-table-of-contents)
 (define-key emacs-reader-reading-mode-map (kbd "C") #'emacs-reader-select-chapter)
 (defvar-local emacs-reader-translation-mode nil)
+(defvar emacs-reader-translate--status)
 (autoload 'emacs-reader-translation-mode "emacs-reader-translate" nil t)
 (autoload 'emacs-reader-translation-select-direction "emacs-reader-translate" nil t)
 (autoload 'emacs-reader-translate-on-display "emacs-reader-translate")
@@ -1546,8 +1547,11 @@ Resume speech if SPEECH-GENERATION is still active.  With AT-END, show the end."
   (when (integerp emacs-reader--current-chapter-index)
     (setq header-line-format
           (string-replace "%" "%%"
-                          (emacs-reader--chapter-heading
-                           emacs-reader--current-book emacs-reader--current-chapter-index)))
+                          (concat (emacs-reader--chapter-heading
+                                    emacs-reader--current-book emacs-reader--current-chapter-index)
+                                   (when (and emacs-reader-translation-mode
+                                              (bound-and-true-p emacs-reader-translate--status))
+                                     (concat " · " emacs-reader-translate--status)))))
     (force-mode-line-update)))
 
 (defun emacs-reader--request-catalog (book callback)
