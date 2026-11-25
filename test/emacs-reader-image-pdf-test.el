@@ -18,7 +18,10 @@
                     ((symbol-function 'emureader-open-doc) (lambda (file) (setq opened file)))
                     ((symbol-function 'derived-mode-p) (lambda (&rest _) t))
                     ((symbol-value 'save-place-mode) nil))
-            (emacs-reader-open-book book)
+            (with-temp-buffer
+              (use-local-map (make-sparse-keymap))
+              (emacs-reader-open-book book)
+              (should (eq (key-binding (kbd "q")) #'emacs-reader-quit)))
             (should ensured)
             (should (equal opened path))))
       (delete-directory emacs-reader-directory t))))

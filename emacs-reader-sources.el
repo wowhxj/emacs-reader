@@ -524,7 +524,7 @@
    ["浏览"
     ("n" "下一项" next-line :transient t)
     ("p" "上一项" previous-line :transient t)
-    ("q" "退出列表" quit-window)]])
+    ("q" "退出列表" emacs-reader-quit)]])
 
 (define-derived-mode emacs-reader-sources-mode tabulated-list-mode "Reader-Sources"
   "Manage local sources using the registry at `emacs-reader-directory'."
@@ -544,6 +544,8 @@
                 "  t 检测  T 全检  c 取消  ? 帮助"))
   (tabulated-list-init-header))
 
+(autoload 'emacs-reader-quit "emacs-reader" nil t)
+(define-key emacs-reader-sources-mode-map (kbd "q") #'emacs-reader-quit)
 (define-key emacs-reader-sources-mode-map (kbd "/") #'emacs-reader-filter-edit)
 (define-key emacs-reader-sources-mode-map (kbd "C-c C-l") #'emacs-reader-filter-clear)
 (define-key emacs-reader-sources-mode-map (kbd "M") #'emacs-reader-sources-mark-visible)

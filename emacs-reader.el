@@ -634,7 +634,10 @@ Create the tab if necessary; otherwise reuse it."
 (defun emacs-reader-quit ()
   "Kill the current Reader buffer and leave its window."
   (interactive)
-  (quit-window t))
+  (let ((buffer (current-buffer)))
+    (quit-window t)
+    (when (buffer-live-p buffer)
+      (kill-buffer buffer))))
 
 (define-derived-mode emacs-reader-shelf-mode special-mode "Reader-Shelf"
   "Major mode for the Reader bookshelf."
@@ -1110,6 +1113,9 @@ Local shelf books resume and save their current chapter."
           (emureader-open-doc path)
           (unless (derived-mode-p 'emureader-mode)
             (user-error "emureader 无法打开 PDF：%s" path))
+          (when-let* ((keymap (current-local-map)))
+            (use-local-map (copy-keymap keymap))
+            (local-set-key (kbd "q") #'emacs-reader-quit))
           (when (and (bound-and-true-p save-place-mode)
                      (require 'emureader-saveplace nil t))
             (emureader--saveplace-find-file))

@@ -3,6 +3,7 @@
 (require 'ert)
 (require 'cl-lib)
 (require 'emacs-reader)
+(defvar emacs-reader-sources-mode-map)
 
 (defvar emacs-reader-test--http-response nil)
 (defvar emacs-reader-test--http-request nil)
@@ -1339,6 +1340,27 @@
         (dolist (buffer (list toc reader shelf))
           (when (buffer-live-p buffer) (kill-buffer buffer)))
         (set-frame-parameter nil 'tabs tabs)))))
+
+(ert-deftest emacs-reader-q-is-consistent-across-list-buffers ()
+  (require 'emacs-reader-opds)
+  (require 'emacs-reader-sources)
+  (dolist (map (list emacs-reader-shelf-mode-map emacs-reader-search-mode-map
+                     emacs-reader-reading-mode-map emacs-reader-toc-mode-map
+                     emacs-reader-opds-mode-map emacs-reader-sources-mode-map))
+    (should (eq (lookup-key map (kbd "q")) #'emacs-reader-quit))))
+
+(ert-deftest emacs-reader-q-kills-buffer-shown-in-multiple-windows ()
+  (save-window-excursion
+    (let ((buffer (generate-new-buffer " *reader-quit-multi-window*")))
+      (unwind-protect
+          (progn
+            (switch-to-buffer buffer)
+            (emacs-reader-reading-mode)
+            (split-window-right)
+            (set-window-buffer (next-window) buffer)
+            (call-interactively #'emacs-reader-quit)
+            (should-not (buffer-live-p buffer)))
+        (when (buffer-live-p buffer) (kill-buffer buffer))))))
 
 (ert-deftest emacs-reader-q-kills-every-reader-buffer ()
   (dolist (mode '(emacs-reader-shelf-mode emacs-reader-reading-mode

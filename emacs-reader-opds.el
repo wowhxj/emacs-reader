@@ -243,6 +243,8 @@ RESULTS limits feed-level actions on a search results page."
     map))
 
 (define-key emacs-reader-opds-mode-map (kbd "a") #'emacs-reader-opds-add)
+(autoload 'emacs-reader-quit "emacs-reader" nil t)
+(define-key emacs-reader-opds-mode-map (kbd "q") #'emacs-reader-quit)
 
 (define-minor-mode emacs-reader-opds-result-mode
   "Enable local filtering on a catalog search result page."
