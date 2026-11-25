@@ -607,23 +607,40 @@ RETRIED is non-nil."
             title)))
 
 (defun emacs-reader--shelf-entry (book)
-  "Return BOOK rendered as a two-line shelf entry carrying BOOK as a property."
-  (let ((author (emacs-reader--shelf-text
-                 (emacs-reader--book-field book 'author)))
-        (source (emacs-reader--shelf-text (emacs-reader--book-source book)))
-        (name (emacs-reader--shelf-text
-               (emacs-reader--book-field book 'name))))
-    (propertize
-     (concat "  " (propertize (if (string-empty-p name) "Untitled" name)
-                              'face 'emacs-reader-shelf-title)
-             (propertize (concat "    "
-                                 (mapconcat #'identity
-                                            (seq-remove #'string-empty-p
-                                                        (list author source))
-                                            "  ·  "))
-                         'face 'emacs-reader-shelf-meta)
-             "\n  " (emacs-reader--book-progress book) "\n")
-     'emacs-reader-book book)))
+  "Return BOOK as one compact line carrying BOOK as a property."
+  (let* ((name (emacs-reader--shelf-text (emacs-reader--book-field book 'name)))
+         (author (emacs-reader--shelf-text (emacs-reader--book-field book 'author)))
+         (url (emacs-reader--book-field book 'bookUrl))
+         (extension (and (equal (alist-get 'readerType book) "file")
+                         (file-name-extension url)))
+         (kind (if extension (upcase extension)
+                 (emacs-reader--shelf-text (emacs-reader--book-source book))))
+         (chapter (alist-get 'durChapterIndex book))
+         (total (alist-get 'totalChapterNum book))
+         (progress (if (and (integerp chapter) (integerp total) (> total 0))
+                       (let ((current (min total (1+ (max 0 chapter)))))
+                         (format "%d%% %d/%d" (round (* 100.0 (/ (float current) total)))
+                                 current total))
+                     "—"))
+         (width (max 1 (window-body-width (get-buffer-window (current-buffer) t))))
+         (suffix (concat (unless (string-empty-p kind) (concat "  " kind))
+                         "  " progress))
+         (available (max 1 (- width 2 (string-width suffix))))
+         (author-width (if (string-empty-p author) 0
+                         (min (string-width author) (max 0 (/ available 3)))))
+         (name-width (max 1 (- available (if (> author-width 0) (+ 2 author-width) 0))))
+         (row (concat "  "
+                      (propertize (truncate-string-to-width
+                                   (if (string-empty-p name) "Untitled" name)
+                                   name-width nil nil "…")
+                                  'face 'emacs-reader-shelf-title)
+                      (when (> author-width 0)
+                        (propertize (concat "  " (truncate-string-to-width
+                                                   author author-width nil nil "…"))
+                                    'face 'emacs-reader-shelf-meta))
+                      (propertize suffix 'face 'emacs-reader-shelf-meta))))
+    (propertize (concat (truncate-string-to-width row width) "\n")
+                'emacs-reader-book book)))
 
 (defun emacs-reader--display-buffer (buffer)
   "Display BUFFER in the current frame's dedicated Reader tab.
@@ -783,7 +800,7 @@ Create the tab if necessary; otherwise reuse it."
               (insert "\n")
               (if books
                   (insert (mapconcat #'emacs-reader--shelf-entry
-                                     emacs-reader--shelf-books "\n"))
+                                     emacs-reader--shelf-books ""))
                 (insert (propertize "  The shelf is empty.\n"
                                     'face 'emacs-reader-shelf-meta)))
               (goto-char (point-min))
