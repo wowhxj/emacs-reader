@@ -106,6 +106,20 @@ Legado 支持 HTML/CSS 选择器、tag/class/id 元素链、索引与排除、�
 
 删除本地书籍会移除书架记录和章节进度。若为 EPUB 或 TXT，最后一条引用被移除时也会删除书库中的文件副本。导入前的原文件保留。Reader3 书架继续使用服务器端管理。
 
+### 双语阅读与译稿
+
+在正文按 `t` 开启或关闭本书的双语阅读，按 `T` 选择英语 → 中文（默认）或中文 → 英语。每段译文显示在原文下方。可用 `M-x customize-face RET emacs-reader-translate-view-face` 调整译文颜色或字体。新书默认关闭；重新打开曾开启的书会恢复其翻译方向和双语显示。
+
+开启后先处理当前章，再依次处理后续章节。已有译稿直接读取；新译文使用当前 gptel 的后端和模型，只发送待译文本。默认预翻下一章，设为 `0` 仅翻当前章。
+
+```elisp
+(setq emacs-reader-translation-prefetch-chapters 1)
+;; 可选，将双语文档集中保存到自己的 Org 目录
+;; (setq emacs-reader-translation-directory "~/org/书籍译稿/")
+```
+
+**译稿按书、章和翻译方向保存为独立的 UTF-8 Org 文档**，默认在当前书库的 `translations/` 下，每份同时包含原文和逐段译文。按 `C-c C-t` 打开本章译稿；在译文段落内校订并保存后，当前阅读页会更新。`M-x emacs-reader-translation-library` 浏览整个译稿库。关闭翻译会保留文档；可以独立备份、迁移或用 Org 导出。原文变化会生成另一版译稿，保留旧版和手工校订。
+
 ### 朗读配置
 
 默认 `emacs-reader-tts-url` 为 `nil`，按 `r` 调用 macOS 的 `say` 或本机安装的 `espeak-ng` / `espeak`。可用 `emacs-reader-tts-native-voice` 指定本机已安装的音色，例如 macOS 的 `Tingting`。

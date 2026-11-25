@@ -1,0 +1,102 @@
+;;; emacs-reader-translate-test.el --- Bilingual reading integration -*- lexical-binding: t; indent-tabs-mode: nil; fill-column: 100; -*-
+
+;;; Commentary:
+;; Exercise normal reading commands and real files with only the model response substituted.
+
+;;; Code:
+(require 'ert)
+(require 'emacs-reader)
+(require 'emacs-reader-translate)
+(require 'emacs-reader-translation-engine)
+(require 'emacs-reader-translate-view)
+
+(defmacro emacs-reader-translate-test--await (condition)
+  "Wait for asynchronous CONDITION."
+  `(let ((deadline (+ (float-time) 10)))
+     (while (and (not ,condition) (< (float-time) deadline)) (accept-process-output nil 0.01))
+     (should ,condition)))
+
+(ert-deftest emacs-reader-translate-bilingual-reading-and-reopen ()
+  (let* ((emacs-reader-directory (make-temp-file "reader-bilingual-" t))
+         (emacs-reader-translation-directory nil)
+         (path (expand-file-name "example.txt" emacs-reader-directory))
+         (emacs-reader-translation-prefetch-chapters 1)
+         (calls 0) reader doc)
+    (unwind-protect
+        (save-window-excursion
+          (cl-letf (((symbol-function 'emacs-reader--display-buffer) #'switch-to-buffer)
+                    ((symbol-function 'emacs-reader-translation--send)
+                     (lambda (_job batch callback)
+                       (cl-incf calls)
+                       (funcall callback
+                                (json-serialize
+                                 (vconcat (mapcar (lambda (entry) (list :id (car entry)
+                                                                        :text "译文样例")) batch)))
+                                nil))))
+            (with-temp-file path
+              (insert "第一章 开始\nThe first paragraph.\n\nThe second paragraph.\n"
+                      "第二章 继续\nAnother chapter.\n第三章 结尾\nEnd."))
+            (setq reader (emacs-reader-preview-file-async path "Bilingual example"))
+            (emacs-reader-translate-test--await (equal emacs-reader--current-chapter-index 0))
+            (should-not emacs-reader-translation-mode)
+            (should (zerop calls))
+            (call-interactively (key-binding "t"))
+            (emacs-reader-translate-test--await (equal emacs-reader-translate--status "双语"))
+            (should (= 2 calls))
+            (should (= 2 (length (directory-files-recursively emacs-reader-directory "\\.org$"))))
+            (should-not (string-search "译文样例" (buffer-string)))
+            (should emacs-reader-translate-view--overlays)
+            (call-interactively (key-binding (kbd "C-c C-t")))
+            (setq doc (current-buffer))
+            (should (derived-mode-p 'org-mode))
+            (goto-char (point-min))
+            (search-forward "译文样例")
+            (replace-match "手工校订")
+            (save-buffer)
+            (switch-to-buffer reader)
+            (should (cl-some (lambda (ov) (string-search "手工校订" (overlay-get ov 'after-string)))
+                             emacs-reader-translate-view--overlays))
+            (kill-buffer reader)
+            (setq reader (emacs-reader-preview-file-async path "Bilingual example"))
+            (emacs-reader-translate-test--await (equal emacs-reader-translate--status "双语"))
+            (should (= 2 calls))
+            (should (cl-some (lambda (ov) (string-search "手工校订" (overlay-get ov 'after-string)))
+                             emacs-reader-translate-view--overlays))
+            (setq-local emacs-reader-translation-prefetch-chapters 0)
+            (emacs-reader-translation-select-direction 'zh-en)
+            (emacs-reader-translate-test--await (equal emacs-reader-translate--status "双语"))
+            (should (= 3 calls))
+            (call-interactively (key-binding "t"))
+            (should-not emacs-reader-translate-view--overlays)
+            (kill-buffer reader)
+            (setq reader (emacs-reader-preview-file-async path "Bilingual example"))
+            (emacs-reader-translate-test--await (equal emacs-reader--current-chapter-index 0))
+            (should-not emacs-reader-translation-mode)
+            (should (= 3 calls))))
+      (when (buffer-live-p reader) (kill-buffer reader))
+      (when (buffer-live-p doc) (kill-buffer doc))
+      (delete-directory emacs-reader-directory t))))
+
+(ert-deftest emacs-reader-translate-stale-replies-after-navigation-and-stop ()
+  (with-temp-buffer
+    (emacs-reader-reading-mode)
+    (let ((emacs-reader-translation-mode t) (emacs-reader-translation-prefetch-chapters 0)
+          (emacs-reader--current-chapter-index 0)
+          (emacs-reader--chapters [((index . 0)) ((index . 1))])
+          (emacs-reader--current-book '((name . "Book"))) (inhibit-read-only t) callbacks)
+      (cl-letf (((symbol-function 'emacs-reader-translation-request)
+                 (lambda (_book _ch _dir _parts cb) (push cb callbacks) #'ignore)))
+        (insert "first")
+        (emacs-reader-translate-chapter)
+        (erase-buffer)
+        (insert "second")
+        (setq emacs-reader--current-chapter-index 1)
+        (emacs-reader-translate-chapter)
+        (funcall (cadr callbacks) '("旧译") nil)
+        (should-not emacs-reader-translate-view--overlays)
+        (emacs-reader-translate--stop)
+        (funcall (car callbacks) '("已取消") nil)
+        (should-not emacs-reader-translate-view--overlays)))))
+
+(provide 'emacs-reader-translate-test)
+;;; emacs-reader-translate-test.el ends here

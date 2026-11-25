@@ -1,0 +1,79 @@
+;;; emacs-reader-translate-view-test.el --- Translation view tests -*- lexical-binding: t; indent-tabs-mode: nil; fill-column: 100; -*-
+
+;;; Commentary:
+;; Exercise chapter formatting, overlay ownership and directory isolation.
+
+;;; Code:
+
+(require 'ert)
+(require 'emacs-reader)
+(require 'emacs-reader-translate-view)
+
+(ert-deftest emacs-reader-translate-view-splits-formatted-chapters ()
+  (dolist (formatted (list (emacs-reader--format-chapter "甲。\n乙。")
+                           (emacs-reader--format-paragraphs "One\ncontinued\n\nTwo")
+                           "\n　甲 \n　 \t\n\n乙\n" "" "\n　　\t "))
+    (with-temp-buffer
+      (insert "\n" formatted "\n")
+      (emacs-reader-reading-mode)
+      (should (equal (emacs-reader-translate-view-paragraphs)
+                     (emacs-reader-translate-view-split formatted)))))
+  (should (equal (emacs-reader-translate-view-split "\n　甲 \n　 \t\n\n乙\n") '("甲" "乙")))
+  (should (equal (emacs-reader-translate-view-split "  One\n continued\n\nTwo")
+                 '("One\n continued" "Two")))
+  (should-not (emacs-reader-translate-view-split "\n　　\t ")))
+
+(ert-deftest emacs-reader-translate-view-preserves-reading-buffer ()
+  (dolist (suffix '("" "\n"))
+    (with-temp-buffer
+      (insert "\n　　First\ncontinued\n\nLast" suffix)
+      (emacs-reader-reading-mode)
+      (goto-char 4)
+      (set-buffer-modified-p nil)
+      (let ((source (buffer-string))
+            (tick (buffer-chars-modified-tick))
+            (speech (emacs-reader--tts-paragraph (point)))
+            (highlight (make-overlay 2 8)))
+        (overlay-put highlight 'face 'emacs-reader-tts-paragraph)
+        (emacs-reader-translate-view-show
+         (vector "第一段\n续行" (propertize "末段" 'display "incorrect")))
+        (should (= 2 (length emacs-reader-translate-view--overlays)))
+        (dolist (overlay emacs-reader-translate-view--overlays)
+          (let* ((end (overlay-end overlay))
+                 (display (overlay-get overlay 'after-string))
+                 (last (= end (- (point-max) (length suffix)))))
+            (should (equal display (if last "\n末段" "\n第一段\n续行")))
+            (should (eq (get-text-property 1 'face display) 'emacs-reader-translate-view-face))
+            (should-not (get-text-property 1 'display display))
+            (should (eq (char-before end) (if last ?t ?d)))))
+        (should (= (point) 4))
+        (should (= tick (buffer-chars-modified-tick)))
+        (should-not (buffer-modified-p))
+        (should (equal source (filter-buffer-substring (point-min) (point-max))))
+        (should (equal speech (emacs-reader--tts-paragraph (point))))
+        (should (equal (emacs-reader-translate-view-paragraphs) '("First\ncontinued" "Last")))
+        (emacs-reader-translate-view-show '(nil "末" "excess"))
+        (should (= 1 (length emacs-reader-translate-view--overlays)))
+        (emacs-reader-translate-view-clear)
+        (should (equal (overlays-in (point-min) (point-max)) (list highlight)))))))
+
+(ert-deftest emacs-reader-translate-view-chapter-and-toc-lifecycle ()
+  (with-temp-buffer
+    (insert "Chapter one")
+    (emacs-reader-reading-mode)
+    (emacs-reader-translate-view-show '("译一"))
+    (let ((inhibit-read-only t))
+      (erase-buffer)
+      (insert "Chapter two"))
+    (should-not (overlays-in (point-min) (point-max)))
+    (emacs-reader-translate-view-show '("译二"))
+    (let ((old (car emacs-reader-translate-view--overlays)))
+      (emacs-reader-toc-mode)
+      (should-not (overlay-buffer old)))
+    (let ((existing (overlays-in (point-min) (point-max))))
+      (should-not (emacs-reader-translate-view-paragraphs))
+      (emacs-reader-translate-view-show '("目录译文"))
+      (should (equal (overlays-in (point-min) (point-max)) existing)))))
+
+(provide 'emacs-reader-translate-view-test)
+;;; emacs-reader-translate-view-test.el ends here

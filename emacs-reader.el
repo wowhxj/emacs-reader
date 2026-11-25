@@ -1145,6 +1145,15 @@ full-width U+3000 indents, are normalized."
 (define-key emacs-reader-reading-mode-map (kbd "[") #'emacs-reader-previous-chapter)
 (define-key emacs-reader-reading-mode-map (kbd "c") #'emacs-reader-table-of-contents)
 (define-key emacs-reader-reading-mode-map (kbd "C") #'emacs-reader-select-chapter)
+(defvar-local emacs-reader-translation-mode nil)
+(autoload 'emacs-reader-translation-mode "emacs-reader-translate" nil t)
+(autoload 'emacs-reader-translation-select-direction "emacs-reader-translate" nil t)
+(autoload 'emacs-reader-translate-on-display "emacs-reader-translate")
+(autoload 'emacs-reader-translation-open-document "emacs-reader-translate" nil t)
+(autoload 'emacs-reader-translation-library "emacs-reader-translate" nil t)
+(define-key emacs-reader-reading-mode-map (kbd "C-c C-t") #'emacs-reader-translation-open-document)
+(define-key emacs-reader-reading-mode-map (kbd "t") #'emacs-reader-translation-mode)
+(define-key emacs-reader-reading-mode-map (kbd "T") #'emacs-reader-translation-select-direction)
 (define-key emacs-reader-reading-mode-map (kbd "r") #'emacs-reader-toggle-read-aloud)
 (define-key emacs-reader-reading-mode-map (kbd "a") #'emacs-reader-add-to-shelf)
 
@@ -1594,6 +1603,9 @@ Resume speech if SPEECH-GENERATION is still active.  With AT-END, show the end."
                          (setq emacs-reader--chapters (vconcat chapters))
                           (emacs-reader--remember-access emacs-reader--current-book chapters)
                          (emacs-reader--update-reading-header)
+                         (when (and emacs-reader-translation-mode
+                                    (natnump emacs-reader--current-chapter-index))
+                           (with-demoted-errors "阅读页翻译：%S" (emacs-reader-translate-on-display)))
                          (when emacs-reader--preview-start-pending
                            (setq emacs-reader--preview-start-pending nil)
                            (emacs-reader--load-chapter
@@ -1730,6 +1742,18 @@ Resume speech if SPEECH-GENERATION is still active.  With AT-END, show the end."
                                  (aref emacs-reader--chapters index) index
                                  (length emacs-reader--chapters))))
 
+(defun emacs-reader--chapter-display-text (content html-p)
+  "Format CONTENT as reading text, returning nil if rendering fails.
+HTML-P is `paragraphs' for local EPUB text, t for HTML, and nil for prose."
+  (when (stringp content)
+    (condition-case nil
+        (cond ((eq html-p 'paragraphs)
+               (if (string-blank-p content) "本页没有可显示的文字。"
+                 (emacs-reader--format-paragraphs content)))
+              (html-p (emacs-reader--html-chapter-text content))
+              (t (emacs-reader--format-chapter content)))
+      (error nil))))
+
 (defun emacs-reader--display-chapter (buffer request-id index content &optional html-p speech-generation at-end)
   "Display CONTENT for INDEX in BUFFER if REQUEST-ID is current.
 With HTML-P, render HTML; otherwise normalize plain text.  Nil means failure.
@@ -1737,14 +1761,7 @@ Continue SPEECH-GENERATION only if it is still active.  AT-END shows the end."
   (when (emacs-reader--chapter-request-current-p buffer request-id)
     (with-current-buffer buffer
       (setq mode-line-process nil)
-      (let ((text (and (stringp content)
-                       (condition-case nil
-                           (cond ((eq html-p 'paragraphs)
-                                   (if (string-blank-p content) "本页没有可显示的文字。"
-                                     (emacs-reader--format-paragraphs content)))
-                                  (html-p (emacs-reader--html-chapter-text content))
-                                  (t (emacs-reader--format-chapter content)))
-                         (error nil)))))
+      (let ((text (emacs-reader--chapter-display-text content html-p)))
         (if (and text (not (string-blank-p text)))
             (let ((inhibit-read-only t))
               (setq emacs-reader--tts-position nil emacs-reader--tts-follow-pending nil)
@@ -1755,6 +1772,8 @@ Continue SPEECH-GENERATION only if it is still active.  AT-END shows the end."
                     emacs-reader--requested-chapter-index index)
               (emacs-reader--update-reading-header)
               (emacs-reader--save-local-progress index)
+              (when emacs-reader--current-book
+                (with-demoted-errors "阅读页翻译：%S" (emacs-reader-translate-on-display)))
               (dolist (window (get-buffer-window-list buffer nil t))
                 (set-window-point window (point))
                 (if at-end
