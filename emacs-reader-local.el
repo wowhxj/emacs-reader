@@ -55,8 +55,8 @@
     (when (file-directory-p dir)
       (mapcar #'emacs-reader-local--read (directory-files dir t "\\.json\\'")))))
 
-(defun emacs-reader-local--write (path record)
-  "Write RECORD to PATH using an atomic rename."
+(defun emacs-reader-local--write (path record &optional new-only)
+  "Write RECORD atomically to PATH.  With NEW-ONLY, refuse to replace PATH."
   (make-directory (file-name-directory path) t)
   (let ((temp (make-temp-file (expand-file-name ".reader-" (file-name-directory path)))))
     (unwind-protect
@@ -66,7 +66,7 @@
               (let ((json (json-serialize record :false-object :false :null-object :null)))
                 (insert (if (multibyte-string-p json) json
                           (decode-coding-string json 'utf-8))))))
-          (rename-file temp path t))
+          (rename-file temp path (not new-only)))
       (when (file-exists-p temp) (delete-file temp)))))
 
 (defun emacs-reader-local--shelf-path (book)
@@ -323,6 +323,31 @@ Once the worker starts, it owns TEMPORARY input until completion."
           (kill-buffer buf)))
     (emacs-reader-local--read (expand-file-name input))))
 
+(defun emacs-reader-local--import-key (type url)
+  "Identify a source by TYPE and URL, treating a bare host as its root path."
+  (cons type (if (string-match-p (rx string-start "http" (? "s") "://" (+ (not (any "/?#")))
+                                     string-end) url)
+                 (concat url "/") url)))
+
+(defun emacs-reader-local--import-records (incoming)
+  "Import new INCOMING records and report counts of added and skipped sources."
+  (let ((seen (make-hash-table :test #'equal)) (added 0))
+    (dolist (record (emacs-reader-local--records "sources"))
+      (let ((type (alist-get 'type record)))
+        (dolist (url (cons (alist-get 'url record) (when (equal type "legado")
+                                                     (append (alist-get 'aliases record) nil))))
+          (puthash (emacs-reader-local--import-key type url) t seen))))
+    (dolist (record incoming)
+      (let* ((type (alist-get 'type record)) (url (alist-get 'url record))
+             (key (emacs-reader-local--import-key type url)))
+        (unless (gethash key seen)
+          (condition-case nil
+              (progn (emacs-reader-local--write (emacs-reader-local--source-path type url) record t)
+                     (cl-incf added))
+            (file-already-exists nil))
+          (puthash key t seen))))
+    (message "已新增 %d 个书源，跳过 %d 个重复条目" added (- (length incoming) added))))
+
 ;;;###autoload
 (defun emacs-reader-import-legado (input)
   "Register Legado sources from a JSON file or HTTP(S) URL INPUT."
@@ -330,22 +355,14 @@ Once the worker starts, it owns TEMPORARY input until completion."
                        (read-file-name "Legado 书源 JSON："))))
   (let* ((json (emacs-reader-local--legado-json input))
          (sources (if (vectorp json) (append json nil) (list json)))
-         (records (emacs-reader-local--records "sources")))
+         records)
     (dolist (source sources)
       (unless (and (consp source) (stringp (alist-get 'bookSourceName source)))
         (user-error "Legado 书源缺少名称"))
       (let ((url (emacs-reader-local--source-url (alist-get 'bookSourceUrl source))))
-        (when-let* ((owner (emacs-reader-local--alias-source url records)))
-          (user-error "该地址已由书源「%s」作为旧地址保留" (alist-get 'name owner)))))
-    (dolist (source sources)
-      (let* ((url (alist-get 'bookSourceUrl source))
-             (path (emacs-reader-local--source-path "legado" url))
-             (record (when (file-exists-p path) (emacs-reader-local--read path))))
-        (setf (alist-get 'type record) "legado" (alist-get 'url record) url
-              (alist-get 'name record) (alist-get 'bookSourceName source)
-              (alist-get 'definition record) source)
-        (emacs-reader-local--write path record)))
-    (message "已导入 %d 个 Legado 书源" (length sources))))
+        (push `((type . "legado") (url . ,url) (name . ,(alist-get 'bookSourceName source))
+                (definition . ,source)) records)))
+    (emacs-reader-local--import-records (nreverse records))))
 
 (defun emacs-reader-local--plist (record)
   "Convert JSON alist RECORD into a provider-facing plist."

@@ -320,10 +320,15 @@
   "Return the registry entry on the current row."
   (or (tabulated-list-get-id) (user-error "请先选择书源")))
 
+(defun emacs-reader-sources--import-one (record)
+  "Validate and import a new catalog RECORD, skipping registered duplicates."
+  (emacs-reader-sources--validate record)
+  (emacs-reader-local--import-records (list record)))
+
 (defun emacs-reader-sources-add-opds (name url)
   "Add an OPDS catalog with NAME and URL."
   (interactive "s目录名称：\nsOPDS 地址：")
-  (emacs-reader-sources--save `((type . "opds") (name . ,name) (url . ,url)))
+  (emacs-reader-sources--import-one `((type . "opds") (name . ,name) (url . ,url)))
   (emacs-reader-sources--refresh))
 
 (defun emacs-reader-sources-import-legado-file (file)
@@ -344,7 +349,7 @@
   (let ((record (emacs-reader-local--read file)))
     (unless (and (consp record) (member (alist-get 'type record) '("opds" "json")))
       (user-error "请选择 type 为 opds 或 json 的完整目录配置"))
-    (emacs-reader-sources--save record))
+    (emacs-reader-sources--import-one record))
   (emacs-reader-sources--refresh))
 
 (defun emacs-reader-sources-add-preset ()
@@ -356,7 +361,7 @@
                               (cons (alist-get 'name src) src)))
                           files))
          (choice (completing-read "添加预置书源：" choices nil t)))
-    (emacs-reader-sources--save (cdr (assoc choice choices)))
+    (emacs-reader-sources--import-one (cdr (assoc choice choices)))
     (emacs-reader-sources--refresh)))
 
 (transient-define-prefix emacs-reader-sources-add ()
