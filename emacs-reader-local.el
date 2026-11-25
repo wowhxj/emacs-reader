@@ -454,6 +454,15 @@ Once the worker starts, it owns TEMPORARY input until completion."
          (all (mapcar #'cdr visible))
          (prior (unless scope (emacs-reader-local--last-sources saved all)))
          (last-label "【按照上次选的源】")
+         (last-summary
+          (unless scope
+            (cond ((null saved) "  首次使用，搜索全部")
+                  ((null prior) "  上次选的源已不可用")
+                  (t (let* ((names (mapconcat (lambda (source) (alist-get 'name source))
+                                              (seq-take prior 3) "、"))
+                            (count (length prior)))
+                       (concat "  " (truncate-string-to-width names 44 nil nil "…")
+                               (when (> count 3) (format " 等 %d 个源" count))))))))
          (default (and visible (if scope "【全部】" last-label)))
          (table (when visible
                   (append (unless scope
@@ -465,7 +474,8 @@ Once the worker starts, it owns TEMPORARY input until completion."
                   (cl-loop for name in names for src = (cdr (assoc name table))
                            collect (list name (cond ((equal (alist-get 'type src) "all") "    ")
                                                     ((memq src emacs-reader-local--marked) "[✓] ")
-                                                    (t "[ ] ")) "")))))
+                                                    (t "[ ] "))
+                                          (if (equal name last-label) last-summary ""))))))
          (prompt (format "选择书源 [%s，C-SPC 勾选/取消，RET 确认]："
                          (if scope (format "%s，DEL 返回" scope) "l Legado，o OPDS，s JSON"))))
     (catch 'reader-picker-scope
