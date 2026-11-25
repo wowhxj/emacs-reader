@@ -27,6 +27,28 @@
     (should (equal (emacs-reader-opds--http-error 422) "HTTP 422 · Query too short"))
     (should (equal (emacs-reader-opds--http-error 404) "HTTP 404"))))
 
+(ert-deftest emacs-reader-opds-search-distinguishes-taleBook-empty-from-missing-route ()
+  (dolist (empty '(nil t))
+    (let ((source '((type . "opds") (url . "https://example.net/opds/")))
+          result requests)
+      (cl-letf (((symbol-function 'url-retrieve)
+                 (lambda (url callback &rest _)
+                   (push url requests)
+                   (with-current-buffer (generate-new-buffer " *OPDS fixture*")
+                     (setq-local url-http-response-status (if (cdr requests) 404 200))
+                     (insert "HTTP/1.1 response\r\n\r\n"
+                             (cond ((null (cdr requests))
+                                    (concat "<feed><link rel='search' "
+                                            "href='/opds/search/{searchTerms}'/></feed>"))
+                                   (empty (concat "<html><title>404: No results found</title>"
+                                                  "<body>404: No results found</body></html>"))
+                                   (t "<html><title>404: Not Found</title></html>")))
+                     (funcall callback nil)))))
+        (emacs-reader-catalog-results source "盗墓笔记"
+                                      (lambda (items reason) (setq result (list items reason))))
+        (should (equal result (list nil (unless empty "HTTP 404"))))
+        (should (string-prefix-p "https://example.net/opds/search/%E7%9B%97" (car requests)))))))
+
 (defun emacs-reader-opds-test--parse (body)
   "Parse fixture BODY relative to a nested catalog."
   (with-temp-buffer

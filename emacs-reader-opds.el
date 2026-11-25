@@ -360,8 +360,17 @@ RESULTS limits feed-level actions on a search results page."
       (message "%s · %s" emacs-reader-opds--name reason))))
 
 (defun emacs-reader-opds--http-error (status)
-  "Describe HTTP STATUS with the validation message of a JSON 422 response."
-  (let ((reason (when (= status 422)
+  "Describe HTTP STATUS using recognized response details."
+  (let ((empty (and (= status 404)
+                    (save-excursion
+                      (goto-char (point-min))
+                      (and (re-search-forward "\r?\n\r?\n" nil t)
+                           (looking-at-p (concat (regexp-quote
+                                                  "<html><title>404: No results found</title>")
+                                                 (regexp-quote
+                                                  "<body>404: No results found</body></html>")
+                                                 "[ \t\r\n]*\\'"))))))
+        (reason (when (= status 422)
                   (ignore-errors
                     (save-excursion
                       (goto-char (point-min))
@@ -370,10 +379,11 @@ RESULTS limits feed-level actions on a search results page."
                         (let* ((reply (emacs-reader-opds--json)) (detail (alist-get 'detail reply)))
                           (cond ((stringp detail) detail)
                                 ((consp (car-safe detail)) (alist-get 'msg (car detail)))))))))))
-    (if (and (stringp reason) (not (string-blank-p reason)))
-        (format "HTTP %d · %s" status
-                (truncate-string-to-width (string-clean-whitespace reason) 200))
-      (format "HTTP %d" status))))
+    (cond (empty "HTTP 404 · No results found")
+          ((and (stringp reason) (not (string-blank-p reason)))
+           (format "HTTP %d · %s" status
+                   (truncate-string-to-width (string-clean-whitespace reason) 200)))
+          (t (format "HTTP %d" status)))))
 
 (defun emacs-reader-opds--get (url read-body done &optional binary)
   "Fetch URL and call READ-BODY at its body, passing the final URL.
@@ -834,7 +844,12 @@ HOME receives the root catalog items for interactive browsing."
            (if (string-search "{" href) (search-opds href)
              (request href #'emacs-reader-opds--description #'search-opds))))
       (with-current-buffer worker
-        (setq emacs-reader-opds--on-error #'finish)
+        (setq emacs-reader-opds--on-error
+              (lambda (reason)
+                (if (and (equal (alist-get 'type source) "opds") (= page 1)
+                         (equal reason "HTTP 404 · No results found"))
+                    (receive-page nil)
+                  (finish reason))))
         (condition-case err
             (let ((url (alist-get 'url source)))
               (when (string-empty-p (string-trim keyword)) (error "Enter a search term"))
