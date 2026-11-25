@@ -39,7 +39,7 @@
             (emacs-reader--display-chapter
              reader emacs-reader--chapter-request-id 1 body
              (and (equal url "book.epub") 'paragraphs))
-            (should (= (length paragraphs) 2))
+            (should (= (length paragraphs) (if (equal url "book.epub") 3 2)))
             (should (equal paragraphs (emacs-reader-translate-view-paragraphs)))))))))
 
 (ert-deftest emacs-reader-translate-fetch-reader3-catalog-and-asset ()
@@ -75,7 +75,7 @@
         (should-not emacs-reader--current-chapter-index)
         (emacs-reader--display-chapter (current-buffer) emacs-reader--chapter-request-id 0 html t)
         (should (equal paragraphs (emacs-reader-translate-view-paragraphs)))
-        (should (= 2 (length paragraphs)))))))
+        (should (equal paragraphs '("Hello" "there" "World")))))))
 
 (ert-deftest emacs-reader-translate-fetch-rejects-locked-and-automatic-purchase ()
   (with-temp-buffer

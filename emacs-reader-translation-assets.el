@@ -135,7 +135,8 @@ Return nil for a missing file.  Signal an error for a damaged document."
           (error "缺少受支持的双语 Org 格式标记"))
         (forward-line 1)
         (cl-loop for source in paragraphs for i from 1 do
-                 (emacs-reader-translation-asset--expect (format "* 段落 %d" i))
+                 (emacs-reader-translation-asset--expect
+                  (format (if (looking-at-p "\\* 段落 ") "* 段落 %d" "* 行 %d") i))
                  (emacs-reader-translation-asset--expect "** 原文")
                  (unless (equal source (emacs-reader-translation-asset--text))
                    (error "译文文档第 %d 段与当前原文不符" i))
@@ -179,7 +180,7 @@ created FILE, validate it and return its text in preference to TRANSLATIONS."
                         "# 校订「译文」下的文本。每行开头保留冒号和空格，空行只写冒号。\n"
                         "#+READER_TRANSLATION: 1\n")
                 (cl-loop for source in paragraphs for text in translations for i from 1 do
-                         (insert (format "* 段落 %d\n** 原文\n" i))
+                         (insert (format "* 行 %d\n** 原文\n" i))
                          (emacs-reader-translation-asset--insert-text source)
                          (insert "** 译文\n")
                          (emacs-reader-translation-asset--insert-text text))

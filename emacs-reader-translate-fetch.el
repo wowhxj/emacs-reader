@@ -8,7 +8,7 @@
 (require 'subr-x)
 (require 'emacs-reader)
 (declare-function emacs-reader--chapter-display-text "emacs-reader" (content html-p))
-(autoload 'emacs-reader-translate-view-split "emacs-reader-translate-view")
+(require 'emacs-reader-translate-view)
 
 (defun emacs-reader-translate-fetch-content-error (text)
   "Return a reason if TEXT contains only whitespace or a known service notice."
@@ -59,7 +59,7 @@ Background work must never open the interactive login prompt."
   "Fetch CHAPTER-INDEX from READER-BUFFER, calling CALLBACK with (PARAGRAPHS ERR).
 ERR is nil on success, otherwise a message.  The returned no-argument
 function discards late responses and skips subsequent catalog/content handoffs."
-  (let (finished)
+  (let ((width (buffer-local-value 'emacs-reader-translation-line-width reader-buffer)) finished)
     (cl-labels
         ((finish (paragraphs err)
            (unless finished
@@ -69,7 +69,7 @@ function discards late responses and skips subsequent catalog/content handoffs."
            (unless finished
              (let* ((text (unless err (emacs-reader--chapter-display-text content kind)))
                     (reason (or err (emacs-reader-translate-fetch-content-error text)))
-                    (paragraphs (unless reason (emacs-reader-translate-view-split text))))
+                    (paragraphs (unless reason (emacs-reader-translate-view-split text width))))
                (finish paragraphs (or reason (unless paragraphs "本章没有正文"))))))
          (remote-response (response)
            (unless finished

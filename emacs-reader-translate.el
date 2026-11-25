@@ -189,7 +189,7 @@
 
 ;;;###autoload
 (define-minor-mode emacs-reader-translation-mode
-  "Toggle paragraph translations in this reader, using the configured gptel model."
+  "Toggle line translations in this reader, using the configured gptel model."
   :lighter (:eval (concat " " emacs-reader-translate--status))
   (if emacs-reader-translation-mode
       (progn

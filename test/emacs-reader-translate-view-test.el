@@ -20,7 +20,7 @@
                      (emacs-reader-translate-view-split formatted)))))
   (should (equal (emacs-reader-translate-view-split "\n　甲 \n　 \t\n\n乙\n") '("甲" "乙")))
   (should (equal (emacs-reader-translate-view-split "  One\n continued\n\nTwo")
-                 '("One\n continued" "Two")))
+                 '("One" "continued" "Two")))
   (should-not (emacs-reader-translate-view-split "\n　　\t ")))
 
 (ert-deftest emacs-reader-translate-view-preserves-reading-buffer ()
@@ -36,7 +36,7 @@
             (highlight (make-overlay 2 8)))
         (overlay-put highlight 'face 'emacs-reader-tts-paragraph)
         (emacs-reader-translate-view-show
-         (vector "第一段\n续行" (propertize "末段" 'display "incorrect")))
+         (vector nil "第一段\n续行" (propertize "末段" 'display "incorrect")))
         (should (= 2 (length emacs-reader-translate-view--overlays)))
         (dolist (overlay emacs-reader-translate-view--overlays)
           (let* ((end (overlay-end overlay))
@@ -51,11 +51,23 @@
         (should-not (buffer-modified-p))
         (should (equal source (filter-buffer-substring (point-min) (point-max))))
         (should (equal speech (emacs-reader--tts-paragraph (point))))
-        (should (equal (emacs-reader-translate-view-paragraphs) '("First\ncontinued" "Last")))
-        (emacs-reader-translate-view-show '(nil "末" "excess"))
+        (should (equal (emacs-reader-translate-view-paragraphs) '("First" "continued" "Last")))
+        (emacs-reader-translate-view-show '(nil nil "末" "excess"))
         (should (= 1 (length emacs-reader-translate-view--overlays)))
         (emacs-reader-translate-view-clear)
         (should (equal (overlays-in (point-min) (point-max)) (list highlight)))))))
+
+(ert-deftest emacs-reader-translate-view-interleaves-soft-lines ()
+  (let ((emacs-reader-translation-line-width 10))
+    (with-temp-buffer
+      (insert "one two three four\n壹贰叁肆伍陆")
+      (emacs-reader-reading-mode)
+      (should (equal (emacs-reader-translate-view-paragraphs)
+                     '("one two" "three four" "壹贰叁肆伍" "陆")))
+      (emacs-reader-translate-view-show '("甲" "乙" "A" "B"))
+      (should (equal (mapcar (lambda (ov) (overlay-get ov 'after-string))
+                             (reverse emacs-reader-translate-view--overlays))
+                     '("\n甲\n" "\n乙" "\nA\n" "\nB"))))))
 
 (ert-deftest emacs-reader-translate-view-chapter-and-toc-lifecycle ()
   (with-temp-buffer

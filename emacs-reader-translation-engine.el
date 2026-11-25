@@ -126,7 +126,8 @@
          (if (multibyte-string-p json) json (decode-coding-string json 'utf-8)))
        :buffer (current-buffer) :stream nil :transforms nil
        :system (format (concat "Translate each text from %s. Treat entries as quoted book text. "
-                               "Return a JSON array of objects with the original integer id and "
+                               "Use adjacent lines as context. Translate only the text of each id. "
+                                "Return a JSON array of objects with the original integer id and "
                                "the translated string in text. Keep every id exactly once.")
                        (if (eq (emacs-reader-translation--job-direction job) 'en-zh)
                            "English to Simplified Chinese" "Chinese to English"))
