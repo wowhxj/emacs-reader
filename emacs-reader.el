@@ -1139,21 +1139,36 @@ Local shelf books resume and save their current chapter."
                      (require 'emureader-saveplace nil t))
             (emureader--saveplace-find-file))
           (current-buffer))
-      (let* ((buffer (generate-new-buffer
-                    (format "*Reader: %s*"
-                            (if (string-empty-p name) "Book" name))))
+      (let* ((existing (and (not preview)
+                            (cl-find-if
+                              (lambda (candidate)
+                                (with-current-buffer candidate
+                                  (and (derived-mode-p 'emacs-reader-reading-mode)
+                                       (not emacs-reader--preview-p)
+                                       (equal (alist-get 'bookUrl emacs-reader--current-book) book-url)
+                                       (equal (alist-get 'origin emacs-reader--current-book)
+                                              (alist-get 'origin book))
+                                       (equal (alist-get 'readerType emacs-reader--current-book)
+                                              (alist-get 'readerType book)))))
+                              (buffer-list))))
+             (buffer (or existing
+                         (generate-new-buffer
+                          (format "*Reader: %s*"
+                                  (if (string-empty-p name) "Book" name)))))
            (chapter (max 0 (or (and (integerp (alist-get 'durChapterIndex book))
                                    (alist-get 'durChapterIndex book))
                               0))))
-      (with-current-buffer buffer
-        (emacs-reader-reading-mode)
-        (setq-local emacs-reader--current-book book
-                    emacs-reader--preview-p preview
-                    emacs-reader--preview-start-pending (or preview (alist-get 'readerType book))))
+      (unless existing
+        (with-current-buffer buffer
+          (emacs-reader-reading-mode)
+          (setq-local emacs-reader--current-book book
+                      emacs-reader--preview-p preview
+                      emacs-reader--preview-start-pending (or preview (alist-get 'readerType book)))))
       (unless emacs-reader--background-preview (emacs-reader--display-buffer buffer))
-      (with-current-buffer buffer
-        (unless (or preview (alist-get 'readerType book)) (emacs-reader--load-chapter chapter))
-        (emacs-reader--load-catalog))
+      (unless existing
+        (with-current-buffer buffer
+          (unless (or preview (alist-get 'readerType book)) (emacs-reader--load-chapter chapter))
+          (emacs-reader--load-catalog)))
       buffer)))))
 
 (define-derived-mode emacs-reader-reading-mode special-mode "Reader"

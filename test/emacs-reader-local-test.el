@@ -40,7 +40,7 @@
             (emacs-reader-shelf)
             (should (= 1 (alist-get 'durChapterIndex (car emacs-reader--shelf-books))))
             (call-interactively #'emacs-reader-open-book)
-            (push (current-buffer) readers)
+            (should (eq (current-buffer) (car readers)))
             (emacs-reader-local-test--await (string-match-p "第二段" (buffer-string)))
             (should (= emacs-reader--current-chapter-index 1))))
       (mapc #'kill-buffer readers)

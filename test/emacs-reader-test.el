@@ -35,6 +35,28 @@
           (should (eq original (window-buffer (selected-window)))))
       (when (buffer-live-p reader) (kill-buffer reader)))))
 
+(ert-deftest emacs-reader-open-book-reuses-only-matching-shelf-buffer ()
+  (let ((book '((name . "同名") (bookUrl . "book") (origin . "source-a")))
+        buffers (loads 0))
+    (unwind-protect
+        (cl-letf (((symbol-function 'emacs-reader--load-catalog)
+                   (lambda () (cl-incf loads)))
+                  ((symbol-function 'emacs-reader--load-chapter) #'ignore)
+                  ((symbol-function 'emacs-reader--display-buffer) #'ignore))
+          (let* ((first (emacs-reader-open-book book))
+                 (_ (push first buffers))
+                 (again (emacs-reader-open-book (copy-tree book)))
+                 (other (emacs-reader-open-book
+                         '((name . "同名") (bookUrl . "book") (origin . "source-b"))))
+                 (_ (push other buffers))
+                 (preview (emacs-reader-open-book book t)))
+            (push preview buffers)
+            (should (eq first again))
+            (should-not (eq first other))
+            (should-not (eq first preview))
+            (should (= loads 3))))
+      (mapc #'kill-buffer buffers))))
+
 (ert-deftest emacs-reader-server-url-allows-http-by-default ()
   (let ((emacs-reader-server-url "http://reader.example:8084"))
     (should emacs-reader-allow-insecure-http)
